@@ -30,8 +30,8 @@ Details below.
 - Primary learning reference: Philipp Oppermann's *Writing an OS in Rust*,
   second edition (os.phil-opp.com).
 
-The full staged plan is in `ROADMAP.md`. **Currently at Stage 0** (boot + serial
-output).
+The full staged plan is in `ROADMAP.md`. **Currently at Stage 1** (VGA text
+output, on top of Stage 0's serial output).
 
 ## Language and writing conventions
 
@@ -94,6 +94,8 @@ Exit QEMU: `Ctrl-A` then `X`.
 - `src/main.rs`: kernel entry `_start`, panic handler, `hlt_loop`.
 - `src/serial.rs`: serial output, providing the `serial_print!` /
   `serial_println!` macros.
+- `src/vga_buffer.rs`: VGA text-buffer driver, providing the `print!` /
+  `println!` macros that write to the screen.
 - `.cargo/config.toml`: the bare-metal target (`x86_64-unknown-none`), build-std,
   and the QEMU runner config.
 - `.claude/settings.json`: pre-approved permissions (cargo + git, including

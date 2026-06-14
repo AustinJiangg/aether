@@ -29,15 +29,15 @@ spin = "0.9"
 # ---------------------------------------------------------------------------
 [package.metadata.bootimage]
 # - serial stdio : connect the VM's serial port to the current terminal's stdio
-# - display none : don't open a graphical window (smoother under WSL2; kernel
-#                  output goes over serial anyway)
 #
-# Tip: once you reach the "VGA text output" stage, if you want to see the QEMU
-# graphical window, remove the "-display", "none" entries (WSL2 needs WSLg or an
-# X server for this).
+# As of Stage 1 we open the graphical window so the VGA text output is visible
+# (WSL2 needs WSLg or an X server for this — it ships with Windows 11). Serial
+# still goes to the terminal, so you get both the boot log and the screen.
+#
+# Tip: on a headless setup with no display, add "-display", "none" back here; the
+# serial log keeps working even when no window can open.
 run-args = [
     "-serial", "stdio",
-    "-display", "none",
 ]
 
 # Keep debug info in release builds too, to make debugging the kernel with gdb

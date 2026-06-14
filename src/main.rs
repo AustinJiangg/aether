@@ -4,9 +4,10 @@
 //! filling the universe and carrying all things — much like a kernel underlies
 //! everything that runs on top of it.
 //!
-//! Current stage (Stage 0): the kernel boots and prints output to the terminal
-//! over the serial port. This is already a true "bare metal" program — it runs
-//! on no underlying operating system and takes over the CPU itself.
+//! Current stage (Stage 1): on top of the Stage 0 serial output, the kernel now
+//! drives the VGA text buffer, printing characters directly to the screen via
+//! memory-mapped I/O. This is already a true "bare metal" program — it runs on
+//! no underlying operating system and takes over the CPU itself.
 //!
 //! See ROADMAP.md for what comes next.
 
@@ -19,6 +20,7 @@
 #![no_main]
 
 mod serial;
+mod vga_buffer;
 
 use core::panic::PanicInfo;
 
@@ -32,15 +34,21 @@ use core::panic::PanicInfo;
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     serial::init();
-
-    serial_println!("========================================");
-    serial_println!("       Hello from Aether kernel!        ");
-    serial_println!("     Running on bare metal x86_64       ");
-    serial_println!("========================================");
-    serial_println!();
     serial_println!("[ OK ] serial port initialized");
-    serial_println!("[ OK ] kernel booted successfully");
-    serial_println!();
+
+    // Stage 1: the VGA text buffer. Unlike the serial lines above, these go to
+    // the *screen* (the QEMU window). We start from a clean screen, then print a
+    // banner and a formatted expression to prove both the driver and the `{}`
+    // formatting machinery work.
+    vga_buffer::WRITER.lock().clear_screen();
+    println!("========================================");
+    println!("        Hello from Aether kernel!");
+    println!("     VGA text buffer is now working.");
+    println!("========================================");
+    println!();
+    println!("Formatting works too: {} + {} = {}", 19, 23, 19 + 23);
+
+    serial_println!("[ OK ] VGA text buffer initialized");
     serial_println!("Kernel entering idle loop. Press Ctrl-A then X to exit QEMU.");
 
     hlt_loop();

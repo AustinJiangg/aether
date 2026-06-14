@@ -9,7 +9,7 @@ Recommended: create a git branch per stage, and merge back to main once it runs.
 | Stage | What to build | OS concepts learned | Status |
 |-------|---------------|---------------------|--------|
 | **0** | Boot + serial output (current) | boot flow, freestanding binary, no_std | Done |
-| **1** | VGA text buffer, print to the screen | memory-mapped I/O, video memory | Todo |
+| **1** | VGA text buffer, print to the screen | memory-mapped I/O, video memory | Done |
 | **2** | CPU exception handling (IDT), trigger a breakpoint exception | interrupt / exception mechanism | Todo |
 | **3** | Hardware interrupts (PIC), keyboard input, timer interrupt | interrupt controller, device drivers | Todo |
 | **4** | Paging + heap allocator, make `Box` / `Vec` usable | virtual memory, address spaces | Todo |
