@@ -6,8 +6,8 @@ The goal is not to clone Ubuntu, but to implement the core mechanisms of an OS b
 hand — booting, interrupts, memory management, process scheduling, file systems —
 in order to **deeply understand how an OS works**.
 
-Currently at **Stage 1**: the kernel boots, prints to the terminal over the serial
-port, and drives the VGA text buffer to print directly to the screen. See
+Currently at **Stage 2**: the kernel boots, prints over serial and to the VGA text
+buffer, and handles its first CPU exception (a breakpoint) via the IDT. See
 [`ROADMAP.md`](./ROADMAP.md) for the full iteration plan.
 
 ---
@@ -80,7 +80,8 @@ aether/
 ├── src/
 │   ├── main.rs            # Kernel entry _start + panic handler
 │   ├── serial.rs          # Serial output (serial_print! / serial_println!)
-│   └── vga_buffer.rs      # VGA text buffer (print! / println!)
+│   ├── vga_buffer.rs      # VGA text buffer (print! / println!)
+│   └── interrupts.rs      # IDT + CPU exception handlers
 ├── ROADMAP.md             # Staged iteration plan
 ├── CLAUDE.md              # Project context and conventions for Claude Code
 └── README.md

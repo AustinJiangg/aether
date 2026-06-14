@@ -30,8 +30,8 @@ Details below.
 - Primary learning reference: Philipp Oppermann's *Writing an OS in Rust*,
   second edition (os.phil-opp.com).
 
-The full staged plan is in `ROADMAP.md`. **Currently at Stage 1** (VGA text
-output, on top of Stage 0's serial output).
+The full staged plan is in `ROADMAP.md`. **Currently at Stage 2** (CPU exception
+handling via the IDT, on top of Stage 0 serial and Stage 1 VGA output).
 
 ## Language and writing conventions
 
@@ -96,6 +96,8 @@ Exit QEMU: `Ctrl-A` then `X`.
   `serial_println!` macros.
 - `src/vga_buffer.rs`: VGA text-buffer driver, providing the `print!` /
   `println!` macros that write to the screen.
+- `src/interrupts.rs`: the IDT and CPU exception handlers (currently the
+  breakpoint handler).
 - `.cargo/config.toml`: the bare-metal target (`x86_64-unknown-none`), build-std,
   and the QEMU runner config.
 - `.claude/settings.json`: pre-approved permissions (cargo + git, including

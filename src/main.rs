@@ -4,10 +4,10 @@
 //! filling the universe and carrying all things — much like a kernel underlies
 //! everything that runs on top of it.
 //!
-//! Current stage (Stage 1): on top of the Stage 0 serial output, the kernel now
-//! drives the VGA text buffer, printing characters directly to the screen via
-//! memory-mapped I/O. This is already a true "bare metal" program — it runs on
-//! no underlying operating system and takes over the CPU itself.
+//! Current stage (Stage 2): the kernel sets up an Interrupt Descriptor Table and
+//! handles its first CPU exception (a breakpoint), on top of the Stage 0 serial
+//! output and the Stage 1 VGA text buffer. This is already a true "bare metal"
+//! program — it runs on no underlying operating system and takes over the CPU.
 //!
 //! See ROADMAP.md for what comes next.
 
@@ -18,9 +18,13 @@
 // Don't use Rust's default entry point (it relies on the C runtime crt0).
 // We define our own entry point instead.
 #![no_main]
+// Exception/interrupt handlers use the special "x86-interrupt" calling
+// convention, which is still unstable, so we opt in to it here.
+#![feature(abi_x86_interrupt)]
 
 mod serial;
 mod vga_buffer;
+mod interrupts;
 
 use core::panic::PanicInfo;
 
@@ -49,6 +53,16 @@ pub extern "C" fn _start() -> ! {
     println!("Formatting works too: {} + {} = {}", 19, 23, 19 + 23);
 
     serial_println!("[ OK ] VGA text buffer initialized");
+
+    // Stage 2: load the IDT, then deliberately raise a breakpoint exception with
+    // `int3`. The CPU dispatches to our handler, which prints and returns; since
+    // #BP is a trap, execution resumes right after `int3` — so reaching the line
+    // below proves the kernel took an exception and kept running.
+    interrupts::init_idt();
+    serial_println!("[ OK ] IDT loaded");
+    x86_64::instructions::interrupts::int3();
+    serial_println!("[ OK ] survived breakpoint, kernel continues");
+
     serial_println!("Kernel entering idle loop. Press Ctrl-A then X to exit QEMU.");
 
     hlt_loop();
