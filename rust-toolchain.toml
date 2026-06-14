@@ -1,0 +1,10 @@
+# Pin the toolchain so that you now, you later, and Claude Code all use the same
+# environment. When you enter the project directory, rustup automatically
+# switches to the nightly specified here.
+#
+# Bare-metal OS development requires nightly: build-std (recompiling core/alloc
+# from source), custom targets, and many low-level features not yet in stable
+# all depend on it.
+[toolchain]
+channel = "nightly"
+components = ["rust-src", "llvm-tools-preview"]

@@ -1,0 +1,33 @@
+# ---------------------------------------------------------------------------
+# Cargo build configuration: tells cargo how to compile and run the kernel for
+# the bare-metal target.
+# ---------------------------------------------------------------------------
+
+[unstable]
+# Bare metal has no precompiled standard library, so we recompile core and
+# compiler_builtins from source.
+build-std = ["core", "compiler_builtins"]
+# Provide low-level memory functions like memcpy / memset (bare metal has no
+# libc to supply them).
+build-std-features = ["compiler-builtins-mem"]
+
+[build]
+# Use the built-in bare-metal target by default, so plain `cargo build` /
+# `cargo run` just works without passing `--target` each time. We use Rust's
+# built-in `x86_64-unknown-none` (freestanding x86_64: no OS, soft-float, no red
+# zone) instead of a hand-written .json target spec — recent nightlies are
+# phasing JSON targets out, and the built-in one is equivalent and maintained.
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+# On `cargo run`, use bootimage to package the kernel into a bootable disk image
+# and hand it off to QEMU.
+runner = "bootimage runner"
+
+# Force the classic static (non-PIE) relocation model. By default this target
+# builds a static *position-independent* executable (PIE) carrying dynamic
+# relocations. The bootloader 0.9 ELF loader does NOT apply relocations, so a PIE
+# kernel ends up at wrong absolute addresses and crashes/hangs the moment the
+# bootloader jumps into it. With relocation-model=static the kernel links as an
+# ET_EXEC with no relocations, which the bootloader loads correctly.
+rustflags = ["-C", "relocation-model=static"]

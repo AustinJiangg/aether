@@ -1,0 +1,46 @@
+[package]
+name = "aether"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <you@example.com>"]
+description = "Aether — a from-scratch, iteratively-built educational x86_64 OS kernel"
+
+[dependencies]
+# Custom Rust bootloader that brings the CPU into 64-bit long mode and loads the
+# kernel. Pinned to 0.9.x: together with the `bootimage` tool, a single
+# `cargo run` builds and boots in QEMU — ideal for getting started. Once you
+# understand the boot flow, consider upgrading to 0.11+ (which uses a
+# build-script approach instead).
+bootloader = "0.9.23"
+
+# x86_64 architecture abstractions: CPU instruction wrappers, register access,
+# page tables, interrupt descriptor tables, and other structures.
+x86_64 = "0.14"
+
+# 16550-compatible serial (UART) driver, used to send kernel output to the terminal.
+uart_16550 = "0.2"
+
+# Spinlock-based Mutex for no_std environments (bare metal has no OS-provided
+# thread-blocking primitives).
+spin = "0.9"
+
+# ---------------------------------------------------------------------------
+# bootimage / QEMU run configuration
+# ---------------------------------------------------------------------------
+[package.metadata.bootimage]
+# - serial stdio : connect the VM's serial port to the current terminal's stdio
+# - display none : don't open a graphical window (smoother under WSL2; kernel
+#                  output goes over serial anyway)
+#
+# Tip: once you reach the "VGA text output" stage, if you want to see the QEMU
+# graphical window, remove the "-display", "none" entries (WSL2 needs WSLg or an
+# X server for this).
+run-args = [
+    "-serial", "stdio",
+    "-display", "none",
+]
+
+# Keep debug info in release builds too, to make debugging the kernel with gdb
+# easier later.
+[profile.release]
+debug = true
