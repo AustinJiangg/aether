@@ -190,8 +190,16 @@ pub static WRITER: Mutex<Writer> = Mutex::new(Writer {
 /// Backing function for the `print!` / `println!` macros. Do not call directly.
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
-    // write_str never fails for our Writer, so unwrap can't actually panic.
-    WRITER.lock().write_fmt(args).unwrap();
+    use x86_64::instructions::interrupts;
+
+    // Disable interrupts while we hold the WRITER lock. Otherwise an interrupt
+    // handler that also prints (e.g. the timer) could fire mid-write, try to
+    // take the same spinlock, and deadlock: the lock can't be released until the
+    // interrupted code resumes, which can't happen until the handler returns.
+    interrupts::without_interrupts(|| {
+        // write_str never fails for our Writer, so unwrap can't actually panic.
+        WRITER.lock().write_fmt(args).unwrap();
+    });
 }
 
 /// Print to the VGA screen without a trailing newline. Same usage as `print!`.

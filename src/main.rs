@@ -4,10 +4,11 @@
 //! filling the universe and carrying all things — much like a kernel underlies
 //! everything that runs on top of it.
 //!
-//! Current stage (Stage 3, step 1): on top of the Stage 0 serial output, the
-//! Stage 1 VGA text buffer, and the Stage 2 breakpoint exception, the kernel now
-//! loads a GDT and TSS so the double fault handler runs on a dedicated stack —
-//! the safety net that keeps a stack overflow from triple faulting the machine.
+//! Current stage (Stage 3): on top of the Stage 0 serial output, the Stage 1
+//! VGA text buffer, and the Stage 2 breakpoint exception, the kernel now loads
+//! a GDT and TSS (so the double fault handler runs on a dedicated stack — the
+//! safety net against a stack overflow triple faulting the machine) and brings
+//! up the 8259 PIC to take its first hardware interrupt: the periodic timer.
 //! This is already a true "bare metal" program — it runs on no underlying
 //! operating system and takes over the CPU.
 //!
@@ -81,6 +82,15 @@ pub extern "C" fn _start() -> ! {
     // IST, the double fault handler runs on its own stack and prints
     // "DOUBLE FAULT" instead. Re-comment it before committing so boot continues.
     // stack_overflow();
+
+    // Stage 3 (step 2): bring up the 8259 PICs and enable hardware interrupts.
+    // From here the timer (IRQ0) fires on its own several times a second; its
+    // handler logs a tick to the serial port. This is the first time the CPU
+    // runs our code because an external device asked it to, not because we did.
+    interrupts::init_pics();
+    serial_println!("[ OK ] PIC initialized");
+    x86_64::instructions::interrupts::enable();
+    serial_println!("[ OK ] hardware interrupts enabled; timer is now ticking");
 
     serial_println!("Kernel entering idle loop. Press Ctrl-A then X to exit QEMU.");
 

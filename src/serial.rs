@@ -35,12 +35,18 @@ pub fn init() {
 /// Internal print function used by the macros. Do not call directly.
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
-    let mut guard = SERIAL1.lock();
-    if let Some(port) = guard.as_mut() {
-        // Writing to the serial port shouldn't fail (barring hardware faults),
-        // so we expect here.
-        port.write_fmt(args).expect("failed to write to serial port");
-    }
+    use x86_64::instructions::interrupts;
+
+    // Disable interrupts while holding the lock, for the same deadlock reason as
+    // the VGA writer: the timer handler logs through this path too.
+    interrupts::without_interrupts(|| {
+        let mut guard = SERIAL1.lock();
+        if let Some(port) = guard.as_mut() {
+            // Writing to the serial port shouldn't fail (barring hardware
+            // faults), so we expect here.
+            port.write_fmt(args).expect("failed to write to serial port");
+        }
+    });
 }
 
 /// Print to the serial port without a trailing newline. Same usage as `print!`.

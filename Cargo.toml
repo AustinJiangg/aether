@@ -24,6 +24,11 @@ uart_16550 = "0.2"
 # thread-blocking primitives).
 spin = "0.9"
 
+# Driver for the pair of chained 8259 PICs (the legacy interrupt controller).
+# Pinned to 0.10.x because it depends on x86_64 0.14, matching ours; 0.11 pulls
+# in x86_64 0.15 and would duplicate that crate in the build.
+pic8259 = "0.10"
+
 # ---------------------------------------------------------------------------
 # bootimage / QEMU run configuration
 # ---------------------------------------------------------------------------
