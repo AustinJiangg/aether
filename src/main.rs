@@ -8,7 +8,8 @@
 //! VGA text buffer, and the Stage 2 breakpoint exception, the kernel now loads
 //! a GDT and TSS (so the double fault handler runs on a dedicated stack — the
 //! safety net against a stack overflow triple faulting the machine) and brings
-//! up the 8259 PIC to take its first hardware interrupt: the periodic timer.
+//! up the 8259 PIC to handle hardware interrupts: the periodic timer (IRQ0)
+//! and the keyboard (IRQ1), whose keystrokes it echoes to the screen.
 //! This is already a true "bare metal" program — it runs on no underlying
 //! operating system and takes over the CPU.
 //!
@@ -91,6 +92,9 @@ pub extern "C" fn _start() -> ! {
     serial_println!("[ OK ] PIC initialized");
     x86_64::instructions::interrupts::enable();
     serial_println!("[ OK ] hardware interrupts enabled; timer is now ticking");
+
+    println!();
+    println!("Keyboard is live - type and your keystrokes will echo below:");
 
     serial_println!("Kernel entering idle loop. Press Ctrl-A then X to exit QEMU.");
 

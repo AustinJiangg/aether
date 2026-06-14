@@ -98,8 +98,9 @@ Exit QEMU: `Ctrl-A` then `X`.
   `println!` macros that write to the screen.
 - `src/gdt.rs`: the Global Descriptor Table and Task State Segment, providing a
   dedicated IST stack for the double fault handler (loaded before the IDT).
-- `src/interrupts.rs`: the IDT and CPU exception handlers (currently the
-  breakpoint and double fault handlers).
+- `src/interrupts.rs`: the IDT, the CPU exception handlers (breakpoint and
+  double fault), and the hardware interrupt handlers (timer and keyboard) along
+  with the 8259 PIC setup.
 - `.cargo/config.toml`: the bare-metal target (`x86_64-unknown-none`), build-std,
   and the QEMU runner config.
 - `.claude/settings.json`: pre-approved permissions (cargo + git, including

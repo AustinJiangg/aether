@@ -28,6 +28,7 @@ spin = "0.9"
 # Pinned to 0.10.x because it depends on x86_64 0.14, matching ours; 0.11 pulls
 # in x86_64 0.15 and would duplicate that crate in the build.
 pic8259 = "0.10"
+pc-keyboard = "0.9.0"
 
 # ---------------------------------------------------------------------------
 # bootimage / QEMU run configuration

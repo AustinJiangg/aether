@@ -18,18 +18,20 @@
 //! On top of CPU exceptions we also handle *hardware* interrupts, delivered
 //! through the legacy 8259 PIC (programmable interrupt controller): the timer
 //! on IRQ0, the keyboard on IRQ1, and so on. We remap the PIC's vectors to
-//! 32..=47 (just past the exception vectors the CPU reserves) and, for now,
-//! handle the timer.
+//! 32..=47 (just past the exception vectors the CPU reserves) and handle the
+//! timer and the keyboard.
 //!
-//! Later stages add more handlers (e.g. page fault, keyboard).
+//! Later stages add more handlers (e.g. page fault).
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use pc_keyboard::{layouts::Us104Key, DecodedKey, HandleControl, PS2Keyboard, ScancodeSet1};
 use pic8259::ChainedPics;
 use spin::{Lazy, Mutex};
+use x86_64::instructions::port::Port;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 
-use crate::{gdt, hlt_loop, println, serial_println};
+use crate::{gdt, hlt_loop, print, println, serial_print, serial_println};
 
 /// The kernel's interrupt descriptor table.
 ///
@@ -50,9 +52,10 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
             .set_handler_fn(double_fault_handler)
             .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
     }
-    // Hardware interrupt: the timer (IRQ0). Indexing the IDT by vector number
-    // reaches the entries past the 32 CPU-exception slots.
+    // Hardware interrupts: the timer (IRQ0) and the keyboard (IRQ1). Indexing
+    // the IDT by vector number reaches the entries past the 32 exception slots.
     idt[InterruptIndex::Timer.as_usize()].set_handler_fn(timer_interrupt_handler);
+    idt[InterruptIndex::Keyboard.as_usize()].set_handler_fn(keyboard_interrupt_handler);
     idt
 });
 
@@ -86,12 +89,24 @@ static PICS: Mutex<ChainedPics> =
 /// from a tick counter like this one.
 static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 
+/// Decoder for PS/2 scancodes from the keyboard (IRQ1): US layout, scancode set
+/// 1 (what the emulated PC keyboard sends). `HandleControl::Ignore` leaves a
+/// Ctrl+key combination as the plain letter instead of a control code. Its
+/// constructors are `const`, so it needs no lazy initialization.
+static KEYBOARD: Mutex<PS2Keyboard<Us104Key, ScancodeSet1>> = Mutex::new(PS2Keyboard::new(
+    ScancodeSet1::new(),
+    Us104Key,
+    HandleControl::Ignore,
+));
+
 /// Vector numbers for the hardware interrupts we handle, laid out relative to
-/// the PIC offset. IRQ0 (the timer) lands on `PIC_1_OFFSET` (= 32).
+/// the PIC offset. IRQ0 (the timer) lands on `PIC_1_OFFSET` (= 32) and IRQ1
+/// (the keyboard) on the next vector (= 33).
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 enum InterruptIndex {
     Timer = PIC_1_OFFSET,
+    Keyboard,
 }
 
 impl InterruptIndex {
@@ -166,5 +181,47 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
     unsafe {
         PICS.lock()
             .notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
+    }
+}
+
+/// Handler for the keyboard interrupt (IRQ1, remapped to vector 33).
+///
+/// The PS/2 controller latches one scancode byte at I/O port 0x60 for each key
+/// press or release. We must read that byte to clear the controller, or it will
+/// not raise another keyboard interrupt. The raw byte is fed to `pc-keyboard`,
+/// which assembles it into key events and decodes those into characters; we
+/// echo printable keys to both the screen and the serial log.
+extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    let mut port: Port<u8> = Port::new(0x60);
+    // SAFETY: 0x60 is the fixed PS/2 data port. Reading it consumes exactly one
+    // pending scancode byte and has no other side effects; we must do it before
+    // sending the EOI so the controller will deliver the next byte.
+    let scancode: u8 = unsafe { port.read() };
+
+    // Scope the keyboard lock so it is released before we signal the PIC.
+    {
+        let mut keyboard = KEYBOARD.lock();
+        // A key event may span several scancode bytes, so `add_byte` returns
+        // `Ok(None)` until it has a complete event.
+        if let Ok(Some(event)) = keyboard.add_byte(scancode) {
+            if let Some(key) = keyboard.process_keyevent(event) {
+                match key {
+                    DecodedKey::Unicode(character) => {
+                        print!("{}", character);
+                        serial_print!("{}", character);
+                    }
+                    DecodedKey::RawKey(raw) => {
+                        print!("{:?}", raw);
+                        serial_print!("{:?}", raw);
+                    }
+                }
+            }
+        }
+    }
+
+    // SAFETY: we send the EOI for exactly the vector we are currently servicing.
+    unsafe {
+        PICS.lock()
+            .notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
     }
 }
