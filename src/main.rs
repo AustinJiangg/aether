@@ -11,8 +11,8 @@
 //! memory for us, so we read CR3 and build an `OffsetPageTable` to translate
 //! addresses (4a) and create new mappings via a frame allocator (4b). On top of
 //! that we map a heap region and register a `#[global_allocator]` (a hand-written
-//! bump allocator), so the `alloc` crate's `Box`/`Vec`/`Rc` now work (4c) — which
-//! completes Stage 4.
+//! linked-list allocator), so the `alloc` crate's `Box`/`Vec`/`Rc` now work (4c),
+//! which completes Stage 4.
 //! This is already a true "bare metal" program — it runs on no underlying
 //! operating system and takes over the CPU.
 //!
@@ -202,16 +202,20 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         allocator::HEAP_SIZE / 1024
     );
 
-    // Many short-lived allocations: each Box is freed at the end of its iteration,
-    // so the bump allocator's live count returns to zero and `next` resets — the
-    // whole loop runs in constant heap space and exercises the (limited) free path.
+    // A long-lived allocation alongside thousands of short-lived ones. The linked-
+    // list allocator reclaims each freed block individually and reuses it, so this
+    // runs in bounded memory. (The previous bump allocator could not: with
+    // `long_lived` never freed, its cursor never reset, and 10000 boxes would
+    // march past the end of the 100 KiB heap.)
+    let long_lived = Box::new(1);
     for i in 0..10_000 {
-        let boxed = Box::new(i);
-        assert_eq!(*boxed, i);
+        let x = Box::new(i);
+        assert_eq!(*x, i);
     }
-    serial_println!("[heap] 10000 short-lived boxes OK (bump frees and resets)");
+    assert_eq!(*long_lived, 1);
+    serial_println!("[heap] 10000 boxes + 1 long-lived OK (linked-list reuses freed blocks)");
 
-    // Long-lived allocations of three different `alloc` types.
+    // The basic alloc types still work as before.
     let heap_value = Box::new(41);
     serial_println!("[heap] Box holds {} at {:p}", *heap_value, heap_value);
 
