@@ -16,6 +16,10 @@
 //! This is already a true "bare metal" program — it runs on no underlying
 //! operating system and takes over the CPU.
 //!
+//! Stage 5 (in progress) adds cooperative multitasking with `async`/`await`.
+//! Step 1 (this commit) introduces a `Task` wrapper plus a simple round-robin
+//! executor, and runs one example task to completion to prove the mechanism.
+//!
 //! See ROADMAP.md for what comes next.
 
 // Don't link the standard library: on bare metal there is no OS to provide the
@@ -37,6 +41,7 @@ mod gdt;
 mod interrupts;
 mod memory;
 mod allocator;
+mod task;
 
 use core::panic::PanicInfo;
 
@@ -46,6 +51,9 @@ use alloc::vec::Vec;
 use bootloader::{entry_point, BootInfo};
 use x86_64::structures::paging::{FrameAllocator, Page, Translate};
 use x86_64::VirtAddr;
+
+use task::simple_executor::SimpleExecutor;
+use task::Task;
 
 // Register `kernel_main` as the kernel entry point.
 //
@@ -233,6 +241,18 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_println!("[ OK ] heap works; Box / Vec / Rc are usable");
     println!("Heap is live; Box / Vec / Rc all work (details on the serial log).");
 
+    // Stage 5 (step 1): cooperative multitasking with async/await. An `async fn`
+    // compiles to a state machine implementing `Future`; the kernel's job is to
+    // `poll` that future until it is `Ready`. `SimpleExecutor` does exactly that —
+    // it holds a queue of tasks and polls each in turn. `example_task` awaits a
+    // number and prints it, then completes, so `run()` returns once the queue
+    // drains. (This first executor busy-polls with a no-op waker; a later step
+    // adds a real waker so the CPU can sleep between events.)
+    let mut executor = SimpleExecutor::new();
+    executor.spawn(Task::new(example_task()));
+    executor.run();
+    serial_println!("[ OK ] async executor drove example_task to completion");
+
     println!();
     println!("Keyboard is live - type and your keystrokes will echo below:");
 
@@ -270,4 +290,20 @@ fn stack_overflow() {
     // into a tail call (which would loop in place without growing the stack).
     // `black_box` is an optimization barrier that forces the frame to persist.
     core::hint::black_box(());
+}
+
+/// A trivial async function: it completes immediately and resolves to a number.
+/// Returning from an `async fn` is what makes its future report `Poll::Ready`.
+async fn async_number() -> u32 {
+    42
+}
+
+/// An example task driven by the executor. Awaiting `async_number()` suspends
+/// this future until that value is ready (here, immediately) and then resumes.
+/// The whole function is compiled into a state machine the executor polls to
+/// completion — the printed line is the proof it ran.
+async fn example_task() {
+    let number = async_number().await;
+    println!("async number: {}", number);
+    serial_println!("[task] example_task resolved async_number() = {}", number);
 }
