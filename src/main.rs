@@ -4,13 +4,14 @@
 //! filling the universe and carrying all things — much like a kernel underlies
 //! everything that runs on top of it.
 //!
-//! Current stage (Stage 4a): on top of Stages 0–3 (serial output, the VGA text
+//! Current stage (Stage 4b): on top of Stages 0–3 (serial output, the VGA text
 //! buffer, the IDT with the breakpoint and double-fault handlers, and hardware
-//! interrupts via the 8259 PIC — timer and keyboard), the kernel now reaches the
-//! page tables. The bootloader maps all of physical memory for us, so we can read
-//! CR3, build an `OffsetPageTable` over the active tables, and translate virtual
-//! addresses to the physical frames they map to. This is the foundation for the
-//! heap allocator that makes `Box`/`Vec` usable in later sub-stages.
+//! interrupts via the 8259 PIC — timer and keyboard), the kernel now manages
+//! virtual memory. The bootloader maps all of physical memory for us, so we read
+//! CR3 and build an `OffsetPageTable` over the active tables: with it we translate
+//! virtual addresses (4a) and, using a frame allocator that draws unused frames
+//! from the boot memory map, create brand-new page mappings (4b). This is the
+//! groundwork for the heap allocator that makes `Box`/`Vec` usable next.
 //! This is already a true "bare metal" program — it runs on no underlying
 //! operating system and takes over the CPU.
 //!
@@ -36,7 +37,7 @@ mod memory;
 use core::panic::PanicInfo;
 
 use bootloader::{entry_point, BootInfo};
-use x86_64::structures::paging::Translate;
+use x86_64::structures::paging::{FrameAllocator, Page, Translate};
 use x86_64::VirtAddr;
 
 // Register `kernel_main` as the kernel entry point.
@@ -123,7 +124,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // SAFETY: the bootloader mapped all physical memory at `phys_mem_offset` (the
     // `map_physical_memory` feature is enabled in Cargo.toml), and we call `init`
     // exactly once here — the two invariants `memory::init` documents.
-    let mapper = unsafe { memory::init(phys_mem_offset) };
+    let mut mapper = unsafe { memory::init(phys_mem_offset) };
 
     // Translate four real, known addresses to prove the page-table walk works:
     // the VGA frame, a spot on the current kernel stack, the boot info struct,
@@ -144,6 +145,44 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     }
     serial_println!("[ OK ] paging initialized; page-table walk works");
     println!("Paging is live (virtual->physical translations on the serial log).");
+
+    // Stage 4b: a frame allocator and the first hand-made mapping. Translation
+    // (above) only reads the tables; to *create* a mapping we need free physical
+    // frames for any missing intermediate tables. `BootInfoFrameAllocator` draws
+    // those from the regions the bootloader marked usable in the memory map.
+    // SAFETY: the bootloader's memory map is valid and the regions it marks
+    // `Usable` are genuinely free, so frames handed out are not aliased.
+    let mut frame_allocator =
+        unsafe { memory::BootInfoFrameAllocator::init(&boot_info.memory_map) };
+
+    // Prove the allocator yields a usable frame before we map anything.
+    if let Some(frame) = frame_allocator.allocate_frame() {
+        serial_println!("[paging] frame allocator handed out {:?}", frame);
+    }
+
+    // Map a brand-new page at 64 TiB (nothing is mapped near there) onto the VGA
+    // frame. Because that region has no page tables yet, `map_to` must build the
+    // L3/L2/L1 tables on the way down, drawing those frames from our allocator —
+    // so a successful mapping exercises the allocator end to end.
+    let page = Page::containing_address(VirtAddr::new(0x_4000_0000_0000));
+    memory::create_example_mapping(page, &mut mapper, &mut frame_allocator);
+    serial_println!(
+        "[paging] mapped {:?} -> {:?}",
+        page.start_address(),
+        mapper.translate_addr(page.start_address())
+    );
+
+    // Write through the NEW page. It aliases the VGA frame, so this lands on the
+    // screen: "New!" at row 20 (byte offset 3200 = 400 u64 units into the buffer).
+    let page_ptr: *mut u64 = page.start_address().as_mut_ptr();
+    // SAFETY: `page` was just mapped writable to the VGA frame, so this offset
+    // stays inside that 4 KiB page and writes to VGA device memory; the volatile
+    // write keeps the compiler from optimizing the memory-mapped store away.
+    unsafe {
+        page_ptr.offset(400).write_volatile(0x_f021_f077_f065_f04e);
+    }
+    serial_println!("[ OK ] frame allocator works; wrote \"New!\" via the new mapping");
+    println!("Frame allocator live; mapped a fresh page onto VGA (look for \"New!\").");
 
     println!();
     println!("Keyboard is live - type and your keystrokes will echo below:");

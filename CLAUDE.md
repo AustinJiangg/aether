@@ -33,8 +33,9 @@ Details below.
 The full staged plan is in `ROADMAP.md`. **Stages 0–3 are done** (serial output,
 the VGA text buffer, the IDT with CPU exception handlers, and hardware interrupts
 via the 8259 PIC — timer and keyboard). **Currently on Stage 4** (paging + heap
-allocator), starting with sub-step 4a: building an `OffsetPageTable` over the
-active page tables and translating virtual addresses.
+allocator): sub-steps 4a (address translation) and 4b (a frame allocator over the
+bootloader memory map, plus the first hand-made page mapping) are done; next is 4c
+(a heap region + `#[global_allocator]` to make `Box`/`Vec` usable).
 
 ## Language and writing conventions
 
@@ -106,7 +107,9 @@ Exit QEMU: `Ctrl-A` then `X`.
   with the 8259 PIC setup.
 - `src/memory.rs`: virtual-memory helpers — reads CR3 and builds an
   `OffsetPageTable` over the active page tables (via the bootloader's complete
-  physical-memory mapping) so the kernel can translate virtual addresses.
+  physical-memory mapping) for translating virtual addresses, plus a
+  `BootInfoFrameAllocator` that hands out usable physical frames from the memory
+  map and a helper that creates new page mappings.
 - `.cargo/config.toml`: the bare-metal target (`x86_64-unknown-none`), build-std,
   and the QEMU runner config.
 - `.claude/settings.json`: pre-approved permissions (cargo + git, including
