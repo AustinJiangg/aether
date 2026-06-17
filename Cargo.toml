@@ -11,7 +11,12 @@ description = "Aether — a from-scratch, iteratively-built educational x86_64 O
 # `cargo run` builds and boots in QEMU — ideal for getting started. Once you
 # understand the boot flow, consider upgrading to 0.11+ (which uses a
 # build-script approach instead).
-bootloader = "0.9.23"
+#
+# The `map_physical_memory` feature makes the bootloader map *all* of physical
+# memory into the virtual address space at a fixed offset (reported in
+# `BootInfo::physical_memory_offset`). That mapping is how the kernel reaches the
+# page tables, whose entries hold physical addresses (Stage 4).
+bootloader = { version = "0.9.23", features = ["map_physical_memory"] }
 
 # x86_64 architecture abstractions: CPU instruction wrappers, register access,
 # page tables, interrupt descriptor tables, and other structures.

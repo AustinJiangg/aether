@@ -4,12 +4,13 @@
 //! filling the universe and carrying all things — much like a kernel underlies
 //! everything that runs on top of it.
 //!
-//! Current stage (Stage 3): on top of the Stage 0 serial output, the Stage 1
-//! VGA text buffer, and the Stage 2 breakpoint exception, the kernel now loads
-//! a GDT and TSS (so the double fault handler runs on a dedicated stack — the
-//! safety net against a stack overflow triple faulting the machine) and brings
-//! up the 8259 PIC to handle hardware interrupts: the periodic timer (IRQ0)
-//! and the keyboard (IRQ1), whose keystrokes it echoes to the screen.
+//! Current stage (Stage 4a): on top of Stages 0–3 (serial output, the VGA text
+//! buffer, the IDT with the breakpoint and double-fault handlers, and hardware
+//! interrupts via the 8259 PIC — timer and keyboard), the kernel now reaches the
+//! page tables. The bootloader maps all of physical memory for us, so we can read
+//! CR3, build an `OffsetPageTable` over the active tables, and translate virtual
+//! addresses to the physical frames they map to. This is the foundation for the
+//! heap allocator that makes `Box`/`Vec` usable in later sub-stages.
 //! This is already a true "bare metal" program — it runs on no underlying
 //! operating system and takes over the CPU.
 //!
@@ -30,18 +31,36 @@ mod serial;
 mod vga_buffer;
 mod gdt;
 mod interrupts;
+mod memory;
 
 use core::panic::PanicInfo;
 
-/// Kernel entry point.
+use bootloader::{entry_point, BootInfo};
+use x86_64::structures::paging::Translate;
+use x86_64::VirtAddr;
+
+// Register `kernel_main` as the kernel entry point.
+//
+// The `bootloader` crate finishes the real-mode -> long-mode switch and then
+// jumps to a symbol named `_start`. Rather than hand-write that symbol (as we
+// did before with `#[no_mangle] pub extern "C" fn _start`), the `entry_point!`
+// macro generates it for us with the correct ABI *and* type-checks that our
+// function has the exact signature the bootloader calls: it passes a
+// `&'static BootInfo`. Defining `_start` by hand gave us no such check, and no
+// access to that argument. (Plain `//` comments here: `///` docs can't attach to
+// a macro invocation.)
+entry_point!(kernel_main);
+
+/// Kernel entry point. Never returns (`!`): there is no caller to return to.
 ///
-/// After the `bootloader` crate finishes the real-mode -> long-mode switch, it
-/// jumps to a function named `_start`. Therefore:
-/// - `#[no_mangle]`: disable name mangling so the symbol is exactly `_start`.
-/// - `extern "C"`: use the C calling convention.
-/// - returns `!`: the kernel entry never returns (there is no caller to return to).
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
+/// `boot_info` is assembled by the bootloader and describes the machine we woke
+/// up on. We use two of its fields: `memory_map` (which physical regions are
+/// usable RAM — needed once we start allocating frames) and
+/// `physical_memory_offset`, the virtual address at which the bootloader mapped
+/// *all* of physical memory for us (because we enabled the `map_physical_memory`
+/// feature). That mapping is what makes the page tables — which hold physical
+/// addresses — reachable.
+fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial::init();
     serial_println!("[ OK ] serial port initialized");
 
@@ -92,6 +111,39 @@ pub extern "C" fn _start() -> ! {
     serial_println!("[ OK ] PIC initialized");
     x86_64::instructions::interrupts::enable();
     serial_println!("[ OK ] hardware interrupts enabled; timer is now ticking");
+
+    // Stage 4a: paging. With paging on, every address the kernel uses is a
+    // *virtual* address that the CPU translates to a physical one by walking a
+    // 4-level page table in hardware. Here we learn to walk that same table in
+    // software: `memory::init` builds an `OffsetPageTable` over the active table,
+    // and `Translate::translate_addr` resolves a virtual address to the physical
+    // frame it maps to (or `None` if nothing is mapped there). This is purely
+    // read-only — installing new mappings needs a frame allocator (Stage 4b).
+    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset);
+    // SAFETY: the bootloader mapped all physical memory at `phys_mem_offset` (the
+    // `map_physical_memory` feature is enabled in Cargo.toml), and we call `init`
+    // exactly once here — the two invariants `memory::init` documents.
+    let mapper = unsafe { memory::init(phys_mem_offset) };
+
+    // Translate four real, known addresses to prove the page-table walk works:
+    // the VGA frame, a spot on the current kernel stack, the boot info struct,
+    // and the base of the physical-memory mapping (which must resolve to physical
+    // address 0, since that virtual base is exactly where physical 0 was mapped).
+    let stack_probe = 0u64;
+    let addresses = [
+        0xb8000,                              // VGA text buffer (memory-mapped I/O)
+        &stack_probe as *const u64 as u64,    // somewhere on the current kernel stack
+        boot_info as *const BootInfo as u64,  // where the boot info struct lives
+        boot_info.physical_memory_offset,     // base of the physical-memory mapping
+    ];
+    serial_println!("[paging] virtual -> physical translations:");
+    for &address in &addresses {
+        let virt = VirtAddr::new(address);
+        let phys = mapper.translate_addr(virt);
+        serial_println!("    {:?} -> {:?}", virt, phys);
+    }
+    serial_println!("[ OK ] paging initialized; page-table walk works");
+    println!("Paging is live (virtual->physical translations on the serial log).");
 
     println!();
     println!("Keyboard is live - type and your keystrokes will echo below:");
