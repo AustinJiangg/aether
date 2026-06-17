@@ -30,12 +30,13 @@ Details below.
 - Primary learning reference: Philipp Oppermann's *Writing an OS in Rust*,
   second edition (os.phil-opp.com).
 
-The full staged plan is in `ROADMAP.md`. **Stages 0–3 are done** (serial output,
-the VGA text buffer, the IDT with CPU exception handlers, and hardware interrupts
-via the 8259 PIC — timer and keyboard). **Currently on Stage 4** (paging + heap
-allocator): sub-steps 4a (address translation) and 4b (a frame allocator over the
-bootloader memory map, plus the first hand-made page mapping) are done; next is 4c
-(a heap region + `#[global_allocator]` to make `Box`/`Vec` usable).
+The full staged plan is in `ROADMAP.md`. **Stages 0–4 are done**: serial output,
+the VGA text buffer, the IDT with CPU exception handlers, hardware interrupts via
+the 8259 PIC (timer and keyboard), and Stage 4's virtual-memory work — page-table
+access and translation (4a), a frame allocator over the bootloader memory map plus
+hand-made page mappings (4b), and a heap backed by a hand-written bump allocator
+that makes `Box`/`Vec`/`Rc` usable (4c). **Next is Stage 5** (cooperative
+multitasking with `async`/`await`).
 
 ## Language and writing conventions
 
@@ -110,6 +111,9 @@ Exit QEMU: `Ctrl-A` then `X`.
   physical-memory mapping) for translating virtual addresses, plus a
   `BootInfoFrameAllocator` that hands out usable physical frames from the memory
   map and a helper that creates new page mappings.
+- `src/allocator.rs`: the kernel heap — maps a fixed virtual range to frames and
+  registers a `#[global_allocator]` (a hand-written bump allocator), so the
+  `alloc` crate's `Box`/`Vec`/`Rc`/`String` become usable.
 - `.cargo/config.toml`: the bare-metal target (`x86_64-unknown-none`), build-std,
   and the QEMU runner config.
 - `.claude/settings.json`: pre-approved permissions (cargo + git, including

@@ -4,9 +4,11 @@
 # ---------------------------------------------------------------------------
 
 [unstable]
-# Bare metal has no precompiled standard library, so we recompile core and
-# compiler_builtins from source.
-build-std = ["core", "compiler_builtins"]
+# Bare metal has no precompiled standard library, so we recompile core,
+# compiler_builtins, and alloc from source. `alloc` provides the heap types
+# (Box/Vec/Rc/String) that become usable once we install a global allocator
+# (Stage 4c).
+build-std = ["core", "compiler_builtins", "alloc"]
 # Provide low-level memory functions like memcpy / memset (bare metal has no
 # libc to supply them).
 build-std-features = ["compiler-builtins-mem"]

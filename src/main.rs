@@ -4,14 +4,15 @@
 //! filling the universe and carrying all things — much like a kernel underlies
 //! everything that runs on top of it.
 //!
-//! Current stage (Stage 4b): on top of Stages 0–3 (serial output, the VGA text
+//! Current stage (Stage 4c): on top of Stages 0–3 (serial output, the VGA text
 //! buffer, the IDT with the breakpoint and double-fault handlers, and hardware
 //! interrupts via the 8259 PIC — timer and keyboard), the kernel now manages
-//! virtual memory. The bootloader maps all of physical memory for us, so we read
-//! CR3 and build an `OffsetPageTable` over the active tables: with it we translate
-//! virtual addresses (4a) and, using a frame allocator that draws unused frames
-//! from the boot memory map, create brand-new page mappings (4b). This is the
-//! groundwork for the heap allocator that makes `Box`/`Vec` usable next.
+//! virtual memory and has a working heap. The bootloader maps all of physical
+//! memory for us, so we read CR3 and build an `OffsetPageTable` to translate
+//! addresses (4a) and create new mappings via a frame allocator (4b). On top of
+//! that we map a heap region and register a `#[global_allocator]` (a hand-written
+//! bump allocator), so the `alloc` crate's `Box`/`Vec`/`Rc` now work (4c) — which
+//! completes Stage 4.
 //! This is already a true "bare metal" program — it runs on no underlying
 //! operating system and takes over the CPU.
 //!
@@ -28,14 +29,20 @@
 // convention, which is still unstable, so we opt in to it here.
 #![feature(abi_x86_interrupt)]
 
+extern crate alloc;
+
 mod serial;
 mod vga_buffer;
 mod gdt;
 mod interrupts;
 mod memory;
+mod allocator;
 
 use core::panic::PanicInfo;
 
+use alloc::boxed::Box;
+use alloc::rc::Rc;
+use alloc::vec::Vec;
 use bootloader::{entry_point, BootInfo};
 use x86_64::structures::paging::{FrameAllocator, Page, Translate};
 use x86_64::VirtAddr;
@@ -183,6 +190,44 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     }
     serial_println!("[ OK ] frame allocator works; wrote \"New!\" via the new mapping");
     println!("Frame allocator live; mapped a fresh page onto VGA (look for \"New!\").");
+
+    // Stage 4c: stand up a kernel heap. `init_heap` maps a fixed virtual range to
+    // freshly-allocated frames (the same `map_to` + frame allocator as 4b), then
+    // arms the `#[global_allocator]` over that range. Once it returns, the `alloc`
+    // crate's types work.
+    allocator::init_heap(&mut mapper, &mut frame_allocator).expect("heap initialization failed");
+    serial_println!(
+        "[ OK ] heap mapped at {:#x}, size {} KiB",
+        allocator::HEAP_START,
+        allocator::HEAP_SIZE / 1024
+    );
+
+    // Many short-lived allocations: each Box is freed at the end of its iteration,
+    // so the bump allocator's live count returns to zero and `next` resets — the
+    // whole loop runs in constant heap space and exercises the (limited) free path.
+    for i in 0..10_000 {
+        let boxed = Box::new(i);
+        assert_eq!(*boxed, i);
+    }
+    serial_println!("[heap] 10000 short-lived boxes OK (bump frees and resets)");
+
+    // Long-lived allocations of three different `alloc` types.
+    let heap_value = Box::new(41);
+    serial_println!("[heap] Box holds {} at {:p}", *heap_value, heap_value);
+
+    let mut vec = Vec::new();
+    for i in 0..500 {
+        vec.push(i);
+    }
+    serial_println!("[heap] Vec has {} elements, last is {}", vec.len(), vec[vec.len() - 1]);
+
+    let rc = Rc::new(alloc::vec![1, 2, 3]);
+    let rc_clone = Rc::clone(&rc);
+    serial_println!("[heap] Rc strong_count after clone = {}", Rc::strong_count(&rc));
+    core::mem::drop(rc);
+    serial_println!("[heap] Rc strong_count after drop  = {}", Rc::strong_count(&rc_clone));
+    serial_println!("[ OK ] heap works; Box / Vec / Rc are usable");
+    println!("Heap is live; Box / Vec / Rc all work (details on the serial log).");
 
     println!();
     println!("Keyboard is live - type and your keystrokes will echo below:");
