@@ -1,19 +1,26 @@
 //! Kernel heap: a memory region plus a global allocator, so the `alloc` crate's
 //! types (`Box`, `Vec`, `String`, `Rc`, ...) become usable.
 //!
-//! Two pieces are needed. First, real backing memory: we pick a fixed virtual
-//! address range for the heap and map every page in it to a freshly-allocated
-//! physical frame (using the Stage 4b frame allocator + `map_to`). Second, a
-//! *global allocator*: a type marked `#[global_allocator]` that implements
-//! `GlobalAlloc`, which `alloc` calls to carve that region into individual
-//! allocations. Here that is a hand-written **linked-list allocator** (a.k.a.
-//! free-list allocator): the free parts of the heap are themselves threaded into
-//! a linked list of `ListNode`s, each holding its region's size and a pointer to
-//! the next free region. Allocation walks the list for a region big enough (first
-//! fit) and splits off the remainder; deallocation pushes the freed region back
-//! onto the list. Unlike the bump allocator it replaced, it reclaims individual
-//! freed blocks, so long- and short-lived allocations can coexist without
-//! exhausting the heap.
+//! First, real backing memory: we pick a fixed virtual address range for the heap
+//! and map every page in it to a freshly-allocated physical frame (using the
+//! Stage 4b frame allocator + `map_to`). Second, a *global allocator*: a type
+//! marked `#[global_allocator]` implementing `GlobalAlloc`, which `alloc` calls to
+//! carve that region into individual allocations.
+//!
+//! The global allocator here is a two-layer, hand-written design:
+//!
+//! - A **fixed-size block allocator** on top. It keeps a separate free list for
+//!   each of a few power-of-two block sizes (8, 16, ... 2048 bytes). A small
+//!   allocation is rounded up to the nearest block size and served by popping a
+//!   block off that list in O(1); freeing just pushes the block back. This is fast
+//!   and avoids the linear search and fragmentation of a pure free list.
+//! - A **linked-list (free-list) allocator** underneath, as the fallback. It hands
+//!   out blocks when a size's list is empty, and serves any request too large for
+//!   the biggest block size. The free regions of the heap thread a list of
+//!   `ListNode`s stored in the free memory itself.
+//!
+//! So most allocations are O(1) from the block lists, and the linked-list layer is
+//! the slower, general-purpose backstop.
 
 use alloc::alloc::{GlobalAlloc, Layout};
 use core::mem;
@@ -35,7 +42,7 @@ pub const HEAP_SIZE: usize = 100 * 1024;
 /// every `Box::new`, `Vec::push`, etc. ultimately calls this value's
 /// `GlobalAlloc` methods. It starts empty and is armed by `init_heap`.
 #[global_allocator]
-static ALLOCATOR: Locked<LinkedListAllocator> = Locked::new(LinkedListAllocator::new());
+static ALLOCATOR: Locked<FixedSizeBlockAllocator> = Locked::new(FixedSizeBlockAllocator::new());
 
 /// Map the heap's pages and hand the backing memory to the global allocator.
 ///
@@ -83,7 +90,7 @@ pub fn init_heap(
 /// Two reasons it exists. The orphan rule forbids implementing the foreign
 /// `GlobalAlloc` trait directly on the foreign `spin::Mutex`, so we wrap it in a
 /// type of our own. And `GlobalAlloc`'s methods take `&self`, yet the allocator
-/// must mutate its free list — the `Mutex` supplies that interior mutability (and
+/// must mutate its lists — the `Mutex` supplies that interior mutability (and
 /// makes concurrent access safe).
 pub struct Locked<A> {
     inner: Mutex<A>,
@@ -100,6 +107,117 @@ impl<A> Locked<A> {
         self.inner.lock()
     }
 }
+
+// ===========================================================================
+// Fixed-size block allocator (the global allocator).
+// ===========================================================================
+
+/// The block sizes that get a dedicated free list. Each MUST be a power of two,
+/// because we also use the size as the block's alignment. A request larger than
+/// the last size falls through to the linked-list fallback. The smallest size (8)
+/// must be at least `size_of::<BlockNode>()` so a freed block can hold its node.
+const BLOCK_SIZES: &[usize] = &[8, 16, 32, 64, 128, 256, 512, 1024, 2048];
+
+/// A free block on one of the fixed-size lists. Only a `next` link is needed: the
+/// block's size is implied by which list it hangs on, so unlike `ListNode` it does
+/// not store a size. Like `ListNode`, it lives inside the free block's own memory.
+struct BlockNode {
+    next: Option<&'static mut BlockNode>,
+}
+
+/// Pick the index of the smallest block size that fits `layout`, or `None` if the
+/// request is larger than the largest block size (then it goes to the fallback).
+/// We use `size.max(align)` so the chosen block satisfies both — valid because the
+/// block sizes are powers of two and double as alignments.
+fn list_index(layout: &Layout) -> Option<usize> {
+    let required_block_size = layout.size().max(layout.align());
+    BLOCK_SIZES.iter().position(|&s| s >= required_block_size)
+}
+
+/// One free list per block size, plus a linked-list allocator as the fallback.
+pub struct FixedSizeBlockAllocator {
+    list_heads: [Option<&'static mut BlockNode>; BLOCK_SIZES.len()],
+    fallback: LinkedListAllocator,
+}
+
+impl FixedSizeBlockAllocator {
+    /// Create an empty allocator: all lists empty, fallback empty. `const` so it
+    /// can initialize the `#[global_allocator]` static at compile time.
+    pub const fn new() -> Self {
+        // `Option<&mut _>` is not `Copy`, so the array can't be `[None; N]`; the
+        // const-item repeat below is the standard way to build it.
+        const EMPTY: Option<&'static mut BlockNode> = None;
+        FixedSizeBlockAllocator {
+            list_heads: [EMPTY; BLOCK_SIZES.len()],
+            fallback: LinkedListAllocator::new(),
+        }
+    }
+
+    /// Arm the allocator by handing the whole heap to the fallback. Blocks migrate
+    /// from the fallback into the per-size lists as they are allocated and freed.
+    ///
+    /// # Safety
+    ///
+    /// `heap_start..heap_start + heap_size` must be unused, mapped, writable
+    /// memory, and this must be called exactly once.
+    pub unsafe fn init(&mut self, heap_start: usize, heap_size: usize) {
+        self.fallback.init(heap_start, heap_size);
+    }
+}
+
+// SAFETY: `GlobalAlloc` is an unsafe trait; callers rely on returned blocks being
+// correctly aligned, large enough, and not currently handed out. A block popped
+// from `list_heads[i]` was pushed there by a matching `dealloc` (so it is free and
+// is `BLOCK_SIZES[i]` bytes, hence big enough and aligned); fresh blocks and
+// oversized requests come from the fallback, which upholds the same guarantees.
+unsafe impl GlobalAlloc for Locked<FixedSizeBlockAllocator> {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let mut allocator = self.lock();
+        match list_index(&layout) {
+            Some(index) => match allocator.list_heads[index].take() {
+                // A block is waiting on this size's list: pop it. O(1).
+                Some(node) => {
+                    allocator.list_heads[index] = node.next.take();
+                    node as *mut BlockNode as *mut u8
+                }
+                // The list is empty: carve a fresh block of this size from the
+                // fallback. When freed it joins this list, growing the pool.
+                None => {
+                    let block_size = BLOCK_SIZES[index];
+                    let block_align = block_size; // sizes are powers of two
+                    let layout = Layout::from_size_align(block_size, block_align).unwrap();
+                    allocator.fallback.allocate(layout)
+                }
+            },
+            // Too big for any fixed size: serve it from the fallback directly.
+            None => allocator.fallback.allocate(layout),
+        }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let mut allocator = self.lock();
+        match list_index(&layout) {
+            // Fits a fixed size: push it back onto that list instead of truly
+            // freeing it. O(1), no walking or splitting.
+            Some(index) => {
+                let new_node = BlockNode {
+                    next: allocator.list_heads[index].take(),
+                };
+                // The block is BLOCK_SIZES[index] bytes (>= the node's size and
+                // alignment, see BLOCK_SIZES), so it can hold the node we write.
+                let new_node_ptr = ptr as *mut BlockNode;
+                new_node_ptr.write(new_node);
+                allocator.list_heads[index] = Some(&mut *new_node_ptr);
+            }
+            // Was a fallback allocation: free it through the fallback.
+            None => allocator.fallback.deallocate(ptr, layout),
+        }
+    }
+}
+
+// ===========================================================================
+// Linked-list (free-list) allocator — the fallback under the block allocator.
+// ===========================================================================
 
 /// A node in the free list. Each free region of the heap stores one of these *in
 /// its own first bytes*, recording the region's size and a link to the next free
@@ -131,7 +249,7 @@ pub struct LinkedListAllocator {
 
 impl LinkedListAllocator {
     /// Create an empty allocator (no free regions yet). `const` so it can
-    /// initialize the `#[global_allocator]` static at compile time.
+    /// initialize the fixed-size allocator's fallback field at compile time.
     pub const fn new() -> Self {
         Self {
             head: ListNode::new(0),
@@ -219,35 +337,38 @@ impl LinkedListAllocator {
         let size = layout.size().max(mem::size_of::<ListNode>());
         (size, layout.align())
     }
-}
 
-// SAFETY: `GlobalAlloc` is an unsafe trait; callers rely on returned blocks being
-// correctly aligned, large enough, and not currently handed out. `find_region`
-// returns only a region just unlinked from the free list (so it is not live), and
-// `size_align` forces every block to fit a `ListNode` so it can rejoin the list on
-// free; any leftover tail is returned to the list as its own free region.
-unsafe impl GlobalAlloc for Locked<LinkedListAllocator> {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let (size, align) = LinkedListAllocator::size_align(layout);
-        let mut allocator = self.lock();
-
-        if let Some((region, alloc_start)) = allocator.find_region(size, align) {
+    /// Allocate a block for `layout`, returning a pointer or null if no free region
+    /// is big enough. Used by the fixed-size allocator as its fallback path.
+    fn allocate(&mut self, layout: Layout) -> *mut u8 {
+        let (size, align) = Self::size_align(layout);
+        if let Some((region, alloc_start)) = self.find_region(size, align) {
             let alloc_end = alloc_start.checked_add(size).expect("overflow");
             let excess_size = region.end_addr() - alloc_end;
             if excess_size > 0 {
-                // Return the unused tail of the region to the free list.
-                allocator.add_free_region(alloc_end, excess_size);
+                // SAFETY: the tail [alloc_end, region.end) is the unused remainder
+                // of a region we just unlinked, so it is free and writable;
+                // `alloc_end` is ListNode-aligned and `excess_size` is at least one
+                // ListNode (guaranteed by `alloc_from_region`'s split check).
+                unsafe {
+                    self.add_free_region(alloc_end, excess_size);
+                }
             }
             alloc_start as *mut u8
         } else {
-            ptr::null_mut() // no region big enough -> out of memory
+            ptr::null_mut()
         }
     }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // Re-derive the true block size and push the region back onto the list.
-        let (size, _) = LinkedListAllocator::size_align(layout);
-        self.lock().add_free_region(ptr as usize, size);
+    /// Return a block to the free list.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must have come from a previous `allocate` with the same `layout` and
+    /// must not have been freed since.
+    unsafe fn deallocate(&mut self, ptr: *mut u8, layout: Layout) {
+        let (size, _) = Self::size_align(layout);
+        self.add_free_region(ptr as usize, size);
     }
 }
 
