@@ -8,6 +8,11 @@
 //! step replaces it with a waker-driven executor that halts the CPU via `hlt`
 //! when no task is ready to make progress.
 
+// The kernel now uses the waker-driven `Executor` (see `executor.rs`), so nothing
+// calls this any more. We keep it in the tree as a reference to compare against,
+// and silence the resulting dead-code warnings for the whole module.
+#![allow(dead_code)]
+
 use super::Task;
 
 use alloc::collections::VecDeque;
