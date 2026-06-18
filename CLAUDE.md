@@ -35,9 +35,13 @@ the VGA text buffer, the IDT with CPU exception handlers, hardware interrupts vi
 the 8259 PIC (timer and keyboard), and Stage 4's virtual-memory work — page-table
 access and translation (4a), a frame allocator over the bootloader memory map plus
 hand-made page mappings (4b), and a heap backed by a hand-written fixed-size block
-allocator over a linked-list fallback, making `Box`/`Vec`/`Rc` usable (4c). **Next
-is Stage 5** (cooperative
-multitasking with `async`/`await`).
+allocator over a linked-list fallback, making `Box`/`Vec`/`Rc` usable (4c).
+**Stage 5 is also done**: cooperative multitasking with `async`/`await` — a
+`Task`/`TaskId` abstraction over heap-allocated futures, an async keyboard whose
+interrupt handler only enqueues scancodes onto a lock-free queue, and a
+waker-driven executor that polls a task only when woken and halts the CPU (`hlt`)
+when idle. **Next is Stage 6** (preemptive scheduling and independent kernel
+threads).
 
 ## Language and writing conventions
 
@@ -105,8 +109,9 @@ Exit QEMU: `Ctrl-A` then `X`.
 - `src/gdt.rs`: the Global Descriptor Table and Task State Segment, providing a
   dedicated IST stack for the double fault handler (loaded before the IDT).
 - `src/interrupts.rs`: the IDT, the CPU exception handlers (breakpoint and
-  double fault), and the hardware interrupt handlers (timer and keyboard) along
-  with the 8259 PIC setup.
+  double fault), and the hardware interrupt handlers along with the 8259 PIC
+  setup — the timer counts ticks, and the keyboard handler (since Stage 5) just
+  pushes the raw scancode onto the async keyboard's queue.
 - `src/memory.rs`: virtual-memory helpers — reads CR3 and builds an
   `OffsetPageTable` over the active page tables (via the bootloader's complete
   physical-memory mapping) for translating virtual addresses, plus a
@@ -116,6 +121,12 @@ Exit QEMU: `Ctrl-A` then `X`.
   registers a `#[global_allocator]` (a hand-written fixed-size block allocator
   over a linked-list fallback), so the `alloc` crate's `Box`/`Vec`/`Rc`/`String`
   become usable.
+- `src/task/`: Stage 5 cooperative multitasking — `mod.rs` (`Task` and the unique
+  `TaskId`), `simple_executor.rs` (a naive busy-polling executor, kept for
+  reference), `keyboard.rs` (the async keyboard: a lock-free scancode queue filled
+  by the IRQ1 handler and drained by a `Stream`-based task that decodes and
+  echoes), and `executor.rs` (the waker-driven executor that sleeps on `hlt` when
+  no task is ready).
 - `.cargo/config.toml`: the bare-metal target (`x86_64-unknown-none`), build-std,
   and the QEMU runner config.
 - `.claude/settings.json`: pre-approved permissions (cargo + git, including

@@ -13,7 +13,7 @@ Recommended: create a git branch per stage, and merge back to main once it runs.
 | **2** | CPU exception handling (IDT), trigger a breakpoint exception | interrupt / exception mechanism | Done |
 | **3** | Hardware interrupts (PIC), keyboard input, timer interrupt | interrupt controller, device drivers | Done |
 | **4** | Paging + heap allocator, make `Box` / `Vec` usable | virtual memory, address spaces | Done |
-| **5** | Cooperative multitasking (tasks written with `async` / `await`) | processes / tasks, scheduling | Todo |
+| **5** | Cooperative multitasking (tasks written with `async` / `await`) | processes / tasks, scheduling | Done |
 | **6** | Preemptive scheduling, independent kernel threads | context switching, time slices | Todo |
 | **7** | Simple shell + built-in commands | system calls, user interaction | Todo |
 | **8** | In-memory simple file system | file abstraction, VFS | Todo |
