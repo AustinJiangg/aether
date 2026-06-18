@@ -1,4 +1,4 @@
-//! A waker-driven executor (Stage 5, step 3a).
+//! A waker-driven executor (Stage 5).
 //!
 //! `SimpleExecutor` re-polled *every* task in a loop, even ones with nothing to
 //! do — burning the CPU. This executor polls a task **only when it has been
@@ -12,8 +12,8 @@
 //! that waker; later the interrupt handler calls `wake()` on it, which pushes the
 //! task's id onto `ready_queue` so our next sweep polls it again.
 //!
-//! One piece is deliberately missing here: when `ready_queue` is empty this still
-//! spins. A later step halts the CPU until an interrupt wakes a task.
+//! When `ready_queue` is empty, `sleep_if_idle` halts the CPU with `hlt` until an
+//! interrupt arrives, instead of spinning — so an idle kernel uses no CPU.
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -102,15 +102,43 @@ impl Executor {
         }
     }
 
-    /// Run forever, polling tasks as they become ready.
+    /// Run forever, polling tasks as they become ready and halting the CPU when
+    /// there is nothing to do.
     ///
     /// The return type `!` ("never") says this function does not return — there is
-    /// no caller in the kernel to return to. For now it spins when `ready_queue`
-    /// is empty; the next step makes it halt the CPU until an interrupt wakes a
-    /// task.
+    /// no caller in the kernel to return to. Each iteration drains the ready
+    /// tasks, then `sleep_if_idle` puts the CPU to sleep until the next interrupt
+    /// if no task is waiting.
     pub fn run(&mut self) -> ! {
         loop {
             self.run_ready_tasks();
+            self.sleep_if_idle();
+        }
+    }
+
+    /// Halt the CPU until the next interrupt, but only if no task is ready.
+    ///
+    /// The subtlety is a race against interrupts. Between checking "is the ready
+    /// queue empty?" and executing `hlt`, a keyboard interrupt could fire, enqueue
+    /// a scancode, and wake its task — pushing onto `ready_queue`. If we then
+    /// halted anyway, that wakeup would be wasted and the task would not run until
+    /// the *next*, unrelated interrupt (or never). So we disable interrupts while
+    /// we decide:
+    ///   - if the queue is empty, `enable_and_hlt` runs `sti; hlt`. On x86 `sti`
+    ///     only takes effect *after the following instruction*, so interrupts stay
+    ///     masked until the `hlt` is already executing — a pending interrupt
+    ///     cannot slip in between the check and the halt; it fires the instant we
+    ///     halt and wakes us straight back up;
+    ///   - if work appeared just before we disabled interrupts, we re-enable them
+    ///     and loop around to poll it, without sleeping.
+    fn sleep_if_idle(&self) {
+        use x86_64::instructions::interrupts::{self, enable_and_hlt};
+
+        interrupts::disable();
+        if self.ready_queue.is_empty() {
+            enable_and_hlt();
+        } else {
+            interrupts::enable();
         }
     }
 }

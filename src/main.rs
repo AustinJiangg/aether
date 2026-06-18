@@ -21,8 +21,9 @@
 //! polls a task only when it has been woken (each task carries a unique
 //! `TaskId`). Two tasks run: a one-shot `example_task` and the async keyboard,
 //! whose interrupt handler only enqueues raw scancodes and wakes the task that
-//! decodes and echoes them. (One piece is left: the executor still spins when
-//! idle; a later step halts the CPU until the next interrupt.)
+//! decodes and echoes them. When no task is ready, the executor halts the CPU
+//! until the next interrupt, so an idle kernel uses no CPU. This completes
+//! Stage 5.
 //!
 //! See ROADMAP.md for what comes next.
 

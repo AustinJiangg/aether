@@ -11,7 +11,7 @@
 //! This module defines the [`Task`] wrapper and its [`TaskId`]. Two executors
 //! drive tasks: [`simple_executor`] (a first, busy-polling version, kept for
 //! reference) and [`executor`] (waker-driven — it polls a task only when it has
-//! been woken). A later step lets the latter halt the CPU when idle.
+//! been woken, and halts the CPU when none is ready).
 
 pub mod executor;
 pub mod keyboard;
