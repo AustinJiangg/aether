@@ -12,6 +12,7 @@
 //! tasks lives in [`simple_executor`] — a first, busy-polling version. A later
 //! step adds a waker-driven executor that can sleep the CPU between events.
 
+pub mod keyboard;
 pub mod simple_executor;
 
 use core::future::Future;

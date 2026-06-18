@@ -35,6 +35,24 @@ spin = "0.9"
 pic8259 = "0.10"
 pc-keyboard = "0.9.0"
 
+# Combinators and utilities for `Future` / `Stream`. Stage 5 uses `Stream` /
+# `StreamExt` (to `.await` a sequence of scancodes one by one) and `AtomicWaker`
+# (so the keyboard interrupt can wake the task waiting on that stream). Built for
+# no_std: default features off, only `alloc` on.
+futures-util = { version = "0.3.32", default-features = false, features = ["alloc"] }
+
+# Lock-free concurrent queues. `ArrayQueue` is a bounded ring buffer that the
+# keyboard interrupt handler can push scancodes into *without taking a lock* —
+# locking inside an interrupt handler risks deadlocking against interrupted code
+# that already holds the same lock. no_std: default off, `alloc` on.
+crossbeam-queue = { version = "0.3.12", default-features = false, features = ["alloc"] }
+
+# A `OnceCell` that is initialized once and then read concurrently (including
+# from interrupt context). Holds the global scancode queue. Default features off
+# for no_std (the default pulls in `std`); that exposes the spin-based
+# `conquer_once::spin::OnceCell`.
+conquer-once = { version = "0.4.0", default-features = false }
+
 # ---------------------------------------------------------------------------
 # bootimage / QEMU run configuration
 # ---------------------------------------------------------------------------

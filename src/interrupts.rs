@@ -25,13 +25,12 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use pc_keyboard::{layouts::Us104Key, DecodedKey, HandleControl, PS2Keyboard, ScancodeSet1};
 use pic8259::ChainedPics;
 use spin::{Lazy, Mutex};
 use x86_64::instructions::port::Port;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 
-use crate::{gdt, hlt_loop, print, println, serial_print, serial_println};
+use crate::{gdt, hlt_loop, println, serial_println};
 
 /// The kernel's interrupt descriptor table.
 ///
@@ -88,16 +87,6 @@ static PICS: Mutex<ChainedPics> =
 /// serial log below; later stages (preemptive scheduling) will drive time slices
 /// from a tick counter like this one.
 static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
-
-/// Decoder for PS/2 scancodes from the keyboard (IRQ1): US layout, scancode set
-/// 1 (what the emulated PC keyboard sends). `HandleControl::Ignore` leaves a
-/// Ctrl+key combination as the plain letter instead of a control code. Its
-/// constructors are `const`, so it needs no lazy initialization.
-static KEYBOARD: Mutex<PS2Keyboard<Us104Key, ScancodeSet1>> = Mutex::new(PS2Keyboard::new(
-    ScancodeSet1::new(),
-    Us104Key,
-    HandleControl::Ignore,
-));
 
 /// Vector numbers for the hardware interrupts we handle, laid out relative to
 /// the PIC offset. IRQ0 (the timer) lands on `PIC_1_OFFSET` (= 32) and IRQ1
@@ -188,36 +177,19 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
 ///
 /// The PS/2 controller latches one scancode byte at I/O port 0x60 for each key
 /// press or release. We must read that byte to clear the controller, or it will
-/// not raise another keyboard interrupt. The raw byte is fed to `pc-keyboard`,
-/// which assembles it into key events and decodes those into characters; we
-/// echo printable keys to both the screen and the serial log.
+/// not raise another keyboard interrupt. As of Stage 5 the handler does nothing
+/// else with it: decoding and echoing moved into the async keyboard task. We just
+/// hand the raw byte off through a lock-free queue (`add_scancode`) and then
+/// acknowledge the interrupt. Keeping the handler this short — no locks, no
+/// allocation, no printing on the hot path — is what makes it safe to run at any
+/// moment, even while other code holds a lock.
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
     let mut port: Port<u8> = Port::new(0x60);
     // SAFETY: 0x60 is the fixed PS/2 data port. Reading it consumes exactly one
     // pending scancode byte and has no other side effects; we must do it before
     // sending the EOI so the controller will deliver the next byte.
     let scancode: u8 = unsafe { port.read() };
-
-    // Scope the keyboard lock so it is released before we signal the PIC.
-    {
-        let mut keyboard = KEYBOARD.lock();
-        // A key event may span several scancode bytes, so `add_byte` returns
-        // `Ok(None)` until it has a complete event.
-        if let Ok(Some(event)) = keyboard.add_byte(scancode) {
-            if let Some(key) = keyboard.process_keyevent(event) {
-                match key {
-                    DecodedKey::Unicode(character) => {
-                        print!("{}", character);
-                        serial_print!("{}", character);
-                    }
-                    DecodedKey::RawKey(raw) => {
-                        print!("{:?}", raw);
-                        serial_print!("{:?}", raw);
-                    }
-                }
-            }
-        }
-    }
+    crate::task::keyboard::add_scancode(scancode);
 
     // SAFETY: we send the EOI for exactly the vector we are currently servicing.
     unsafe {

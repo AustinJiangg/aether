@@ -17,8 +17,12 @@
 //! operating system and takes over the CPU.
 //!
 //! Stage 5 (in progress) adds cooperative multitasking with `async`/`await`.
-//! Step 1 (this commit) introduces a `Task` wrapper plus a simple round-robin
-//! executor, and runs one example task to completion to prove the mechanism.
+//! A `Task` wraps a pinned, heap-allocated future, and `SimpleExecutor` polls
+//! queued tasks round-robin. Two tasks run: a one-shot `example_task` and the
+//! async keyboard, whose interrupt handler now only enqueues raw scancodes while
+//! the task decodes and echoes them off the interrupt path. (A later step swaps
+//! in a waker-driven executor that sleeps the CPU between events instead of
+//! busy-polling.)
 //!
 //! See ROADMAP.md for what comes next.
 
@@ -241,23 +245,28 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_println!("[ OK ] heap works; Box / Vec / Rc are usable");
     println!("Heap is live; Box / Vec / Rc all work (details on the serial log).");
 
-    // Stage 5 (step 1): cooperative multitasking with async/await. An `async fn`
-    // compiles to a state machine implementing `Future`; the kernel's job is to
-    // `poll` that future until it is `Ready`. `SimpleExecutor` does exactly that —
-    // it holds a queue of tasks and polls each in turn. `example_task` awaits a
-    // number and prints it, then completes, so `run()` returns once the queue
-    // drains. (This first executor busy-polls with a no-op waker; a later step
-    // adds a real waker so the CPU can sleep between events.)
-    let mut executor = SimpleExecutor::new();
-    executor.spawn(Task::new(example_task()));
-    executor.run();
-    serial_println!("[ OK ] async executor drove example_task to completion");
-
+    // Stage 5: cooperative multitasking with async/await. An `async fn` compiles
+    // to a state machine implementing `Future`; the executor's job is to `poll`
+    // each task's future until it is `Ready`. We hand the CPU to `SimpleExecutor`
+    // running two tasks:
+    //   - `example_task`: a one-shot demo that awaits a number, prints it, and
+    //     finishes (proving the executor drives a future to completion);
+    //   - `print_keypresses`: the async keyboard. The IRQ1 handler now only
+    //     enqueues raw scancodes and wakes this task, which decodes and echoes
+    //     them here, in task context, instead of inside the interrupt.
     println!();
     println!("Keyboard is live - type and your keystrokes will echo below:");
+    serial_println!("Kernel handing control to the async executor.");
 
-    serial_println!("Kernel entering idle loop. Press Ctrl-A then X to exit QEMU.");
+    let mut executor = SimpleExecutor::new();
+    executor.spawn(Task::new(example_task()));
+    executor.spawn(Task::new(task::keyboard::print_keypresses()));
+    executor.run();
 
+    // `SimpleExecutor::run` returns only once *every* task finishes, but
+    // `print_keypresses` loops forever — so control never comes back here. We
+    // still end in `hlt_loop` to satisfy the `-> !` return type and as a backstop.
+    // (This executor busy-polls instead of sleeping; a later step fixes that.)
     hlt_loop();
 }
 
