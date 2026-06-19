@@ -1,4 +1,4 @@
-//! Stage 6a: cooperative kernel threads.
+//! Stage 6: independent kernel threads.
 //!
 //! Stage 5's async tasks share a single kernel stack and cooperate by returning
 //! `Poll::Pending` at an `.await`; the compiler turns each task into a state
@@ -7,14 +7,26 @@
 //! register context**, and we move between threads by hand-rolled
 //! [`switch::context_switch`].
 //!
-//! For this stage the switches are still **cooperative** — a thread keeps the CPU
-//! until it calls [`yield_now`]. Stage 6b will trigger the very same machinery
-//! from the timer interrupt, turning it into *preemptive* scheduling where a
-//! thread can be switched out at any instruction, even mid-loop.
+//! Stage 6a drove these switches **cooperatively** — a thread kept the CPU until
+//! it called [`yield_now`]. Stage 6b adds **preemption**: the timer interrupt
+//! calls [`schedule`], which performs the very same [`switch::context_switch`]
+//! from interrupt context. A thread can now be switched out at any instruction,
+//! even in the middle of a tight loop that never yields.
+//!
+//! How preemption reuses the cooperative switch: the timer's handler is a normal
+//! `extern "x86-interrupt"` function. Its compiler-generated prologue/epilogue
+//! already save and restore the *full* register state of the interrupted thread
+//! and end in `iretq`. Inside it we just call `context_switch`, which — from each
+//! thread's own point of view — behaves like an ordinary function call that
+//! returns much later. A preempted thread is parked at that call; when it is
+//! scheduled again the call returns, the handler's epilogue runs, and `iretq`
+//! resumes it at the exact instruction the timer interrupted. So no separate
+//! "save every register" assembly is needed.
 //!
 //! The scheduling policy is the simplest possible: **round-robin**. A
 //! [`Scheduler`] keeps every thread in a map and a queue of the ones that are
-//! ready to run; [`yield_now`] rotates to the front of the queue.
+//! ready to run; the rotation moves the running thread to the back and takes the
+//! front.
 //!
 //! Stacks are allocated from the Stage 4c heap. They have **no guard page**, so a
 //! thread that overflows its stack silently corrupts adjacent heap data rather
@@ -25,9 +37,10 @@ mod switch;
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use spin::Mutex;
+use x86_64::instructions::interrupts;
 
 use crate::{hlt_loop, println, serial_println};
 
@@ -102,11 +115,17 @@ impl Scheduler {
 
 /// The kernel's single scheduler.
 ///
-/// In Stage 6a nothing in interrupt context touches this lock (the timer handler
-/// only counts ticks), so a plain spinlock is safe. Stage 6b, which reschedules
-/// *from* the timer interrupt, will have to disable interrupts around accesses to
-/// avoid an interrupt deadlocking against a thread that already holds the lock.
+/// Now that the timer interrupt reschedules *through* this lock (see [`schedule`]),
+/// access discipline matters: thread-context code that switches ([`yield_now`],
+/// [`thread_exit`]) disables interrupts around its critical section, and the timer
+/// path uses `try_lock` and simply skips a tick rather than deadlocking against a
+/// thread that is mid-update.
 static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
+
+/// Whether timer-driven preemption is active. [`run`] sets it once the threads are
+/// spawned; until then the timer interrupt only counts ticks (Stage 6a behavior)
+/// and never switches threads — so spawning and setup run without being preempted.
+static PREEMPTION_ON: AtomicBool = AtomicBool::new(false);
 
 /// Register the current (boot) execution context as thread 0.
 ///
@@ -229,6 +248,11 @@ extern "C" fn thread_entry() -> ! {
             .expect("thread 0 must never reach thread_entry")
     };
 
+    // We may have been scheduled for the very first time from the timer interrupt,
+    // where interrupts are disabled. A kernel thread must run with interrupts
+    // enabled, or it could never be preempted again. Turn them on before running.
+    interrupts::enable();
+
     entry();
 
     thread_exit();
@@ -240,6 +264,11 @@ extern "C" fn thread_entry() -> ! {
 /// stays in the map (now `Finished`) until `reap_finished`, running on a different
 /// stack, drops it.
 fn thread_exit() -> ! {
+    // Disable interrupts so the timer cannot preempt us partway through the exit
+    // switch. We never return, so we never re-enable them here; the thread we hand
+    // the CPU to restores its own interrupt state as it resumes.
+    interrupts::disable();
+
     let (old_rsp, new_rsp) = {
         let mut scheduler = SCHEDULER.lock();
         let current_id = scheduler
@@ -249,12 +278,13 @@ fn thread_exit() -> ! {
 
         // Hand the CPU to the next ready thread. The bootstrap thread is normally
         // queued, so this almost always succeeds; if somehow nothing is ready,
-        // there is no thread left to run, so just halt on this (now-dead) stack.
+        // there is no thread left to run, so re-enable interrupts and idle.
         let next_id = match scheduler.ready_queue.pop_front() {
             Some(id) => id,
             None => {
                 drop(scheduler);
                 serial_println!("[scheduler] last thread exited; halting");
+                interrupts::enable();
                 hlt_loop();
             }
         };
@@ -269,51 +299,85 @@ fn thread_exit() -> ! {
     };
 
     // SAFETY: `old_rsp` is a valid writable slot and `new_rsp` was produced by
-    // `context_switch`/`prepare_stack`; the lock is dropped before switching.
+    // `context_switch`/`prepare_stack`; the lock is dropped before switching and
+    // interrupts are disabled, so the switch cannot be interrupted.
     unsafe {
         switch::context_switch(old_rsp, new_rsp);
     }
     unreachable!("a finished thread was scheduled again");
 }
 
-/// Voluntarily give up the CPU to the next ready thread (round-robin).
+/// Rotate to the next ready thread, given an already-locked scheduler.
 ///
-/// Returns `true` if it actually switched, `false` if this thread was the only
-/// one ready (in which case it simply keeps running).
-pub fn yield_now() -> bool {
-    let (old_rsp, new_rsp) = {
-        let mut scheduler = SCHEDULER.lock();
-        let current_id = scheduler
-            .current
-            .expect("yield_now reached with no current thread");
+/// Moves the current thread to the back of the ready queue, makes the front
+/// thread current, **drops the lock**, and switches. Returns `true` if it
+/// switched, `false` if no other thread was ready (the lock is dropped either
+/// way). Shared by the cooperative [`yield_now`] and the preemptive [`schedule`].
+///
+/// Callers MUST have interrupts disabled: the switch has to be atomic with
+/// respect to the timer, and `context_switch` must never run with interrupts on
+/// (a tick striking mid-switch, while the stack is half-swapped, is fatal).
+fn switch_to_next(mut scheduler: spin::MutexGuard<'_, Scheduler>) -> bool {
+    let current_id = scheduler
+        .current
+        .expect("switch_to_next reached with no current thread");
 
-        // If no other thread is ready, there is nothing to switch to.
-        let next_id = match scheduler.ready_queue.pop_front() {
-            Some(id) => id,
-            None => return false,
-        };
-
-        // The current thread goes to the back of the ready queue...
-        scheduler.threads.get_mut(&current_id).unwrap().state = ThreadState::Ready;
-        scheduler.ready_queue.push_back(current_id);
-        // ...and the one we popped takes the CPU.
-        scheduler.threads.get_mut(&next_id).unwrap().state = ThreadState::Running;
-        scheduler.current = Some(next_id);
-
-        let new_rsp = scheduler.threads[&next_id].stack_pointer;
-        let old_rsp: *mut u64 = &mut scheduler.threads.get_mut(&current_id).unwrap().stack_pointer;
-        (old_rsp, new_rsp)
+    // If no other thread is ready, there is nothing to switch to.
+    let next_id = match scheduler.ready_queue.pop_front() {
+        Some(id) => id,
+        None => return false,
     };
+
+    // The current thread goes to the back of the ready queue...
+    scheduler.threads.get_mut(&current_id).unwrap().state = ThreadState::Ready;
+    scheduler.ready_queue.push_back(current_id);
+    // ...and the one we popped takes the CPU.
+    scheduler.threads.get_mut(&next_id).unwrap().state = ThreadState::Running;
+    scheduler.current = Some(next_id);
+
+    let new_rsp = scheduler.threads[&next_id].stack_pointer;
+    let old_rsp: *mut u64 = &mut scheduler.threads.get_mut(&current_id).unwrap().stack_pointer;
+    drop(scheduler);
 
     // SAFETY: both come from live `Thread` entries — `old_rsp` is the current
     // thread's saved-sp slot, `new_rsp` was produced by `context_switch` or
-    // `prepare_stack`. Crucially, the scheduler lock is released above *before* we
-    // switch, so the thread we resume can lock the scheduler itself (e.g. to
-    // `yield_now` in turn) without deadlocking against us.
+    // `prepare_stack`. The lock is dropped above so the thread we resume can lock
+    // the scheduler itself; callers guarantee interrupts are disabled, so this
+    // switch cannot be interrupted by the timer.
     unsafe {
         switch::context_switch(old_rsp, new_rsp);
     }
     true
+}
+
+/// Voluntarily give up the CPU to the next ready thread (round-robin).
+///
+/// Returns `true` if it actually switched, `false` if this thread was the only
+/// one ready. With preemption now active, the Stage 6b demo never calls this —
+/// it relies on the timer instead — but it remains the API a thread uses to cede
+/// the CPU willingly, and shares its switch path with [`schedule`].
+#[allow(dead_code)]
+pub fn yield_now() -> bool {
+    // Disable interrupts around the whole switch (restored when we are resumed),
+    // so the timer cannot preempt us between picking the next thread and the
+    // actual stack swap.
+    interrupts::without_interrupts(|| switch_to_next(SCHEDULER.lock()))
+}
+
+/// Preempt the current thread; called from the timer interrupt handler.
+///
+/// A no-op until [`run`] arms preemption. We use `try_lock` so that if a thread
+/// is mid-update of the scheduler (holding the lock with interrupts disabled), we
+/// simply skip this tick instead of spinning forever on a lock that cannot be
+/// released until we return. We are already in interrupt context with interrupts
+/// disabled, which is exactly what `switch_to_next` requires.
+pub fn schedule() {
+    if !PREEMPTION_ON.load(Ordering::SeqCst) {
+        return;
+    }
+    if let Some(scheduler) = SCHEDULER.try_lock() {
+        switch_to_next(scheduler);
+    }
 }
 
 /// Free the stacks of any threads that have finished.
@@ -321,7 +385,9 @@ pub fn yield_now() -> bool {
 /// Safe to call only from a thread that is not itself being reaped — we run this
 /// from the bootstrap thread in [`run`], so we are never freeing the stack we are
 /// standing on. Removing a thread from the map drops its `Box<[u8]>` stack,
-/// returning that memory to the heap.
+/// returning that memory to the heap. The timer cannot preempt us mid-reap: while
+/// we hold the scheduler lock, [`schedule`]'s `try_lock` fails and the tick is
+/// skipped.
 fn reap_finished() {
     let mut scheduler = SCHEDULER.lock();
     let finished: Vec<ThreadId> = scheduler
@@ -337,18 +403,29 @@ fn reap_finished() {
 
 /// Hand the bootstrap thread over to the scheduler and never return.
 ///
-/// We round-robin through the spawned threads with `yield_now`, reaping finished
-/// ones each time around. Because nothing blocks in Stage 6a, the first time
-/// `yield_now` reports it could not switch means every other thread has finished
-/// — so we clean up and halt the CPU.
+/// We arm timer-driven preemption, then settle into an idle loop: reap finished
+/// threads and `hlt` until the next interrupt. From here on the **timer** drives
+/// scheduling — each tick may preempt whatever is running (including this idle
+/// loop) to run a ready thread. When every spawned thread has finished, the timer
+/// finds nothing else ready and keeps returning here, so the kernel idles.
 pub fn run() -> ! {
+    // Arm preemption: from the next tick on, the timer interrupt will switch
+    // threads. Everything before this point (init, spawn) ran without that risk.
+    PREEMPTION_ON.store(true, Ordering::SeqCst);
+
+    let mut announced = false;
     loop {
         reap_finished();
-        if !yield_now() {
-            reap_finished();
+
+        // Once only the bootstrap thread remains, every demo thread has finished.
+        if !announced && SCHEDULER.lock().threads.len() == 1 {
+            announced = true;
             serial_println!("[scheduler] all kernel threads finished; idling");
             println!("All kernel threads finished; kernel is now idle.");
-            hlt_loop();
         }
+
+        // Sleep until the next interrupt. The timer will either preempt us to run
+        // a ready thread, or — if none are ready — return right here to halt again.
+        x86_64::instructions::hlt();
     }
 }

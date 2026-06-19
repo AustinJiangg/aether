@@ -23,14 +23,15 @@
 //! and echoes them. When no task is ready, the executor halts the CPU until the
 //! next interrupt, so an idle kernel uses no CPU.
 //!
-//! Stage 6a (this stage) adds independent kernel threads. Unlike an async task,
-//! each thread owns a separate stack and a full CPU register context, swapped by
-//! hand in `thread::switch::context_switch`. For now they switch *cooperatively*
-//! via `thread::yield_now`: we register the boot context as thread 0, spawn a few
-//! demo threads, and round-robin between them — their interleaved output proves
-//! the switch works. Stage 6b will drive the same switch from the timer interrupt
-//! to make scheduling preemptive. (The Stage 5 async executor is set aside while
-//! this stage runs the thread scheduler, and folded back in later.)
+//! Stage 6 adds independent kernel threads. Unlike an async task, each thread
+//! owns a separate stack and a full CPU register context, swapped by hand in
+//! `thread::switch::context_switch`. Stage 6a built that switch and drove it
+//! cooperatively via `thread::yield_now`; Stage 6b (this stage) makes scheduling
+//! *preemptive*: the timer interrupt calls `thread::schedule`, which switches to
+//! the next ready thread. The demo threads now busy-loop and never yield, yet
+//! still take turns — proof that the timer is forcibly preempting them. (The
+//! Stage 5 async executor is set aside while this stage runs the thread
+//! scheduler, and folded back in later.)
 //!
 //! See ROADMAP.md for what comes next.
 
@@ -258,17 +259,16 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_println!("[ OK ] heap works; Box / Vec / Rc are usable");
     println!("Heap is live; Box / Vec / Rc all work (details on the serial log).");
 
-    // Stage 6a: cooperative kernel threads. Unlike the Stage 5 async tasks (which
-    // share one stack and cooperate at `.await`), each thread here owns its own
-    // heap-allocated stack and a full saved register context, switched by hand in
-    // `thread::switch::context_switch`. We register the boot context as thread 0,
-    // spawn three demo threads, and hand control to the round-robin scheduler.
-    // Each demo thread yields after every line, so the three outputs interleave —
-    // that interleaving is the proof the context switch works. `thread::run` never
-    // returns (`-> !`), so it is the kernel's final call.
+    // Stage 6b: preemptive scheduling. Same idea as 6a, but the demo threads now
+    // busy-loop and never call `yield_now` — the timer interrupt (via
+    // `thread::schedule`) forcibly switches between them. We register the boot
+    // context as thread 0, spawn the three demo threads, and hand control to
+    // `thread::run`, which arms preemption and then idles, reaping finished
+    // threads and halting between ticks. `thread::run` never returns (`-> !`), so
+    // it is the kernel's final call.
     println!();
-    println!("Stage 6a: three cooperative kernel threads, round-robin below:");
-    serial_println!("Kernel handing control to the thread scheduler.");
+    println!("Stage 6b: three preempted kernel threads (none ever yield) below:");
+    serial_println!("Kernel arming preemptive scheduler; timer will switch threads.");
 
     thread::init();
     thread::spawn(demo_thread_a);
@@ -308,24 +308,35 @@ fn stack_overflow() {
     core::hint::black_box(());
 }
 
-// Stage 6a demo threads. Each prints a few numbered lines and calls
-// `thread::yield_now()` after every one, handing the CPU to the next thread. The
-// scheduler is round-robin, so the three streams interleave (A0, B0, C0, A1, ...)
-// — visible proof that the context switch saves and restores each thread
-// correctly. They differ only in their label, so a small macro keeps them DRY.
-macro_rules! demo_thread {
+/// How many iterations each demo thread burns between prints. Tuned so a step
+/// spans several timer ticks, giving the timer chances to preempt a thread
+/// mid-step. It is pure busy-work with no `yield_now()`, so ANY interleaving of
+/// the three threads' output below can only be the timer preempting them.
+const BUSY_ITERS: u64 = 400_000;
+
+// Stage 6b demo threads. Each prints a few numbered steps, but between them it
+// just spins on CPU-bound work and NEVER yields. With cooperative scheduling this
+// would let the first thread monopolize the CPU forever; under preemption the
+// timer slices time between them, so the three streams still interleave. They
+// differ only in their label, so a small macro keeps them DRY.
+macro_rules! busy_thread {
     ($name:ident, $label:literal) => {
         fn $name() {
-            for i in 0..5 {
-                println!("[thread {}] step {}", $label, i);
-                serial_println!("[thread {}] step {}", $label, i);
-                thread::yield_now();
+            for step in 0..5 {
+                // Burn CPU without ever calling thread::yield_now().
+                let mut acc: u64 = 0;
+                for k in 0..BUSY_ITERS {
+                    acc = acc.wrapping_add(k);
+                    core::hint::black_box(acc);
+                }
+                println!("[thread {}] step {} (acc={})", $label, step, acc);
+                serial_println!("[thread {}] step {}", $label, step);
             }
             serial_println!("[thread {}] finished", $label);
         }
     };
 }
 
-demo_thread!(demo_thread_a, "A");
-demo_thread!(demo_thread_b, "B");
-demo_thread!(demo_thread_c, "C");
+busy_thread!(demo_thread_a, "A");
+busy_thread!(demo_thread_b, "B");
+busy_thread!(demo_thread_c, "C");

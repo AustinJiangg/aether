@@ -154,10 +154,20 @@ extern "x86-interrupt" fn double_fault_handler(
 /// Handler for the timer interrupt (IRQ0, remapped to vector 32).
 ///
 /// The PIC raises this periodically on its own; unlike `int3`, nothing in our
-/// code asks for it. We count the tick (logging it occasionally) and then
-/// acknowledge the interrupt. Acknowledgement is mandatory: until the PIC
-/// receives an end-of-interrupt (EOI), it delivers no further interrupt on this
-/// line, so the timer would appear to fire exactly once.
+/// code asks for it. We count the tick (logging it occasionally), acknowledge the
+/// interrupt, and then — since Stage 6b — drive preemptive scheduling.
+///
+/// Acknowledgement (EOI) is mandatory and is sent *before* we reschedule: until
+/// the PIC receives the EOI it delivers no further timer interrupt, and the
+/// `thread::schedule` call below may switch to another thread and not return here
+/// for a while. Sending the EOI first guarantees each timer IRQ is acknowledged
+/// exactly once regardless of switching.
+///
+/// `thread::schedule` is a no-op until the thread scheduler is armed
+/// (`thread::run`). When it does switch, it swaps to another thread's stack and
+/// returns to *this* handler only once the current thread is scheduled again; at
+/// that point this handler's epilogue runs `iretq`, resuming the thread exactly
+/// where the timer originally struck.
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
     let count = TIMER_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     // Log the first tick (proof the IRQ fired and EOI works), then every 100th,
@@ -171,6 +181,9 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
         PICS.lock()
             .notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
     }
+    // Preemptively reschedule. Must run after the EOI (see above) and with the
+    // PICS lock already released, so we do not hold it across a context switch.
+    crate::thread::schedule();
 }
 
 /// Handler for the keyboard interrupt (IRQ1, remapped to vector 33).
