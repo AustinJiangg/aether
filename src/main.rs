@@ -16,14 +16,21 @@
 //! This is already a true "bare metal" program — it runs on no underlying
 //! operating system and takes over the CPU.
 //!
-//! Stage 5 (in progress) adds cooperative multitasking with `async`/`await`.
-//! A `Task` wraps a pinned, heap-allocated future. A waker-driven `Executor`
-//! polls a task only when it has been woken (each task carries a unique
-//! `TaskId`). Two tasks run: a one-shot `example_task` and the async keyboard,
-//! whose interrupt handler only enqueues raw scancodes and wakes the task that
-//! decodes and echoes them. When no task is ready, the executor halts the CPU
-//! until the next interrupt, so an idle kernel uses no CPU. This completes
-//! Stage 5.
+//! Stage 5 added cooperative multitasking with `async`/`await`. A `Task` wraps a
+//! pinned, heap-allocated future. A waker-driven `Executor` polls a task only when
+//! it has been woken (each task carries a unique `TaskId`). The async keyboard's
+//! interrupt handler only enqueues raw scancodes and wakes the task that decodes
+//! and echoes them. When no task is ready, the executor halts the CPU until the
+//! next interrupt, so an idle kernel uses no CPU.
+//!
+//! Stage 6a (this stage) adds independent kernel threads. Unlike an async task,
+//! each thread owns a separate stack and a full CPU register context, swapped by
+//! hand in `thread::switch::context_switch`. For now they switch *cooperatively*
+//! via `thread::yield_now`: we register the boot context as thread 0, spawn a few
+//! demo threads, and round-robin between them — their interleaved output proves
+//! the switch works. Stage 6b will drive the same switch from the timer interrupt
+//! to make scheduling preemptive. (The Stage 5 async executor is set aside while
+//! this stage runs the thread scheduler, and folded back in later.)
 //!
 //! See ROADMAP.md for what comes next.
 
@@ -46,7 +53,15 @@ mod gdt;
 mod interrupts;
 mod memory;
 mod allocator;
+// The Stage 5 async-task subsystem is dormant during Stage 6a: the kernel hands
+// control to the thread scheduler instead of the async executor, so the executor
+// and scancode stream sit unused. (The IRQ-side `add_scancode` is still wired up;
+// with no stream created, the queue stays uninitialized and stray keypresses are
+// harmlessly dropped with a warning.) Silence the resulting dead-code warnings for
+// the whole subtree until a later stage folds async tasks and threads together.
+#[allow(dead_code)]
 mod task;
+mod thread;
 
 use core::panic::PanicInfo;
 
@@ -56,9 +71,6 @@ use alloc::vec::Vec;
 use bootloader::{entry_point, BootInfo};
 use x86_64::structures::paging::{FrameAllocator, Page, Translate};
 use x86_64::VirtAddr;
-
-use task::executor::Executor;
-use task::Task;
 
 // Register `kernel_main` as the kernel entry point.
 //
@@ -246,24 +258,23 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_println!("[ OK ] heap works; Box / Vec / Rc are usable");
     println!("Heap is live; Box / Vec / Rc all work (details on the serial log).");
 
-    // Stage 5: cooperative multitasking with async/await. An `async fn` compiles
-    // to a state machine implementing `Future`; the executor's job is to `poll`
-    // each task's future until it is `Ready`. We hand the CPU to the waker-driven
-    // `Executor` running two tasks:
-    //   - `example_task`: a one-shot demo that awaits a number, prints it, and
-    //     finishes (proving the executor drives a future to completion);
-    //   - `print_keypresses`: the async keyboard. The IRQ1 handler only enqueues
-    //     raw scancodes and wakes this task, which decodes and echoes them here,
-    //     in task context, instead of inside the interrupt.
-    // `Executor::run` never returns (`-> !`), so it is the kernel's final call.
+    // Stage 6a: cooperative kernel threads. Unlike the Stage 5 async tasks (which
+    // share one stack and cooperate at `.await`), each thread here owns its own
+    // heap-allocated stack and a full saved register context, switched by hand in
+    // `thread::switch::context_switch`. We register the boot context as thread 0,
+    // spawn three demo threads, and hand control to the round-robin scheduler.
+    // Each demo thread yields after every line, so the three outputs interleave —
+    // that interleaving is the proof the context switch works. `thread::run` never
+    // returns (`-> !`), so it is the kernel's final call.
     println!();
-    println!("Keyboard is live - type and your keystrokes will echo below:");
-    serial_println!("Kernel handing control to the async executor.");
+    println!("Stage 6a: three cooperative kernel threads, round-robin below:");
+    serial_println!("Kernel handing control to the thread scheduler.");
 
-    let mut executor = Executor::new();
-    executor.spawn(Task::new(example_task()));
-    executor.spawn(Task::new(task::keyboard::print_keypresses()));
-    executor.run();
+    thread::init();
+    thread::spawn(demo_thread_a);
+    thread::spawn(demo_thread_b);
+    thread::spawn(demo_thread_c);
+    thread::run();
 }
 
 /// Handler invoked when the kernel panics. On bare metal we must define this
@@ -297,18 +308,24 @@ fn stack_overflow() {
     core::hint::black_box(());
 }
 
-/// A trivial async function: it completes immediately and resolves to a number.
-/// Returning from an `async fn` is what makes its future report `Poll::Ready`.
-async fn async_number() -> u32 {
-    42
+// Stage 6a demo threads. Each prints a few numbered lines and calls
+// `thread::yield_now()` after every one, handing the CPU to the next thread. The
+// scheduler is round-robin, so the three streams interleave (A0, B0, C0, A1, ...)
+// — visible proof that the context switch saves and restores each thread
+// correctly. They differ only in their label, so a small macro keeps them DRY.
+macro_rules! demo_thread {
+    ($name:ident, $label:literal) => {
+        fn $name() {
+            for i in 0..5 {
+                println!("[thread {}] step {}", $label, i);
+                serial_println!("[thread {}] step {}", $label, i);
+                thread::yield_now();
+            }
+            serial_println!("[thread {}] finished", $label);
+        }
+    };
 }
 
-/// An example task driven by the executor. Awaiting `async_number()` suspends
-/// this future until that value is ready (here, immediately) and then resumes.
-/// The whole function is compiled into a state machine the executor polls to
-/// completion — the printed line is the proof it ran.
-async fn example_task() {
-    let number = async_number().await;
-    println!("async number: {}", number);
-    serial_println!("[task] example_task resolved async_number() = {}", number);
-}
+demo_thread!(demo_thread_a, "A");
+demo_thread!(demo_thread_b, "B");
+demo_thread!(demo_thread_c, "C");
