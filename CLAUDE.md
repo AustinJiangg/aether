@@ -40,8 +40,13 @@ allocator over a linked-list fallback, making `Box`/`Vec`/`Rc` usable (4c).
 `Task`/`TaskId` abstraction over heap-allocated futures, an async keyboard whose
 interrupt handler only enqueues scancodes onto a lock-free queue, and a
 waker-driven executor that polls a task only when woken and halts the CPU (`hlt`)
-when idle. **Next is Stage 6** (preemptive scheduling and independent kernel
-threads).
+when idle. **Stage 6 is also done**: preemptive scheduling with independent
+kernel threads — each thread owns a heap stack and a saved register context, a
+hand-written `context_switch` swaps between them (6a, cooperative via
+`yield_now`), and the timer interrupt drives a round-robin scheduler that
+preempts a running thread without its cooperation (6b). The async-task subsystem
+is dormant during this stage. **Next is Stage 7** (a simple shell with built-in
+commands).
 
 ## Language and writing conventions
 
@@ -110,8 +115,9 @@ Exit QEMU: `Ctrl-A` then `X`.
   dedicated IST stack for the double fault handler (loaded before the IDT).
 - `src/interrupts.rs`: the IDT, the CPU exception handlers (breakpoint and
   double fault), and the hardware interrupt handlers along with the 8259 PIC
-  setup — the timer counts ticks, and the keyboard handler (since Stage 5) just
-  pushes the raw scancode onto the async keyboard's queue.
+  setup — the timer counts ticks and (since Stage 6b) calls `thread::schedule`
+  after its EOI to preempt the running thread, and the keyboard handler (since
+  Stage 5) just pushes the raw scancode onto the async keyboard's queue.
 - `src/memory.rs`: virtual-memory helpers — reads CR3 and builds an
   `OffsetPageTable` over the active page tables (via the bootloader's complete
   physical-memory mapping) for translating virtual addresses, plus a
@@ -126,7 +132,12 @@ Exit QEMU: `Ctrl-A` then `X`.
   reference), `keyboard.rs` (the async keyboard: a lock-free scancode queue filled
   by the IRQ1 handler and drained by a `Stream`-based task that decodes and
   echoes), and `executor.rs` (the waker-driven executor that sleeps on `hlt` when
-  no task is ready).
+  no task is ready). Dormant during Stage 6 (marked `#[allow(dead_code)]`), to be
+  folded back in with threads later.
+- `src/thread/`: Stage 6 preemptive kernel threads — `mod.rs` (`Thread`/`ThreadId`,
+  a round-robin `Scheduler`, `spawn`/`yield_now`/`run`, the fabricated initial
+  stack frame, and `schedule` called from the timer to preempt) and `switch.rs`
+  (the naked `context_switch` that saves callee-saved registers and swaps stacks).
 - `.cargo/config.toml`: the bare-metal target (`x86_64-unknown-none`), build-std,
   and the QEMU runner config.
 - `.claude/settings.json`: pre-approved permissions (cargo + git, including
