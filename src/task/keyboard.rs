@@ -123,6 +123,10 @@ impl Stream for ScancodeStream {
 /// executor is free to run something else (or sleep the CPU) until the interrupt
 /// handler wakes us. Decoding lives here, off the interrupt path, where taking
 /// the screen/serial locks is safe.
+///
+/// Superseded by the Stage 7 shell (`src/shell.rs`), which does the same decoding
+/// but buffers a line and dispatches it. Kept as the minimal echo reference.
+#[allow(dead_code)]
 pub async fn print_keypresses() {
     let mut scancodes = ScancodeStream::new();
     let mut keyboard = PS2Keyboard::new(ScancodeSet1::new(), Us104Key, HandleControl::Ignore);

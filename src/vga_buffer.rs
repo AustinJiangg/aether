@@ -168,6 +168,25 @@ impl Writer {
         }
         self.column_position = 0;
     }
+
+    /// Erase the most recently written character on the bottom row: step the
+    /// cursor back one column and blank that cell. Does nothing at column 0 — we
+    /// do not wrap back up to the previous row, so the shell's line editing only
+    /// erases within the current line. Used by `backspace` below.
+    pub fn backspace(&mut self) {
+        if self.column_position > 0 {
+            self.column_position -= 1;
+            let blank = ScreenChar {
+                ascii_character: b' ',
+                color_code: self.color_code,
+            };
+            // SAFETY: column_position < BUFFER_WIDTH and the row is the last one,
+            // so the cell is in range; volatile write of one VGA cell.
+            unsafe {
+                Self::cell_ptr(BUFFER_HEIGHT - 1, self.column_position).write_volatile(blank);
+            }
+        }
+    }
 }
 
 /// Implementing `core::fmt::Write` is what lets `write_fmt` (and therefore the
@@ -200,6 +219,20 @@ pub fn _print(args: fmt::Arguments) {
         // write_str never fails for our Writer, so unwrap can't actually panic.
         WRITER.lock().write_fmt(args).unwrap();
     });
+}
+
+/// Clear the whole screen. Free-function wrapper around [`Writer::clear_screen`]
+/// that takes the lock with interrupts disabled, for the same deadlock-avoidance
+/// reason as `_print`. Used by the shell's `clear` command.
+pub fn clear_screen() {
+    x86_64::instructions::interrupts::without_interrupts(|| WRITER.lock().clear_screen());
+}
+
+/// Erase the last character on the current line. Free-function wrapper around
+/// [`Writer::backspace`], locked with interrupts disabled like `_print`. Used by
+/// the shell's line editing.
+pub fn backspace() {
+    x86_64::instructions::interrupts::without_interrupts(|| WRITER.lock().backspace());
 }
 
 /// Print to the VGA screen without a trailing newline. Same usage as `print!`.

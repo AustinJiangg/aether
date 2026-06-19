@@ -83,10 +83,16 @@ pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 static PICS: Mutex<ChainedPics> =
     Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
 
-/// Count of timer interrupts handled since boot. For now it only throttles the
-/// serial log below; later stages (preemptive scheduling) will drive time slices
-/// from a tick counter like this one.
+/// Count of timer interrupts handled since boot. It throttles the serial log
+/// below, paces Stage 6b's preemptive time slices, and backs the shell's `ticks`
+/// and `uptime` commands (read via [`timer_ticks`]).
 static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// The number of timer interrupts handled since boot. Exposed for the shell's
+/// `ticks` / `uptime` commands.
+pub fn timer_ticks() -> u64 {
+    TIMER_TICKS.load(Ordering::Relaxed)
+}
 
 /// Vector numbers for the hardware interrupts we handle, laid out relative to
 /// the PIC offset. IRQ0 (the timer) lands on `PIC_1_OFFSET` (= 32) and IRQ1

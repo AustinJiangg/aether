@@ -23,15 +23,17 @@
 //! and echoes them. When no task is ready, the executor halts the CPU until the
 //! next interrupt, so an idle kernel uses no CPU.
 //!
-//! Stage 6 adds independent kernel threads. Unlike an async task, each thread
-//! owns a separate stack and a full CPU register context, swapped by hand in
-//! `thread::switch::context_switch`. Stage 6a built that switch and drove it
-//! cooperatively via `thread::yield_now`; Stage 6b (this stage) makes scheduling
-//! *preemptive*: the timer interrupt calls `thread::schedule`, which switches to
-//! the next ready thread. The demo threads now busy-loop and never yield, yet
-//! still take turns — proof that the timer is forcibly preempting them. (The
-//! Stage 5 async executor is set aside while this stage runs the thread
-//! scheduler, and folded back in later.)
+//! Stage 6 added independent kernel threads with a hand-written context switch,
+//! driven cooperatively (6a) and then preemptively from the timer (6b).
+//!
+//! Stage 7 (this stage) adds a tiny interactive shell. It revives the Stage 5
+//! async executor: the shell is an async task that `.await`s decoded keystrokes
+//! from the keyboard `ScancodeStream`, buffers a line, and on Enter dispatches it
+//! to a built-in command (help, echo, clear, ticks, uptime, mem). A boot-time
+//! self-test runs a few canned commands so the shell is verifiable even without a
+//! keyboard. There is no user mode yet, so the shell runs in kernel space and its
+//! commands are direct kernel calls — a precursor to real system calls. (The
+//! Stage 6 thread scheduler is dormant while this stage runs the executor.)
 //!
 //! See ROADMAP.md for what comes next.
 
@@ -54,15 +56,15 @@ mod gdt;
 mod interrupts;
 mod memory;
 mod allocator;
-// The Stage 5 async-task subsystem is dormant during Stage 6a: the kernel hands
-// control to the thread scheduler instead of the async executor, so the executor
-// and scancode stream sit unused. (The IRQ-side `add_scancode` is still wired up;
-// with no stream created, the queue stays uninitialized and stray keypresses are
-// harmlessly dropped with a warning.) Silence the resulting dead-code warnings for
-// the whole subtree until a later stage folds async tasks and threads together.
-#[allow(dead_code)]
 mod task;
+// The Stage 6 thread scheduler is dormant during Stage 7: the kernel runs the
+// async executor (the shell) instead, so the scheduler's spawn/run/yield sit
+// unused. (Its `schedule` is still called from the timer handler, but no-ops
+// because preemption is never armed.) Silence the dead-code warnings for the
+// subtree until a later stage folds async tasks and threads together.
+#[allow(dead_code)]
 mod thread;
+mod shell;
 
 use core::panic::PanicInfo;
 
@@ -72,6 +74,9 @@ use alloc::vec::Vec;
 use bootloader::{entry_point, BootInfo};
 use x86_64::structures::paging::{FrameAllocator, Page, Translate};
 use x86_64::VirtAddr;
+
+use task::executor::Executor;
+use task::Task;
 
 // Register `kernel_main` as the kernel entry point.
 //
@@ -259,22 +264,19 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_println!("[ OK ] heap works; Box / Vec / Rc are usable");
     println!("Heap is live; Box / Vec / Rc all work (details on the serial log).");
 
-    // Stage 6b: preemptive scheduling. Same idea as 6a, but the demo threads now
-    // busy-loop and never call `yield_now` — the timer interrupt (via
-    // `thread::schedule`) forcibly switches between them. We register the boot
-    // context as thread 0, spawn the three demo threads, and hand control to
-    // `thread::run`, which arms preemption and then idles, reaping finished
-    // threads and halting between ticks. `thread::run` never returns (`-> !`), so
-    // it is the kernel's final call.
+    // Stage 7: an interactive shell on the revived async executor. First a boot
+    // self-test runs a few canned commands through the shell's dispatcher, so the
+    // command logic is verifiable even without a keyboard (e.g. headless QEMU).
+    // Then we hand the CPU to the executor running the shell task, which reads
+    // keystrokes, buffers a line, and dispatches it on Enter. `Executor::run`
+    // never returns (`-> !`), so it is the kernel's final call.
     println!();
-    println!("Stage 6b: three preempted kernel threads (none ever yield) below:");
-    serial_println!("Kernel arming preemptive scheduler; timer will switch threads.");
+    serial_println!("Kernel starting the interactive shell on the async executor.");
+    shell::selftest();
 
-    thread::init();
-    thread::spawn(demo_thread_a);
-    thread::spawn(demo_thread_b);
-    thread::spawn(demo_thread_c);
-    thread::run();
+    let mut executor = Executor::new();
+    executor.spawn(Task::new(shell::run()));
+    executor.run();
 }
 
 /// Handler invoked when the kernel panics. On bare metal we must define this
@@ -308,35 +310,5 @@ fn stack_overflow() {
     core::hint::black_box(());
 }
 
-/// How many iterations each demo thread burns between prints. Tuned so a step
-/// spans several timer ticks, giving the timer chances to preempt a thread
-/// mid-step. It is pure busy-work with no `yield_now()`, so ANY interleaving of
-/// the three threads' output below can only be the timer preempting them.
-const BUSY_ITERS: u64 = 400_000;
-
-// Stage 6b demo threads. Each prints a few numbered steps, but between them it
-// just spins on CPU-bound work and NEVER yields. With cooperative scheduling this
-// would let the first thread monopolize the CPU forever; under preemption the
-// timer slices time between them, so the three streams still interleave. They
-// differ only in their label, so a small macro keeps them DRY.
-macro_rules! busy_thread {
-    ($name:ident, $label:literal) => {
-        fn $name() {
-            for step in 0..5 {
-                // Burn CPU without ever calling thread::yield_now().
-                let mut acc: u64 = 0;
-                for k in 0..BUSY_ITERS {
-                    acc = acc.wrapping_add(k);
-                    core::hint::black_box(acc);
-                }
-                println!("[thread {}] step {} (acc={})", $label, step, acc);
-                serial_println!("[thread {}] step {}", $label, step);
-            }
-            serial_println!("[thread {}] finished", $label);
-        }
-    };
-}
-
-busy_thread!(demo_thread_a, "A");
-busy_thread!(demo_thread_b, "B");
-busy_thread!(demo_thread_c, "C");
+// Stage 7's interactive shell lives in `src/shell.rs`; its demo threads from
+// Stage 6 are gone now that the kernel runs the async executor instead.
