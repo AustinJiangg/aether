@@ -129,3 +129,12 @@ fn fs_write_read_roundtrip() {
     fs::remove("/testtmp").unwrap();
     assert!(fs::read("/testtmp/a.txt").is_err());
 }
+
+/// Stage 9a: the user-mode segments installed in the GDT carry privilege level 3,
+/// so the descent to ring 3 (9b) will push the correct CS/SS.
+#[test_case]
+fn gdt_user_selectors_are_ring3() {
+    use x86_64::PrivilegeLevel;
+    assert_eq!(crate::gdt::user_code_selector().rpl(), PrivilegeLevel::Ring3);
+    assert_eq!(crate::gdt::user_data_selector().rpl(), PrivilegeLevel::Ring3);
+}

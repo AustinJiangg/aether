@@ -36,6 +36,10 @@ pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 /// for a handler that only prints and halts.
 const DOUBLE_FAULT_STACK_SIZE: usize = 4096 * 5;
 
+/// Size of the ring 0 stack the CPU switches to on a privilege change — an
+/// interrupt or exception taken while running in ring 3 (Stage 9). 5 pages.
+const PRIVILEGE_STACK_SIZE: usize = 4096 * 5;
+
 /// The Task State Segment. In long mode the TSS no longer holds a task's saved
 /// registers (hardware task switching is gone); it survives mainly to hold the
 /// IST and the privilege-level stack table. We fill IST entry 0 with a
@@ -54,6 +58,22 @@ static TSS: Lazy<TaskStateSegment> = Lazy::new(|| {
         let stack_start = VirtAddr::from_ptr(core::ptr::addr_of!(STACK));
         stack_start + DOUBLE_FAULT_STACK_SIZE as u64
     };
+    // privilege_stack_table[0] is "rsp0": the stack the CPU switches to when an
+    // interrupt or exception transfers control from ring 3 up to ring 0. User
+    // code runs on its own (untrusted) stack, so the CPU must not handle the
+    // interrupt there — it loads this dedicated kernel stack, pushes the interrupt
+    // frame, and runs the handler on it. Without rsp0 set, the first interrupt
+    // taken in user mode would have no kernel stack and escalate to a triple
+    // fault. Unused until Stage 9b enters ring 3; harmless to set up now.
+    tss.privilege_stack_table[0] = {
+        // Same pattern as the IST stack above: a zero-initialized static in .bss
+        // (no heap this early), addressed with `addr_of!` so we never form a
+        // reference to a mutable static. x86 stacks grow down, so the CPU wants
+        // the top (highest address) as the initial stack pointer.
+        static mut STACK: [u8; PRIVILEGE_STACK_SIZE] = [0; PRIVILEGE_STACK_SIZE];
+        let stack_start = VirtAddr::from_ptr(core::ptr::addr_of!(STACK));
+        stack_start + PRIVILEGE_STACK_SIZE as u64
+    };
     tss
 });
 
@@ -63,6 +83,8 @@ static TSS: Lazy<TaskStateSegment> = Lazy::new(|| {
 struct Selectors {
     code_selector: SegmentSelector,
     tss_selector: SegmentSelector,
+    user_code_selector: SegmentSelector,
+    user_data_selector: SegmentSelector,
 }
 
 /// The GDT together with the selectors that index into it.
@@ -70,14 +92,32 @@ static GDT: Lazy<(GlobalDescriptorTable, Selectors)> = Lazy::new(|| {
     let mut gdt = GlobalDescriptorTable::new();
     let code_selector = gdt.add_entry(Descriptor::kernel_code_segment());
     let tss_selector = gdt.add_entry(Descriptor::tss_segment(&TSS));
+    // Ring 3 code and data segments for user mode (Stage 9). `add_entry` folds
+    // each descriptor's DPL into the returned selector's RPL, so both selectors
+    // already carry RPL 3 — exactly what gets pushed as CS/SS when we drop to
+    // ring 3 in Stage 9b.
+    let user_code_selector = gdt.add_entry(Descriptor::user_code_segment());
+    let user_data_selector = gdt.add_entry(Descriptor::user_data_segment());
     (
         gdt,
         Selectors {
             code_selector,
             tss_selector,
+            user_code_selector,
+            user_data_selector,
         },
     )
 });
+
+/// The ring 3 user code selector (RPL 3), pushed as `CS` when entering user mode.
+pub fn user_code_selector() -> SegmentSelector {
+    GDT.1.user_code_selector
+}
+
+/// The ring 3 user data selector (RPL 3), pushed as `SS` when entering user mode.
+pub fn user_data_selector() -> SegmentSelector {
+    GDT.1.user_data_selector
+}
 
 /// Load the GDT, reload the code segment register (CS), and load the TSS.
 /// Call once during early boot, before loading the IDT (the IDT's double fault
@@ -97,4 +137,16 @@ pub fn init() {
         CS::set_reg(GDT.1.code_selector);
         load_tss(GDT.1.tss_selector);
     }
+
+    // Stage 9a checkpoint: the GDT now carries ring 3 segments and the TSS holds a
+    // kernel stack (rsp0) for ring-3 -> ring-0 transitions. Log the user selectors
+    // so a `cargo run` shows them; the descent into ring 3 itself arrives in 9b.
+    let uc = user_code_selector();
+    let ud = user_data_selector();
+    crate::serial_println!(
+        "[gdt] ring 3 segments ready: code={:#x}, data={:#x} (rpl {:?})",
+        uc.0,
+        ud.0,
+        uc.rpl(),
+    );
 }
