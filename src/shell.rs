@@ -1,4 +1,4 @@
-//! Stage 7: a tiny interactive shell (a read-eval-print loop).
+//! Stage 7-8: a tiny interactive shell (a read-eval-print loop).
 //!
 //! This is the kernel's first real "user interaction": it reads a command line
 //! from the keyboard, parses it, runs a built-in command, prints the result, and
@@ -8,23 +8,28 @@
 //! halts the CPU until the keyboard interrupt wakes it, so an idle shell costs
 //! nothing.
 //!
+//! Stage 8 adds file commands (`ls`, `cat`, `write`, `mkdir`, `rm`, `cd`, `pwd`)
+//! over the in-memory file system in [`crate::fs`]. The shell keeps a current
+//! working directory and resolves relative paths against it.
+//!
 //! A note on "system calls": there is no user mode yet (no ring 3, no privilege
 //! separation), so this shell runs in *kernel* space and its commands are plain
 //! kernel function calls. The single `dispatch` entry point is the seed of what
 //! becomes a system-call interface once user mode exists — but it is not one yet.
 //!
 //! Verifying a shell is awkward when there is no keyboard (headless QEMU cannot
-//! type), so [`selftest`] feeds a few canned command lines through the same
-//! `dispatch` path at boot. That output proves parsing and the commands work; the
-//! interactive [`run`] loop then handles real keystrokes.
+//! type), so [`selftest`] drives canned commands (and a few simulated keystrokes)
+//! through the same code paths at boot. The interactive [`run`] loop then handles
+//! real keys.
 
 use alloc::string::String;
+use alloc::vec::Vec;
 
 use futures_util::stream::StreamExt;
 use pc_keyboard::{layouts::Us104Key, DecodedKey, HandleControl, PS2Keyboard, ScancodeSet1};
 
 use crate::task::keyboard::ScancodeStream;
-use crate::{allocator, interrupts, vga_buffer};
+use crate::{allocator, fs, interrupts, vga_buffer};
 
 /// Print to BOTH the screen and the serial log, with a trailing newline.
 ///
@@ -49,25 +54,56 @@ macro_rules! sh_println {
     }};
 }
 
-/// What we print before each command line.
-const PROMPT: &str = "aether> ";
-
 /// The default PIT rate is ~18.2 Hz. We round to 18 for a rough `uptime`; this is
 /// an estimate, not a calibrated clock.
 const TIMER_HZ: u64 = 18;
 
+/// Print the prompt, which shows the current working directory, e.g. `aether:/docs> `.
+fn print_prompt(cwd: &str) {
+    sh_print!("aether:{}> ", cwd);
+}
+
+/// Resolve `arg` (absolute or relative) against `cwd` into a normalized absolute
+/// path. Handles `.` (stay), `..` (up a level), and redundant slashes. The result
+/// always starts with `/`.
+fn resolve_path(cwd: &str, arg: &str) -> String {
+    // Absolute args ignore the cwd; relative ones build on it.
+    let base = if arg.starts_with('/') { "" } else { cwd };
+
+    let mut comps: Vec<&str> = Vec::new();
+    for comp in base.split('/').chain(arg.split('/')) {
+        match comp {
+            "" | "." => {}              // skip empty parts and "."
+            ".." => {
+                comps.pop(); // ".." backs up one level (a no-op at the root)
+            }
+            name => comps.push(name),
+        }
+    }
+
+    if comps.is_empty() {
+        return String::from("/");
+    }
+    let mut path = String::new();
+    for comp in comps {
+        path.push('/');
+        path.push_str(comp);
+    }
+    path
+}
+
 /// Parse one command line and run it.
 ///
-/// The first whitespace-separated word is the command name; everything after it
-/// is the argument string. This is the shell's central dispatch point — both the
-/// interactive loop and the boot self-test go through here.
-fn dispatch(line: &str) {
+/// The first whitespace-separated word is the command name; the rest is its
+/// argument string. This is the shell's central dispatch point — the interactive
+/// loop and the boot self-test both go through here. `cwd` is `&mut` so `cd` can
+/// change it.
+fn dispatch(cwd: &mut String, line: &str) {
     let line = line.trim();
     if line.is_empty() {
         return; // a blank line does nothing
     }
 
-    // Split into the command word and the rest (its arguments).
     let mut parts = line.splitn(2, char::is_whitespace);
     let cmd = parts.next().unwrap_or("");
     let args = parts.next().unwrap_or("").trim();
@@ -86,6 +122,16 @@ fn dispatch(line: &str) {
             allocator::HEAP_START,
             allocator::HEAP_SIZE / 1024
         ),
+
+        // --- file system commands (Stage 8) ---
+        "pwd" => sh_println!("{}", cwd),
+        "ls" => cmd_ls(cwd, args),
+        "cat" => cmd_cat(cwd, args),
+        "write" => cmd_write(cwd, args),
+        "mkdir" => cmd_mkdir(cwd, args),
+        "rm" => cmd_rm(cwd, args),
+        "cd" => cmd_cd(cwd, args),
+
         other => sh_println!("unknown command: '{}' (try 'help')", other),
     }
 }
@@ -93,71 +139,94 @@ fn dispatch(line: &str) {
 /// The `help` command: list the built-ins.
 fn help() {
     sh_println!("available commands:");
-    sh_println!("  help          show this list");
-    sh_println!("  echo <text>   print <text>");
-    sh_println!("  clear         clear the screen");
-    sh_println!("  ticks         timer ticks since boot");
-    sh_println!("  uptime        rough seconds since boot");
-    sh_println!("  mem           kernel heap location and size");
+    sh_println!("  help                  show this list");
+    sh_println!("  echo <text>           print <text>");
+    sh_println!("  clear                 clear the screen");
+    sh_println!("  ticks / uptime        timer ticks / rough seconds since boot");
+    sh_println!("  mem                   kernel heap location and size");
+    sh_println!("  ls [path]             list a directory");
+    sh_println!("  cat <path>            print a file");
+    sh_println!("  write <path> <text>   write text to a file");
+    sh_println!("  mkdir <path>          create a directory");
+    sh_println!("  rm <path>             remove a file or directory");
+    sh_println!("  cd <path>             change directory");
+    sh_println!("  pwd                   print the working directory");
 }
 
-/// Boot-time self-test: run a few canned commands through [`dispatch`].
-///
-/// This makes the shell verifiable without a keyboard (headless QEMU), exercising
-/// the exact parse-and-dispatch path the interactive loop uses. It deliberately
-/// omits `clear`, which would wipe the boot log we want to inspect.
-pub fn selftest() {
-    sh_println!();
-    sh_println!("[shell selftest] running canned commands through the dispatcher:");
-    for command in ["help", "echo hello aether", "ticks", "mem", "bogus"] {
-        sh_println!("{}{}", PROMPT, command); // show the line as if it were typed
-        dispatch(command);
+/// `ls [path]` — list a directory (the cwd if no path is given).
+fn cmd_ls(cwd: &str, args: &str) {
+    let path = if args.is_empty() {
+        String::from(cwd)
+    } else {
+        resolve_path(cwd, args)
+    };
+    match fs::list(&path) {
+        Ok(entries) if entries.is_empty() => sh_println!("(empty)"),
+        Ok(entries) => {
+            for (name, is_dir) in entries {
+                // A trailing slash marks directories, like a real `ls -F`.
+                sh_println!("  {}{}", name, if is_dir { "/" } else { "" });
+            }
+        }
+        Err(e) => sh_println!("ls: {}: {}", path, e.as_str()),
     }
-
-    // Exercise the interactive key path (echo, Backspace, Enter) by feeding
-    // decoded keys through the same `handle_key` the live loop uses — no keyboard
-    // needed. We "type" `echX`, Backspace (erasing the X), then `o hi` and Enter,
-    // so the buffer becomes `echo hi`; the resulting `hi` proves the editing
-    // worked. (On serial the X still shows, since the port cannot un-print; on the
-    // screen the Backspace really erases it.)
-    sh_println!("[shell selftest] simulating typed input with a Backspace:");
-    let mut line = String::new();
-    sh_print!("{}", PROMPT);
-    for key in ['e', 'c', 'h', 'X', '\u{8}', 'o', ' ', 'h', 'i', '\n'] {
-        handle_key(&mut line, DecodedKey::Unicode(key));
-    }
-
-    sh_println!("[shell selftest] done");
 }
 
-/// The interactive shell task.
-///
-/// Reads decoded keystrokes from the keyboard [`ScancodeStream`], echoes them
-/// with minimal line editing (printable characters and Backspace), and on Enter
-/// dispatches the buffered line. `scancodes.next().await` suspends the task when
-/// no input is waiting, so the executor can halt the CPU until the keyboard
-/// interrupt wakes us. The decoding mirrors the Stage 5 keyboard task; the new
-/// part is buffering a line and dispatching it.
-pub async fn run() {
-    let mut scancodes = ScancodeStream::new();
-    let mut keyboard = PS2Keyboard::new(ScancodeSet1::new(), Us104Key, HandleControl::Ignore);
-    let mut line = String::new();
+/// `cat <path>` — print a file's contents (as UTF-8 text when possible).
+fn cmd_cat(cwd: &str, args: &str) {
+    let path = resolve_path(cwd, args);
+    match fs::read(&path) {
+        Ok(data) => match core::str::from_utf8(&data) {
+            Ok(text) => sh_println!("{}", text),
+            Err(_) => sh_println!("<{} bytes of binary data>", data.len()),
+        },
+        Err(e) => sh_println!("cat: {}: {}", path, e.as_str()),
+    }
+}
 
-    sh_println!();
-    sh_println!("Interactive shell ready - type a command (try 'help'):");
-    sh_print!("{}", PROMPT);
+/// `write <path> <text>` — create/overwrite a file with the given text.
+fn cmd_write(cwd: &str, args: &str) {
+    let mut parts = args.splitn(2, char::is_whitespace);
+    let path_arg = parts.next().unwrap_or("");
+    let text = parts.next().unwrap_or("");
+    if path_arg.is_empty() {
+        sh_println!("usage: write <path> <text>");
+        return;
+    }
+    let path = resolve_path(cwd, path_arg);
+    match fs::write(&path, text.as_bytes()) {
+        Ok(()) => sh_println!("wrote {} bytes to {}", text.len(), path),
+        Err(e) => sh_println!("write: {}: {}", path, e.as_str()),
+    }
+}
 
-    while let Some(scancode) = scancodes.next().await {
-        // A key event may span several scancode bytes, so `add_byte` returns
-        // `Ok(None)` until it has assembled one; `process_keyevent` then maps it to
-        // a `DecodedKey` (or `None` for, say, a modifier press).
-        let Ok(Some(event)) = keyboard.add_byte(scancode) else {
-            continue;
-        };
-        let Some(key) = keyboard.process_keyevent(event) else {
-            continue;
-        };
-        handle_key(&mut line, key);
+/// `mkdir <path>` — create a directory.
+fn cmd_mkdir(cwd: &str, args: &str) {
+    let path = resolve_path(cwd, args);
+    if let Err(e) = fs::mkdir(&path) {
+        sh_println!("mkdir: {}: {}", path, e.as_str());
+    }
+}
+
+/// `rm <path>` — remove a file or directory.
+fn cmd_rm(cwd: &str, args: &str) {
+    let path = resolve_path(cwd, args);
+    if let Err(e) = fs::remove(&path) {
+        sh_println!("rm: {}: {}", path, e.as_str());
+    }
+}
+
+/// `cd <path>` — change the working directory (no arg goes to root).
+fn cmd_cd(cwd: &mut String, args: &str) {
+    let path = if args.is_empty() {
+        String::from("/")
+    } else {
+        resolve_path(cwd, args)
+    };
+    if fs::is_dir(&path) {
+        *cwd = path;
+    } else {
+        sh_println!("cd: {}: not a directory", path);
     }
 }
 
@@ -166,14 +235,14 @@ pub async fn run() {
 /// Echoes printable characters, erases on Backspace, and on Enter runs the
 /// buffered line. Factored out of [`run`] so the boot [`selftest`] can drive the
 /// exact same key-handling logic without a real keyboard.
-fn handle_key(line: &mut String, key: DecodedKey) {
+fn handle_key(line: &mut String, cwd: &mut String, key: DecodedKey) {
     match key {
         // Enter: finish the line, run it, then show a fresh prompt.
         DecodedKey::Unicode('\n') => {
             sh_println!();
-            dispatch(line);
+            dispatch(cwd, line);
             line.clear();
-            sh_print!("{}", PROMPT);
+            print_prompt(cwd);
         }
         // Backspace (0x08) or Delete (0x7f): erase the last buffered character.
         // We only erase when the buffer is non-empty, which also keeps the cursor
@@ -190,5 +259,83 @@ fn handle_key(line: &mut String, key: DecodedKey) {
         }
         // Non-character keys (arrows, function keys, ...) are ignored for now.
         DecodedKey::RawKey(_) => {}
+    }
+}
+
+/// Boot-time self-test: drive canned commands and a few simulated keystrokes
+/// through the real `dispatch`/`handle_key`, so the shell and file system are
+/// verifiable without a keyboard (e.g. headless QEMU). It builds a small
+/// directory tree, lists and reads it, then removes part of it.
+pub fn selftest() {
+    let mut cwd = String::from("/");
+
+    sh_println!();
+    sh_println!("[shell selftest] commands + in-memory file system:");
+    let script = [
+        "help",
+        "mkdir /docs",
+        "write /docs/hello.txt hi from aether",
+        "write /readme top-level readme",
+        "mkdir /docs/sub",
+        "ls /",
+        "ls /docs",
+        "cat /docs/hello.txt",
+        "cd /docs",
+        "pwd",
+        "ls",
+        "cat ../readme",
+        "rm /docs/hello.txt",
+        "ls",
+        "cd /",
+        "bogus",
+    ];
+    for command in script {
+        sh_println!("aether:{}> {}", cwd, command);
+        dispatch(&mut cwd, command);
+    }
+
+    // Exercise the interactive key path (echo, Backspace, Enter) by feeding
+    // decoded keys through the same `handle_key` the live loop uses. We "type"
+    // `echX`, Backspace (erasing the X), then `o hi` and Enter, so the buffer
+    // becomes `echo hi`; the resulting `hi` proves the editing worked. (On serial
+    // the X still shows, since the port cannot un-print; on screen it is erased.)
+    sh_println!("[shell selftest] simulating typed input with a Backspace:");
+    let mut line = String::new();
+    print_prompt(&cwd);
+    for key in ['e', 'c', 'h', 'X', '\u{8}', 'o', ' ', 'h', 'i', '\n'] {
+        handle_key(&mut line, &mut cwd, DecodedKey::Unicode(key));
+    }
+
+    sh_println!("[shell selftest] done");
+}
+
+/// The interactive shell task.
+///
+/// Reads decoded keystrokes from the keyboard [`ScancodeStream`], echoes them
+/// with minimal line editing, and on Enter dispatches the buffered line.
+/// `scancodes.next().await` suspends the task when no input is waiting, so the
+/// executor can halt the CPU until the keyboard interrupt wakes us. The decoding
+/// mirrors the Stage 5 keyboard task; the new part is buffering and dispatching.
+pub async fn run() {
+    let mut scancodes = ScancodeStream::new();
+    let mut keyboard = PS2Keyboard::new(ScancodeSet1::new(), Us104Key, HandleControl::Ignore);
+    let mut line = String::new();
+    let mut cwd = String::from("/");
+
+    sh_println!();
+    sh_println!("Interactive shell ready - type a command (try 'help'):");
+    print_prompt(&cwd);
+
+    while let Some(scancode) = scancodes.next().await {
+        // A key event may span several scancode bytes, so `add_byte` returns
+        // `Ok(None)` until it has assembled one; `process_keyevent` then maps it to
+        // a `DecodedKey` (or `None` for, say, a modifier press).
+        let Ok(Some(event)) = keyboard.add_byte(scancode) else {
+            continue;
+        };
+        let Some(key) = keyboard.process_keyevent(event) else {
+            continue;
+        };
+        handle_key(&mut line, &mut cwd, key);
     }
 }

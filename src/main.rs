@@ -26,14 +26,16 @@
 //! Stage 6 added independent kernel threads with a hand-written context switch,
 //! driven cooperatively (6a) and then preemptively from the timer (6b).
 //!
-//! Stage 7 (this stage) adds a tiny interactive shell. It revives the Stage 5
-//! async executor: the shell is an async task that `.await`s decoded keystrokes
-//! from the keyboard `ScancodeStream`, buffers a line, and on Enter dispatches it
-//! to a built-in command (help, echo, clear, ticks, uptime, mem). A boot-time
-//! self-test runs a few canned commands so the shell is verifiable even without a
-//! keyboard. There is no user mode yet, so the shell runs in kernel space and its
-//! commands are direct kernel calls — a precursor to real system calls. (The
-//! Stage 6 thread scheduler is dormant while this stage runs the executor.)
+//! Stage 7 added a tiny interactive shell on the revived Stage 5 async executor:
+//! an async task that `.await`s decoded keystrokes from the keyboard
+//! `ScancodeStream`, buffers a line, and on Enter dispatches it to a built-in
+//! command. Stage 8 (this stage) adds an in-memory file system (`fs`): a tree of
+//! files and directories on the heap, with shell commands `ls`, `cat`, `write`,
+//! `mkdir`, `rm`, `cd`, and `pwd`. A boot self-test exercises the commands and the
+//! file system, so both are verifiable without a keyboard. There is no user mode
+//! yet, so the shell runs in kernel space and its commands are direct kernel calls
+//! — a precursor to real system calls. (The Stage 6 thread scheduler is dormant
+//! while this stage runs the executor.)
 //!
 //! See ROADMAP.md for what comes next.
 
@@ -64,6 +66,7 @@ mod task;
 // subtree until a later stage folds async tasks and threads together.
 #[allow(dead_code)]
 mod thread;
+mod fs;
 mod shell;
 
 use core::panic::PanicInfo;
