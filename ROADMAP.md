@@ -16,7 +16,11 @@ Recommended: create a git branch per stage, and merge back to main once it runs.
 | **5** | Cooperative multitasking (tasks written with `async` / `await`) | processes / tasks, scheduling | Done |
 | **6** | Preemptive scheduling, independent kernel threads | context switching, time slices | Done |
 | **7** | Simple shell + built-in commands | system calls, user interaction | Done |
-| **8** | In-memory simple file system | file abstraction, VFS | Todo |
+| **8** | In-memory simple file system | file abstraction, VFS | Done |
+
+**All planned stages (0-8) are complete.** Ideas beyond the roadmap: user mode and
+real system calls, a disk driver with a persistent file system, SMP (multi-core),
+and networking.
 
 ## References
 

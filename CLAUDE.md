@@ -51,7 +51,13 @@ buffers a line (with Backspace editing), and on Enter dispatches it to a built-i
 command (`help`, `echo`, `clear`, `ticks`, `uptime`, `mem`); a boot self-test
 makes it verifiable headless. There is no user mode yet, so commands are direct
 kernel calls — a precursor to system calls. The thread scheduler is dormant
-during this stage. **Next is Stage 8** (an in-memory file system).
+during this stage. **Stage 8 is also done**: an in-memory file system (`fs`) — a
+heap-backed tree of file and directory nodes addressed by `/`-separated paths,
+with `RamFs` operations (mkdir/write/read/list/remove) behind a global mutex, and
+shell commands (`ls`, `cat`, `write`, `mkdir`, `rm`, `cd`, `pwd`) over it with a
+current working directory and relative-path (`..`) resolution. **This completes
+the planned roadmap (stages 0-8).** Further work would extend beyond it (user
+mode and real system calls, a disk driver and persistent FS, SMP, networking).
 
 ## Language and writing conventions
 
@@ -144,10 +150,15 @@ Exit QEMU: `Ctrl-A` then `X`.
   (the naked `context_switch` that saves callee-saved registers and swaps stacks).
   Dormant during Stage 7 (marked `#[allow(dead_code)]`); the timer still calls
   `schedule`, but it no-ops because preemption is never armed.
-- `src/shell.rs`: Stage 7 interactive shell — an async task that reads decoded
-  keystrokes from the keyboard `ScancodeStream`, buffers a line (with Backspace),
-  and on Enter routes it through a `dispatch` table of built-in commands. Includes
-  a boot `selftest` so the shell is verifiable without a keyboard.
+- `src/shell.rs`: Stage 7-8 interactive shell — an async task that reads decoded
+  keystrokes from the keyboard `ScancodeStream`, buffers a line (with Backspace)
+  against a current working directory, and on Enter routes it through a `dispatch`
+  table of built-in commands (including the Stage 8 file commands). Includes a
+  boot `selftest` so the shell and file system are verifiable without a keyboard.
+- `src/fs.rs`: Stage 8 in-memory file system — a heap-backed tree of `File`/`Dir`
+  nodes addressed by `/`-separated paths, exposed as a global `RamFs` behind a
+  mutex with `mkdir`/`write`/`read`/`list`/`remove`/`is_dir`. No disk, no
+  persistence, no VFS layer.
 - `.cargo/config.toml`: the bare-metal target (`x86_64-unknown-none`), build-std,
   and the QEMU runner config.
 - `.claude/settings.json`: pre-approved permissions (cargo + git, including
