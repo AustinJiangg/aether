@@ -82,6 +82,7 @@ mod task;
 mod thread;
 mod fs;
 mod shell;
+mod syscall;
 mod usermode;
 // Test-only: the in-QEMU unit-test harness (runner, QEMU exit, `#[test_case]`s).
 // Compiled solely for `cargo test`, never into the real kernel image.
@@ -308,6 +309,20 @@ fn boot_continue() -> ! {
         usermode::reached_ring3()
     );
     println!("Back from a ring 3 excursion; continuing boot.");
+
+    // Stage 10a: exercise the `int 0x80` syscall path from ring 0 — the very path
+    // the ring 3 program will use in 10b. `sys_write` makes the kernel print on the
+    // caller's behalf; `sys_getpid` returns a value back across the boundary.
+    {
+        let msg = b"hello, kernel, from a syscall\n";
+        // SAFETY: `msg` is a valid readable byte slice for SYS_WRITE; SYS_GETPID
+        // ignores its arguments.
+        let pid = unsafe {
+            syscall::invoke(syscall::SYS_WRITE, msg.as_ptr() as u64, msg.len() as u64);
+            syscall::invoke(syscall::SYS_GETPID, 0, 0)
+        };
+        serial_println!("[syscall] getpid() returned {}", pid);
+    }
 
     // From here the two builds diverge (`#[cfg(test)]` compiles exactly one block;
     // see the test-harness note in `src/testing.rs`). The interactive shell's

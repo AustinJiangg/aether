@@ -29,6 +29,7 @@ use pic8259::ChainedPics;
 use spin::{Lazy, Mutex};
 use x86_64::instructions::port::Port;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
+use x86_64::PrivilegeLevel;
 
 use crate::{gdt, hlt_loop, println, serial_println};
 
@@ -55,6 +56,13 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     // the IDT by vector number reaches the entries past the 32 exception slots.
     idt[InterruptIndex::Timer.as_usize()].set_handler_fn(timer_interrupt_handler);
     idt[InterruptIndex::Keyboard.as_usize()].set_handler_fn(keyboard_interrupt_handler);
+    // Stage 10: the syscall vector. Setting the gate's DPL to 3 is what lets ring 3
+    // execute `int 0x80` (a gate's DPL is the highest-numbered ring allowed to
+    // invoke it); with the default DPL 0, a ring 3 `int 0x80` would raise a #GP
+    // instead of entering the handler.
+    idt[0x80]
+        .set_handler_fn(crate::syscall::syscall_handler)
+        .set_privilege_level(PrivilegeLevel::Ring3);
     idt
 });
 

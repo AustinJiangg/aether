@@ -146,3 +146,22 @@ fn gdt_user_selectors_are_ring3() {
 fn reached_user_mode() {
     assert!(crate::usermode::reached_ring3());
 }
+
+/// Stage 10a: the `int 0x80` syscall path works — dispatch routes to the right
+/// implementation and the return value crosses back to the caller. Driven from
+/// ring 0 here; ring 3 uses the identical sequence in 10b.
+#[test_case]
+fn syscall_dispatch_works() {
+    use crate::syscall;
+    // getpid returns the fixed placeholder pid.
+    let pid = unsafe { syscall::invoke(syscall::SYS_GETPID, 0, 0) };
+    assert_eq!(pid, 1);
+    // write returns the number of bytes it printed.
+    let msg = b"[test] int 0x80 round-trip\n";
+    let written =
+        unsafe { syscall::invoke(syscall::SYS_WRITE, msg.as_ptr() as u64, msg.len() as u64) };
+    assert_eq!(written, msg.len() as u64);
+    // an unknown syscall number reports the error sentinel.
+    let bad = unsafe { syscall::invoke(9999, 0, 0) };
+    assert_eq!(bad, u64::MAX);
+}
