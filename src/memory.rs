@@ -24,12 +24,16 @@
 //! to translate addresses. Creating *new* mappings additionally needs a supply of
 //! free physical frames (a frame allocator), which is the next sub-stage (4b).
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use bootloader::bootinfo::{MemoryMap, MemoryRegionType};
-use x86_64::registers::control::Cr3;
+use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::structures::paging::{
     FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB,
 };
 use x86_64::{PhysAddr, VirtAddr};
+
+use crate::serial_println;
 
 /// Build an [`OffsetPageTable`] over the page table that is currently active.
 ///
@@ -161,4 +165,227 @@ pub fn create_example_mapping(
     // from `frame_allocator`, which yields exclusively unused frames.
     let map_result = unsafe { mapper.map_to(page, frame, flags, frame_allocator) };
     map_result.expect("map_to failed").flush();
+}
+
+// ---------------------------------------------------------------------------
+// Process address spaces (Stage 11a).
+// ---------------------------------------------------------------------------
+//
+// Until now the whole kernel has run in a single address space: one set of page
+// tables, one value in CR3, set up by the bootloader. A *process* needs its own
+// address space, so two programs can use the same virtual addresses for different
+// physical memory and neither can reach the other's. At the hardware level an
+// address space *is* a top-level (L4 / PML4) page table; "switching to a process"
+// is loading that table's frame into CR3.
+//
+// The one thing that must survive a CR3 switch is the kernel itself. The CPU is
+// running kernel instructions on a kernel stack, and the instant after `mov cr3`
+// it fetches the next instruction through the *new* table. If that table does not
+// map the kernel, the fetch faults, no handler is reachable, and the machine
+// triple-faults. So every address space must map the kernel (plus the heap, the
+// stacks, and the physical-memory window) at the same virtual addresses.
+//
+// The textbook way to guarantee that is the "higher-half kernel": keep the kernel
+// in L4 slots 256..512 and user programs in 0..256, so a new space just copies the
+// higher half. Bootloader 0.9 does not relocate us there, though — it maps the
+// kernel, heap, and physical-memory window in the *lower* half (watch the boot
+// log: the present L4 slots are all < 256). So rather than copy a fixed half we
+// copy *every present* top-level entry, wherever it sits. The clone then maps
+// exactly what the kernel maps; a user program's pages later go into slots that
+// are still empty here.
+
+/// A page table holds 512 entries.
+const PAGE_TABLE_ENTRIES: usize = 512;
+/// Bit 0 of a page-table entry marks it present (it maps something).
+const ENTRY_PRESENT: u64 = 1 << 0;
+
+/// One process's address space: ownership of a top-level (L4) page-table frame.
+///
+/// Loading [`AddressSpace::l4_frame`] into CR3 makes this space active. For now an
+/// `AddressSpace` only ever clones the kernel's mappings; Stage 11b will map a user
+/// program into the empty lower slots of one.
+///
+/// The L4 frame is never freed: `BootInfoFrameAllocator` cannot reclaim frames, so
+/// dropping an `AddressSpace` simply leaks its one frame. That is fine for the
+/// boot-time experiments here; a real allocator comes later.
+pub struct AddressSpace {
+    l4_frame: PhysFrame,
+}
+
+impl AddressSpace {
+    /// Build a new address space that mirrors the kernel's current one.
+    ///
+    /// Allocates a fresh frame for the L4 table, zeroes it, then copies every
+    /// present entry from the active (kernel) L4 into it, so the result maps
+    /// exactly what the kernel maps. Returns `None` if no physical frame is free.
+    ///
+    /// `physical_memory_offset` must be the bootloader's physical-memory-window
+    /// base (the value passed to [`init`]); it is trusted to reach both L4 frames.
+    pub fn new_cloning_kernel(
+        frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+        physical_memory_offset: VirtAddr,
+    ) -> Option<AddressSpace> {
+        let l4_frame = frame_allocator.allocate_frame()?;
+        // The L4 that CR3 points at right now: the kernel space we are cloning.
+        let (active_l4_frame, _) = Cr3::read();
+
+        // Reach both L4 tables through the physical-memory window, as raw arrays of
+        // 512 eight-byte entries. We use raw `u64` pointers rather than
+        // `&PageTable` on purpose: the kernel's `mapper` (built in `init`) already
+        // holds a `&mut PageTable` to the active L4, so forming any reference to it
+        // here would alias that `&mut` — undefined behavior. Raw reads alias
+        // nothing.
+        let src =
+            (physical_memory_offset + active_l4_frame.start_address().as_u64()).as_ptr::<u64>();
+        let dst =
+            (physical_memory_offset + l4_frame.start_address().as_u64()).as_mut_ptr::<u64>();
+
+        // SAFETY: `src` and `dst` address two distinct, page-aligned 4 KiB frames
+        // lying fully inside the physical-memory window, so every one of the 512
+        // eight-byte slots of each is valid to access. `dst`'s frame is freshly
+        // allocated and referenced by nothing else. We zero `dst` before copying so
+        // leftover bits can never be walked as a bogus entry; then we copy only
+        // present entries. A copied L4 entry holds the physical address of one of
+        // the kernel's L3 tables, so the clone shares — and thus maps — exactly the
+        // kernel's memory.
+        unsafe {
+            for i in 0..PAGE_TABLE_ENTRIES {
+                dst.add(i).write(0);
+            }
+            for i in 0..PAGE_TABLE_ENTRIES {
+                let entry = src.add(i).read();
+                if entry & ENTRY_PRESENT != 0 {
+                    dst.add(i).write(entry);
+                }
+            }
+        }
+
+        Some(AddressSpace { l4_frame })
+    }
+
+    /// The physical frame holding this space's L4 table — the value CR3 takes to
+    /// make the space active.
+    pub fn l4_frame(&self) -> PhysFrame {
+        self.l4_frame
+    }
+
+    /// Make this address space active: load its L4 frame into CR3. Returns the
+    /// previously-active `(frame, flags)`, which [`restore_address_space`] takes to
+    /// switch back.
+    ///
+    /// # Safety
+    ///
+    /// This space's L4 must map the executing kernel — its code, the current stack,
+    /// and the physical-memory window — at their current virtual addresses, or the
+    /// instruction right after the CR3 load faults with no reachable handler and
+    /// the CPU triple-faults. A space from [`AddressSpace::new_cloning_kernel`]
+    /// satisfies this. (Loading CR3 also flushes the TLB.)
+    pub unsafe fn activate(&self) -> (PhysFrame, Cr3Flags) {
+        let previous = Cr3::read();
+        // SAFETY: by this method's contract `self.l4_frame` maps the running
+        // kernel; we keep the current CR3 flags unchanged.
+        Cr3::write(self.l4_frame, previous.1);
+        previous
+    }
+}
+
+/// Restore a previously-active address space — pass the value [`AddressSpace::activate`]
+/// returned.
+///
+/// # Safety
+///
+/// `previous` must be a CR3 `(frame, flags)` that was active earlier in this boot
+/// and still maps the running kernel; the value `activate` returns is exactly that.
+/// (Loading CR3 also flushes the TLB.)
+pub unsafe fn restore_address_space(previous: (PhysFrame, Cr3Flags)) {
+    // SAFETY: per the contract `previous` is a known-good CR3 that maps the running
+    // kernel, so restoring it is sound.
+    Cr3::write(previous.0, previous.1);
+}
+
+// --- Stage 11a boot demo + verification state ------------------------------
+
+/// Set once the boot demo has cloned the kernel space, switched CR3 onto the
+/// clone, run there, and switched back successfully. Read by the Stage 11a test.
+static CLONE_ROUNDTRIP_OK: AtomicBool = AtomicBool::new(false);
+
+/// Whether the address-space clone + CR3 round-trip succeeded at boot.
+pub fn address_space_clone_ok() -> bool {
+    CLONE_ROUNDTRIP_OK.load(Ordering::SeqCst)
+}
+
+/// Stage 11a demonstration: clone the kernel address space, switch the CPU onto
+/// the clone, do real kernel work there (a heap allocation), then switch back.
+///
+/// Completing the round-trip is the proof the clone is faithful: were it missing
+/// any entry the running kernel needs, the first access after the CR3 switch would
+/// fault. Records the outcome for [`address_space_clone_ok`].
+pub fn demo_clone_kernel_space(
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    physical_memory_offset: VirtAddr,
+) {
+    let kernel_l4 = Cr3::read().0;
+    serial_println!(
+        "[addrspace] kernel address space: L4 at {:?}",
+        kernel_l4.start_address()
+    );
+
+    let space = match AddressSpace::new_cloning_kernel(frame_allocator, physical_memory_offset) {
+        Some(space) => space,
+        None => {
+            serial_println!("[addrspace] no free frame for a new L4; skipping demo");
+            return;
+        }
+    };
+
+    // List which top-level slots the kernel occupies. Printing them makes the
+    // "kernel lives in the lower half" claim above concrete, and explains why the
+    // clone copies every present entry instead of a fixed higher half.
+    let l4_ptr =
+        (physical_memory_offset + space.l4_frame().start_address().as_u64()).as_ptr::<u64>();
+    let mut slots = alloc::vec::Vec::new();
+    for i in 0..PAGE_TABLE_ENTRIES {
+        // SAFETY: `l4_ptr` addresses the clone's own L4 frame through the
+        // physical-memory window, so all 512 slots are readable, and nothing else
+        // references this freshly-allocated frame. We only read.
+        if unsafe { l4_ptr.add(i).read() } & ENTRY_PRESENT != 0 {
+            slots.push(i);
+        }
+    }
+    let all_lower = slots.iter().all(|&s| s < 256);
+    serial_println!(
+        "[addrspace] cloned the kernel into a new L4 at {:?}; present L4 slots {:?} ({})",
+        space.l4_frame().start_address(),
+        slots,
+        if all_lower {
+            "all in the lower half, so the clone copies every present entry"
+        } else {
+            "spanning both halves"
+        },
+    );
+
+    // Switch onto the clone, prove the kernel still works there, then switch back.
+    // SAFETY: `space` cloned every present entry of the active kernel space, so it
+    // maps the running code, stack, heap, and physical-memory window; switching to
+    // it is sound.
+    let previous = unsafe { space.activate() };
+    let active_on_clone = Cr3::read().0;
+    // Exercise the heap while on the clone. The kernel heap is the *same* physical
+    // memory in both spaces (we copied its L4 entry), so allocating here and
+    // freeing it after the switch-back is valid. `black_box` stops the compiler
+    // from optimizing the probe — and thus the round-trip — away.
+    let probe = alloc::boxed::Box::new(0xA5A5_u64);
+    let probe_ok = core::hint::black_box(*probe) == 0xA5A5;
+    // SAFETY: `previous` is the kernel space active moments ago; it still maps the
+    // running kernel, so restoring it is sound.
+    unsafe { restore_address_space(previous) };
+    let active_after_restore = Cr3::read().0;
+
+    let ok = active_on_clone == space.l4_frame() && probe_ok && active_after_restore == kernel_l4;
+    CLONE_ROUNDTRIP_OK.store(ok, Ordering::SeqCst);
+    serial_println!(
+        "[addrspace] switched to the clone (CR3 -> {:?}) and back to the kernel (CR3 -> {:?})",
+        active_on_clone.start_address(),
+        active_after_restore.start_address(),
+    );
 }

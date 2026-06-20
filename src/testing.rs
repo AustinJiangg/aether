@@ -173,3 +173,13 @@ fn syscall_dispatch_works() {
 fn ring3_made_a_syscall() {
     assert!(crate::syscall::ring3_syscall_count() >= 1);
 }
+
+/// Stage 11a: the kernel can clone its own address space into a second L4, switch
+/// CR3 onto the clone, run real kernel work there, and switch back. The round-trip
+/// runs during boot (in `kernel_main`, before this harness) via
+/// `memory::demo_clone_kernel_space`, which records its success — so by now the
+/// flag must be set.
+#[test_case]
+fn address_space_clone_roundtrip() {
+    assert!(crate::memory::address_space_clone_ok());
+}

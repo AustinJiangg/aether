@@ -284,6 +284,20 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_println!("[ OK ] heap works; Box / Vec / Rc are usable");
     println!("Heap is live; Box / Vec / Rc all work (details on the serial log).");
 
+    // Stage 11a: process address spaces. To the hardware, a process *is* its own
+    // top-level page table — its own value in CR3. Before giving each user program
+    // a private space, we prove the core move in isolation: build a second address
+    // space that clones the kernel's mappings, switch the CPU onto it, run real
+    // kernel work there, and switch back. Surviving the round-trip shows we can hand
+    // the CPU a fresh CR3 without the kernel vanishing underneath it — the
+    // foundation the ELF loader (11b) and per-process scheduling (12) build on.
+    memory::demo_clone_kernel_space(&mut frame_allocator, phys_mem_offset);
+    serial_println!(
+        "[ OK ] address-space clone + CR3 round-trip verified = {}",
+        memory::address_space_clone_ok()
+    );
+    println!("Address spaces live; cloned the kernel space and switched CR3 (serial log).");
+
     // Stage 9b/10b: take a brief excursion into user mode (ring 3) before finishing
     // boot. `map_user_code` maps a ring 3 page holding a small program that calls
     // `write` then `exit` via `int 0x80`; `enter` forges a ring 3 interrupt frame
