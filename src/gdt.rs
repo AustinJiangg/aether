@@ -119,6 +119,12 @@ pub fn user_data_selector() -> SegmentSelector {
     GDT.1.user_data_selector
 }
 
+/// The ring 0 kernel code selector (RPL 0). Used to rebuild a ring 0 context when
+/// returning to the kernel from user mode (Stage 9b).
+pub fn kernel_code_selector() -> SegmentSelector {
+    GDT.1.code_selector
+}
+
 /// Load the GDT, reload the code segment register (CS), and load the TSS.
 /// Call once during early boot, before loading the IDT (the IDT's double fault
 /// entry references the IST slot the TSS defines here).

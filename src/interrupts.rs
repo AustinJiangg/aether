@@ -174,7 +174,7 @@ extern "x86-interrupt" fn double_fault_handler(
 /// returns to *this* handler only once the current thread is scheduled again; at
 /// that point this handler's epilogue runs `iretq`, resuming the thread exactly
 /// where the timer originally struck.
-extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn timer_interrupt_handler(mut stack_frame: InterruptStackFrame) {
     let count = TIMER_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     // Log the first tick (proof the IRQ fired and EOI works), then every 100th,
     // so the serial log shows the timer running steadily without flooding it.
@@ -187,6 +187,11 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
         PICS.lock()
             .notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
     }
+    // Stage 9b: if a ring 3 excursion is in flight, this may be the tick that
+    // caught the CPU in ring 3. `on_timer_tick` then rewrites our return frame so
+    // the `iretq` below resumes the kernel instead of the user code. A no-op on
+    // every other tick.
+    crate::usermode::on_timer_tick(&mut stack_frame);
     // Preemptively reschedule. Must run after the EOI (see above) and with the
     // PICS lock already released, so we do not hold it across a context switch.
     crate::thread::schedule();

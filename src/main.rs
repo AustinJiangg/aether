@@ -82,6 +82,7 @@ mod task;
 mod thread;
 mod fs;
 mod shell;
+mod usermode;
 // Test-only: the in-QEMU unit-test harness (runner, QEMU exit, `#[test_case]`s).
 // Compiled solely for `cargo test`, never into the real kernel image.
 #[cfg(test)]
@@ -282,10 +283,35 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_println!("[ OK ] heap works; Box / Vec / Rc are usable");
     println!("Heap is live; Box / Vec / Rc all work (details on the serial log).");
 
-    // From here the two builds diverge (`#[cfg(test)]` compiles exactly one
-    // block). Initialization above is identical for both, so the tests run
-    // against the real, fully-booted kernel. The interactive shell's executor
-    // never returns, so in a test build it would keep the tests from ever
+    // Stage 9b: take a brief excursion into user mode (ring 3) before finishing
+    // boot. `map_user_code` maps a single ring 3 page holding a spin loop; `enter`
+    // forges a ring 3 interrupt frame and `iretq`s into it. The timer then catches
+    // the CPU running in ring 3 (proving we got there) and resumes the kernel at
+    // `boot_continue`. `enter` never returns here.
+    let user_entry = usermode::map_user_code(&mut mapper, &mut frame_allocator);
+    usermode::enter(user_entry, boot_continue);
+}
+
+/// Continue (and finish) boot after the Stage 9b ring 3 excursion.
+///
+/// Reached only via [`usermode::on_timer_tick`] rewriting the timer's return frame
+/// to land here in ring 0, on the boot stack that `usermode::enter` saved. From
+/// the kernel's point of view this is simply "the rest of `kernel_main`": it runs
+/// the tests in a `cargo test` build, or launches the interactive shell otherwise.
+/// Never returns.
+fn boot_continue() -> ! {
+    // We were resumed with interrupts disabled (the rewritten frame cleared IF);
+    // re-enable them now that we are safely back on the kernel stack.
+    x86_64::instructions::interrupts::enable();
+    serial_println!(
+        "[usermode] resumed in the kernel (ring 0); reached ring 3 = {}",
+        usermode::reached_ring3()
+    );
+    println!("Back from a ring 3 excursion; continuing boot.");
+
+    // From here the two builds diverge (`#[cfg(test)]` compiles exactly one block;
+    // see the test-harness note in `src/testing.rs`). The interactive shell's
+    // executor never returns, so in a test build it would keep the tests from ever
     // running — instead we hand control to the generated test harness, which runs
     // every `#[test_case]` and then exits QEMU with a pass/fail status.
     #[cfg(test)]
@@ -294,12 +320,11 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         hlt_loop(); // only to satisfy the `-> !` return type
     }
 
-    // Stage 7: an interactive shell on the revived async executor. First a boot
-    // self-test runs a few canned commands through the shell's dispatcher, so the
-    // command logic is verifiable even without a keyboard (e.g. headless QEMU).
-    // Then we hand the CPU to the executor running the shell task, which reads
-    // keystrokes, buffers a line, and dispatches it on Enter. `Executor::run`
-    // never returns (`-> !`), so it is the kernel's final call.
+    // Stage 7: an interactive shell on the revived async executor. A boot self-test
+    // first runs canned commands through the dispatcher (so the command logic is
+    // verifiable without a keyboard), then we hand the CPU to the executor running
+    // the shell task, which reads keystrokes, buffers a line, and dispatches it on
+    // Enter. `Executor::run` never returns (`-> !`), so it is the kernel's final call.
     #[cfg(not(test))]
     {
         // Imported here, inside the non-test block, so they don't read as unused

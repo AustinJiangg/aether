@@ -138,3 +138,11 @@ fn gdt_user_selectors_are_ring3() {
     assert_eq!(crate::gdt::user_code_selector().rpl(), PrivilegeLevel::Ring3);
     assert_eq!(crate::gdt::user_data_selector().rpl(), PrivilegeLevel::Ring3);
 }
+
+/// Stage 9b: the kernel actually executed code in ring 3 and came back. The tests
+/// run from `boot_continue`, which is reached only after the timer observed the
+/// CPU at `CPL == 3` and rewrote its return frame — so by now this must be set.
+#[test_case]
+fn reached_user_mode() {
+    assert!(crate::usermode::reached_ring3());
+}

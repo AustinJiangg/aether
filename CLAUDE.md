@@ -160,6 +160,11 @@ Exit QEMU: `Ctrl-A` then `X`.
   nodes addressed by `/`-separated paths, exposed as a global `RamFs` behind a
   mutex with `mkdir`/`write`/`read`/`list`/`remove`/`is_dir`. No disk, no
   persistence, no VFS layer.
+- `src/usermode.rs`: Stage 9b user-mode entry — maps one `USER_ACCESSIBLE` page
+  holding a tiny ring 3 spin program, forges an interrupt-return frame and
+  `iretq`s into ring 3, then proves it: the timer handler (`on_timer_tick`) sees
+  `CPL == 3` and rewrites its return frame to resume the kernel in ring 0. (Stage
+  9a added the ring 3 GDT segments and the TSS `rsp0` stack in `gdt.rs`.)
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run
