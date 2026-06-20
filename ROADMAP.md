@@ -15,7 +15,7 @@ Recommended: create a git branch per stage, and merge back to main once it runs.
 | **4** | Paging + heap allocator, make `Box` / `Vec` usable | virtual memory, address spaces | Done |
 | **5** | Cooperative multitasking (tasks written with `async` / `await`) | processes / tasks, scheduling | Done |
 | **6** | Preemptive scheduling, independent kernel threads | context switching, time slices | Done |
-| **7** | Simple shell + built-in commands | system calls, user interaction | Todo |
+| **7** | Simple shell + built-in commands | system calls, user interaction | Done |
 | **8** | In-memory simple file system | file abstraction, VFS | Todo |
 
 ## References

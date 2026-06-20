@@ -44,9 +44,14 @@ when idle. **Stage 6 is also done**: preemptive scheduling with independent
 kernel threads — each thread owns a heap stack and a saved register context, a
 hand-written `context_switch` swaps between them (6a, cooperative via
 `yield_now`), and the timer interrupt drives a round-robin scheduler that
-preempts a running thread without its cooperation (6b). The async-task subsystem
-is dormant during this stage. **Next is Stage 7** (a simple shell with built-in
-commands).
+preempts a running thread without its cooperation (6b). **Stage 7 is also done**:
+an interactive kernel shell (REPL) on the revived async executor — the shell is
+an async task that awaits decoded keystrokes from the keyboard `ScancodeStream`,
+buffers a line (with Backspace editing), and on Enter dispatches it to a built-in
+command (`help`, `echo`, `clear`, `ticks`, `uptime`, `mem`); a boot self-test
+makes it verifiable headless. There is no user mode yet, so commands are direct
+kernel calls — a precursor to system calls. The thread scheduler is dormant
+during this stage. **Next is Stage 8** (an in-memory file system).
 
 ## Language and writing conventions
 
@@ -132,12 +137,17 @@ Exit QEMU: `Ctrl-A` then `X`.
   reference), `keyboard.rs` (the async keyboard: a lock-free scancode queue filled
   by the IRQ1 handler and drained by a `Stream`-based task that decodes and
   echoes), and `executor.rs` (the waker-driven executor that sleeps on `hlt` when
-  no task is ready). Dormant during Stage 6 (marked `#[allow(dead_code)]`), to be
-  folded back in with threads later.
+  no task is ready). Revived in Stage 7 to drive the shell.
 - `src/thread/`: Stage 6 preemptive kernel threads — `mod.rs` (`Thread`/`ThreadId`,
   a round-robin `Scheduler`, `spawn`/`yield_now`/`run`, the fabricated initial
   stack frame, and `schedule` called from the timer to preempt) and `switch.rs`
   (the naked `context_switch` that saves callee-saved registers and swaps stacks).
+  Dormant during Stage 7 (marked `#[allow(dead_code)]`); the timer still calls
+  `schedule`, but it no-ops because preemption is never armed.
+- `src/shell.rs`: Stage 7 interactive shell — an async task that reads decoded
+  keystrokes from the keyboard `ScancodeStream`, buffers a line (with Backspace),
+  and on Enter routes it through a `dispatch` table of built-in commands. Includes
+  a boot `selftest` so the shell is verifiable without a keyboard.
 - `.cargo/config.toml`: the bare-metal target (`x86_64-unknown-none`), build-std,
   and the QEMU runner config.
 - `.claude/settings.json`: pre-approved permissions (cargo + git, including
