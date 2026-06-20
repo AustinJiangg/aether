@@ -18,9 +18,63 @@ Recommended: create a git branch per stage, and merge back to main once it runs.
 | **7** | Simple shell + built-in commands | system calls, user interaction | Done |
 | **8** | In-memory simple file system | file abstraction, VFS | Done |
 
-**All planned stages (0-8) are complete.** Ideas beyond the roadmap: user mode and
-real system calls, a disk driver with a persistent file system, SMP (multi-core),
-and networking.
+**All planned stages (0-8) are complete.** The kernel also has an in-QEMU
+unit-test harness (`cargo test`, see `src/testing.rs`) — engineering scaffolding
+rather than a numbered stage, added before the user-space work below so the
+riskier code that follows has an automated safety net.
+
+## Beyond the roadmap (stages 9+)
+
+Stages 0-8 produced a single-address-space kernel that runs entirely in ring 0:
+kernel threads, an async executor, a heap, and an in-memory file system — but no
+user mode, no privilege separation, and no real system calls. The through-line
+from here is to **run real, isolated user programs**, the step that turns "a
+kernel with threads" into "an operating system." That is the main line below;
+three more independent tracks (persistence, modern hardware, networking) can
+follow in any order.
+
+An architectural note that shapes the main line: the kernel currently has two
+multitasking models that do not yet coexist — the async executor (`task/`, which
+drives the shell today) and the preemptive thread scheduler (`thread/`, dormant).
+User processes need a per-process kernel stack, a saved register context, and an
+address space — which the thread side already prototypes — so the user-space work
+extends `thread/`, while the async executor stays an in-kernel facility. The two
+unify later.
+
+### Main line: the road to user space
+
+| Stage | What to build | OS concepts | Smallest verifiable step |
+|-------|---------------|-------------|--------------------------|
+| **9**  | Drop to user mode (ring 3) | privilege rings, GDT user segments, TSS `rsp0`, the `iretq` descent | Map a user page, `iretq` into ring-3 code; a timer interrupt fires and the handler observes `CPL == 3` in the saved frame — proving both that we reached ring 3 and that `rsp0` keeps the interrupt from triple-faulting. |
+| **10** | System calls | the user/kernel boundary, register-passed arguments | Start with `int 0x80` (IDT gate `DPL = 3`), simpler than the `syscall`/`sysret` MSRs. Implement `write`, `exit`, `getpid`; the Stage 9 program prints via `sys_write` and exits cleanly. |
+| **11** | Process address space + ELF loader | address-space isolation, higher-half kernel, ELF64 | (11a) each process its own page table (own CR3), kernel mapped into every space's higher half; (11b) a minimal ELF64 loader maps `PT_LOAD` segments. Hardest step: copy the top-level entries covering the kernel + physical-memory map into the new L4, or the kernel is unreachable after the CR3 switch. |
+| **12** | Multiple user processes | process scheduling, time-sliced userland | Tie processes into the (extended) thread scheduler, switching CR3 on each context switch; two user programs interleave their output under timer preemption. Add `spawn`/`exit`/`wait`. |
+
+### Parallel tracks (any order, after the main line)
+
+| Stage | Track | What to build | OS concepts |
+|-------|-------|---------------|-------------|
+| **13** | Persistence | Block device driver: ATA PIO read/write of raw sectors from a QEMU disk image | device I/O, polling |
+| **14** | Persistence | On-disk file system (FAT, read then write); factor a VFS trait so `RamFs` and the disk FS coexist | real FS layout, VFS |
+| **15** | Hardware | Replace the 8259 PIC with the Local APIC + IO-APIC; use the Local APIC timer instead of the PIT | modern interrupt delivery; prereq for SMP |
+| **16** | Hardware | SMP: bring up the other cores via INIT-SIPI-SIPI, per-CPU data, run the scheduler on multiple cores | real concurrency, per-CPU state |
+| **17** | Networking | NIC driver (virtio-net or e1000): send/receive raw Ethernet frames | DMA, ring buffers |
+| **18** | Networking | Minimal network stack: ARP + IPv4 + ICMP (reply to host `ping`), or integrate `smoltcp` | protocol layering |
+
+### Notes
+
+- **Each stage stays one `cargo run`-verifiable commit**, the same discipline as
+  stages 0-8 — and from Stage 9 on, each new mechanism should ship with a
+  `#[test_case]` (e.g. "after an interrupt from ring 3, the saved `CPL` is 3").
+- Large stages split into sub-steps with their own commits, as 4 (4a/4b/4c) and 6
+  (6a/6b) did — e.g. 9a sets up the GDT user segments and TSS `rsp0`, 9b performs
+  the ring-3 descent.
+- **Version caveats**: the `x86_64` crate's TSS / MSR APIs, ATA's QEMU wiring, and
+  ELF-crate choices have all shifted across versions — verify against current docs
+  rather than assuming from memory.
+- Optional, non-blocking refinements: upgrade `bootloader` 0.9 → 0.11 (framebuffer,
+  modern boot info), give kernel thread stacks a guard page, and eventually unify
+  the async executor with the thread scheduler.
 
 ## References
 
