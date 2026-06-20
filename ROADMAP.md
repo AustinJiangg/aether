@@ -43,6 +43,11 @@ unify later.
 
 ### Main line: the road to user space
 
+> **Status:** Stage 9 is complete — 9a installed the ring 3 GDT segments and the
+> TSS `rsp0` stack (`gdt.rs`); 9b forges an `iretq` frame to descend into ring 3
+> and uses a frame-rewrite to return to the kernel (`usermode.rs`). Stage 10 is
+> next.
+
 | Stage | What to build | OS concepts | Smallest verifiable step |
 |-------|---------------|-------------|--------------------------|
 | **9**  | Drop to user mode (ring 3) | privilege rings, GDT user segments, TSS `rsp0`, the `iretq` descent | Map a user page, `iretq` into ring-3 code; a timer interrupt fires and the handler observes `CPL == 3` in the saved frame — proving both that we reached ring 3 and that `rsp0` keeps the interrupt from triple-faulting. |
