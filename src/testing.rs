@@ -190,7 +190,7 @@ fn address_space_clone_roundtrip() {
 fn elf_parser_reads_demo_program() {
     use crate::elf::ElfFile;
     use crate::process;
-    let bytes = process::demo_elf();
+    let bytes = process::demo_elf(b"test message\n");
     let elf = ElfFile::parse(&bytes).expect("demo ELF must parse");
     assert_eq!(elf.entry(), process::USER_LOAD_BASE + 120);
     let segments: alloc::vec::Vec<_> = elf.load_segments().collect();
@@ -218,4 +218,12 @@ fn elf_ran_in_its_own_address_space() {
     let kernel_l4 = crate::process::kernel_l4();
     assert_ne!(user_l4, 0);
     assert_ne!(user_l4, kernel_l4);
+}
+
+/// Stage 12b: the cooperative scheduler ran more than one user process. Boot spawns
+/// two demo programs before this harness; each exits via the `exit` syscall, which
+/// dispatches the next, so by now at least two processes must have exited.
+#[test_case]
+fn scheduler_ran_multiple_processes() {
+    assert!(crate::process::processes_exited() >= 2);
 }

@@ -43,22 +43,24 @@ unify later.
 
 ### Main line: the road to user space
 
-> **Status:** Stages 9-11 are complete, and Stage 12a runs a loaded program in ring
-> 3. Stage 9 reaches ring 3 (`gdt.rs`, `usermode.rs`). Stage 10 adds `int 0x80`
-> system calls (`syscall.rs`). Stage 11a adds an `AddressSpace` (`memory.rs`) that
-> clones the kernel L4 and switches CR3; Stage 11b adds an ELF64 parser (`elf.rs`)
-> and loader (`process.rs`) that maps a program's `PT_LOAD` segments into a fresh
-> space through the physical-memory window. Stage 12a (`process::run`) then maps the
-> image a user stack, switches CR3 to it, and `iretq`s into ring 3: the program runs
-> on its own CR3 — the `int 0x80` handler still reaches the kernel because every
-> space maps it — prints via `write`, and `exit`s back, after which the kernel
-> switches CR3 back. This replaced the Stage 9b/10b hand-mapped excursion. Note:
-> under bootloader 0.9 the kernel, heap, and physical-memory window all live in the
-> *lower* half (present L4 slots all < 256), so a clone copies every present
-> top-level entry rather than a fixed higher half, and user programs load into an
-> otherwise-empty slot (64) for private lower-level tables. Stage 12b (tie processes
-> into the scheduler, switching CR3 per context switch so several user programs
-> interleave; add `spawn`/`exit`/`wait`) is next.
+> **Status:** Stages 9-11 are complete; Stage 12 is in progress. Stage 9 reaches
+> ring 3 (`gdt.rs`, `usermode.rs`); Stage 10 adds `int 0x80` system calls
+> (`syscall.rs`); Stage 11a adds an `AddressSpace` (`memory.rs`) that clones the
+> kernel L4 and switches CR3; Stage 11b adds an ELF64 parser (`elf.rs`) and loader
+> (`process.rs`) that maps a program's `PT_LOAD` segments into a fresh space. Stage
+> 12a runs one loaded program in ring 3 on its own CR3 (the `int 0x80` handler still
+> reaches the kernel because every space maps it). Stage 12b adds a cooperative
+> scheduler (`process.rs`): `spawn` queues loaded programs, `run` enters the first in
+> ring 3, and the `exit` syscall dispatches the next — rewriting the interrupt frame
+> and switching CR3 from inside the handler — until none remain, then resumes the
+> kernel. Two byte-identical programs each print their own message from the same
+> virtual address, proving the address spaces are isolated. Processes run with
+> interrupts off (purely cooperative). Note: under bootloader 0.9 the kernel, heap,
+> and physical-memory window all live in the *lower* half (present L4 slots all <
+> 256), so a clone copies every present top-level entry, and user programs load into
+> an otherwise-empty slot (64) for private lower-level tables. Stage 12c (set IF and
+> add timer preemption — interleave processes mid-execution, which needs saving a
+> preempted process's full register context; plus `wait`) is next.
 
 | Stage | What to build | OS concepts | Smallest verifiable step |
 |-------|---------------|-------------|--------------------------|

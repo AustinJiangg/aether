@@ -307,20 +307,34 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // reachable that way. We verify by translating the entry point in the new space
     // and reading the code back; switching to the space and running it in ring 3 is
     // the next step.
-    let image = process::demo_load_elf(&mut frame_allocator, phys_mem_offset);
+    // Stage 11b: load two user programs, each into its own private address space.
+    // They are byte-identical except for the message string — yet each reads its own
+    // message from the *same* virtual address, because the address spaces are
+    // separate (the whole point of per-process paging).
+    let img1 = process::demo_load_elf(
+        b"hello from user process #1\n",
+        &mut frame_allocator,
+        phys_mem_offset,
+    );
+    let img2 = process::demo_load_elf(
+        b"hello from user process #2\n",
+        &mut frame_allocator,
+        phys_mem_offset,
+    );
     serial_println!(
-        "[ OK ] ELF loaded into a private address space, verified = {}",
+        "[ OK ] two ELF programs loaded into private address spaces, verified = {}",
         process::elf_load_ok()
     );
-    println!("ELF loader live; mapped a program into a new address space (serial log).");
+    println!("ELF loader live; loaded two programs into separate address spaces (serial log).");
 
-    // Stage 12a: run the loaded ELF in ring 3 on its own address space. This
-    // replaces the Stage 9b/10b hand-mapped excursion — the program now comes from
-    // the ELF loader. `process::run` switches CR3 to the image and enters ring 3;
-    // when the program calls `exit` (or the timer catches it), the kernel resumes at
-    // `boot_continue`, which switches CR3 back to the kernel space. `run` never
-    // returns here.
-    process::run(&image, boot_continue);
+    // Stage 12b: spawn both programs and start the cooperative scheduler. It enters
+    // process #1 in ring 3 on its own CR3; when #1 calls `exit`, the syscall handler
+    // dispatches #2; when #2 exits, the kernel resumes at `boot_continue` (which
+    // switches CR3 back to the kernel space). `run` never returns here.
+    let p1 = process::spawn(img1);
+    let p2 = process::spawn(img2);
+    serial_println!("[sched] spawned processes {} and {}", p1, p2);
+    process::run(boot_continue);
 }
 
 /// Continue (and finish) boot after the ring 3 excursion (Stage 12a runs a loaded
@@ -348,11 +362,12 @@ fn boot_continue() -> ! {
         syscall::ring3_syscall_count()
     );
     serial_println!(
-        "[process] the ELF ran on L4 {:#x} (kernel L4 {:#x}); now back on the kernel space",
+        "[sched] {} user process(es) ran (last on L4 {:#x}, kernel L4 {:#x}); back on the kernel space",
+        process::processes_exited(),
         process::last_user_run_l4(),
         process::kernel_l4(),
     );
-    println!("Back from a ring 3 excursion; continuing boot.");
+    println!("Back from running user processes; continuing boot.");
 
     // Stage 10a: exercise the `int 0x80` syscall path from ring 0 — the very path
     // the ring 3 program will use in 10b. `sys_write` makes the kernel print on the

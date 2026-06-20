@@ -70,11 +70,11 @@ pub extern "x86-interrupt" fn syscall_handler(mut frame: InterruptStackFrame) {
     }
 
     // `exit` from ring 3 is special: the program is done, so there is no value to
-    // hand back to it. Instead we rewrite this interrupt's return frame (Stage 9b's
-    // mechanism) so the `iretq` below resumes the kernel rather than the user code.
+    // hand back to it. Hand off to the scheduler, which rewrites this interrupt's
+    // return frame to switch to the next ready process (Stage 12b) or, if none
+    // remain, to resume the kernel (Stage 9b's mechanism).
     if number == SYS_EXIT && from_ring3 {
-        crate::serial_println!("[syscall] exit({}) from ring 3; returning to the kernel", arg1);
-        crate::usermode::resume_kernel(&mut frame);
+        crate::process::on_user_exit(&mut frame, arg1);
         return;
     }
 

@@ -21,7 +21,9 @@
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use alloc::vec::Vec;
+use spin::Mutex;
 use x86_64::registers::control::{Cr3, Cr3Flags};
+use x86_64::structures::idt::InterruptStackFrame;
 use x86_64::structures::paging::{
     FrameAllocator, Mapper, OffsetPageTable, Page, PageTableFlags, PhysFrame, Size4KiB, Translate,
 };
@@ -238,8 +240,7 @@ fn map_segment(
 ///   [120 .. 143)  code  (entry point = USER_LOAD_BASE + 120)
 ///   [143 ..    )  message string
 /// ```
-pub fn demo_elf() -> Vec<u8> {
-    let msg: &[u8] = b"hello from a loaded ELF, in its own address space\n";
+pub fn demo_elf(msg: &[u8]) -> Vec<u8> {
     let msg_offset = DEMO_ENTRY_OFFSET + DEMO_CODE_LEN; // 143
     let total = msg_offset + msg.len();
 
@@ -292,10 +293,11 @@ pub fn elf_load_ok() -> bool {
 /// Stage 11b demo: build the demo ELF, load it into a fresh address space, and
 /// verify by translating the entry point in that space and reading the code back.
 pub fn demo_load_elf(
+    msg: &[u8],
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
     physical_memory_offset: VirtAddr,
 ) -> UserImage {
-    let bytes = demo_elf();
+    let bytes = demo_elf(msg);
 
     // Log what the parser sees in the ELF (entry + each loadable segment's perms).
     if let Ok(elf) = ElfFile::parse(&bytes) {
@@ -357,47 +359,136 @@ pub fn demo_load_elf(
     image
 }
 
-// --- Stage 12a: running a loaded program in ring 3 -------------------------
+// --- Stage 12a/12b: running loaded programs in ring 3 ----------------------
 
-/// The kernel's CR3 (frame address + flags), saved by [`run`] so the resume
-/// continuation can switch back. The user program runs on its own CR3, but the
+/// The kernel's CR3 (frame address + flags), saved when the scheduler starts so the
+/// resume continuation can switch back. User programs run on their own CR3, but the
 /// kernel is mapped there too, so the continuation reaches this code either way.
 static KERNEL_L4_ADDR: AtomicU64 = AtomicU64::new(0);
 static KERNEL_L4_FLAGS: AtomicU64 = AtomicU64::new(0);
-/// The L4 the last [`run`] executed a user program on — for the Stage 12a test.
+/// The L4 the most recent process ran on — for the "ran in its own space" test.
 static RAN_USER_L4_ADDR: AtomicU64 = AtomicU64::new(0);
+/// How many user processes have exited — for the Stage 12b test.
+static PROCESSES_EXITED: AtomicU64 = AtomicU64::new(0);
 
-/// Run a loaded program in ring 3 on its own address space; never returns to the
-/// caller.
-///
-/// Remembers the kernel's CR3 (so the continuation can switch back), switches CR3
-/// to the image, and enters ring 3 at the program's entry on its user stack. When
-/// the program calls `exit` (or the timer catches it spinning), the kernel resumes
-/// at `resume` — which **must** call [`return_to_kernel_space`] first, before it
-/// touches anything mapped only in the kernel's address space.
-pub fn run(image: &UserImage, resume: fn() -> !) -> ! {
+/// A user process: a unique id plus its loaded image (address space, entry, stack).
+/// Stage 12b runs processes cooperatively to completion; a later stage adds a saved
+/// register context so a process can be preempted and resumed mid-execution.
+struct Process {
+    id: u64,
+    image: UserImage,
+}
+
+/// A minimal cooperative scheduler: a FIFO queue of ready processes plus the one
+/// currently running. Dispatch is driven by the `exit` syscall (see [`on_user_exit`]),
+/// not the timer — processes run with interrupts off and yield only by exiting.
+struct Scheduler {
+    ready: Vec<Process>,
+    current: Option<Process>,
+    next_id: u64,
+}
+
+static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler {
+    ready: Vec::new(),
+    current: None,
+    next_id: 1,
+});
+
+/// Add a loaded program to the scheduler's ready queue; returns its process id.
+pub fn spawn(image: UserImage) -> u64 {
+    let mut sched = SCHEDULER.lock();
+    let id = sched.next_id;
+    sched.next_id += 1;
+    sched.ready.push(Process { id, image });
+    id
+}
+
+/// Start the cooperative scheduler: run the spawned processes in ring 3, one after
+/// another, each on its own address space. Never returns to the caller. When the
+/// last process exits, the kernel resumes at `resume` — which **must** call
+/// [`return_to_kernel_space`] first, before touching kernel-only mappings.
+pub fn run(resume: fn() -> !) -> ! {
+    // Remember the kernel's CR3 so the eventual return can switch back.
     let kernel = Cr3::read();
     KERNEL_L4_ADDR.store(kernel.0.start_address().as_u64(), Ordering::SeqCst);
     KERNEL_L4_FLAGS.store(kernel.1.bits(), Ordering::SeqCst);
-    RAN_USER_L4_ADDR.store(
-        image.space.l4_frame().start_address().as_u64(),
-        Ordering::SeqCst,
-    );
 
-    serial_println!(
-        "[process] running user program: CR3 {:?} -> {:?}, entry {:?}, stack top {:?}",
-        kernel.0.start_address(),
-        image.space.l4_frame().start_address(),
-        image.entry,
-        image.user_stack_top,
-    );
+    let started = {
+        let mut sched = SCHEDULER.lock();
+        if sched.ready.is_empty() {
+            None
+        } else {
+            let first = sched.ready.remove(0);
+            let entry = first.image.entry;
+            let stack = first.image.user_stack_top;
+            let l4 = first.image.space.l4_frame();
+            RAN_USER_L4_ADDR.store(l4.start_address().as_u64(), Ordering::SeqCst);
+            serial_println!(
+                "[sched] starting process {} on L4 {:?} ({} more queued)",
+                first.id,
+                l4.start_address(),
+                sched.ready.len(),
+            );
+            // SAFETY: the image clones the kernel, so its space maps the running
+            // kernel; switching CR3 to it is sound.
+            unsafe { first.image.space.activate() };
+            sched.current = Some(first);
+            Some((entry, stack))
+        }
+    };
 
-    // SAFETY: `image.space` is a clone of the kernel space with the program mapped
-    // into empty slots, so it maps the running kernel; switching CR3 to it is sound.
-    unsafe {
-        image.space.activate();
+    match started {
+        Some((entry, stack)) => usermode::enter(entry, stack, resume),
+        None => {
+            serial_println!("[sched] no processes to run");
+            resume()
+        }
     }
-    usermode::enter(image.entry, image.user_stack_top, resume);
+}
+
+/// Called by the `exit` syscall when a ring 3 process terminates (see `syscall.rs`).
+/// Drops the finished process and, if another is ready, switches to it — rewriting
+/// the interrupt's return frame and CR3 so the handler's `iretq` enters the next
+/// program. If none remain, resumes the kernel instead.
+pub fn on_user_exit(frame: &mut InterruptStackFrame, code: u64) {
+    PROCESSES_EXITED.fetch_add(1, Ordering::SeqCst);
+
+    let next = {
+        let mut sched = SCHEDULER.lock();
+        let finished_id = sched.current.take().map(|p| p.id).unwrap_or(0);
+        if sched.ready.is_empty() {
+            serial_println!(
+                "[sched] process {} exited (code {}); no more ready, returning to the kernel",
+                finished_id,
+                code,
+            );
+            None
+        } else {
+            let next = sched.ready.remove(0);
+            let entry = next.image.entry;
+            let stack = next.image.user_stack_top;
+            let l4 = next.image.space.l4_frame();
+            RAN_USER_L4_ADDR.store(l4.start_address().as_u64(), Ordering::SeqCst);
+            serial_println!(
+                "[sched] process {} exited (code {}); switching to process {} on L4 {:?}",
+                finished_id,
+                code,
+                next.id,
+                l4.start_address(),
+            );
+            // SAFETY: the next image clones the kernel, so its space maps the running
+            // kernel; switching CR3 to it from the handler is sound — the rsp0 stack
+            // holding `frame` is mapped identically in every address space.
+            unsafe { next.image.space.activate() };
+            sched.current = Some(next);
+            Some((entry, stack))
+        }
+    };
+
+    match next {
+        Some((entry, stack)) => usermode::switch_to_user(frame, entry, stack),
+        None => usermode::resume_kernel(frame),
+    }
 }
 
 /// Switch CR3 back to the kernel address space saved by [`run`]. Call once, at the
@@ -423,4 +514,9 @@ pub fn last_user_run_l4() -> u64 {
 /// The kernel's L4 frame, saved by the last [`run`]. For the Stage 12a test.
 pub fn kernel_l4() -> u64 {
     KERNEL_L4_ADDR.load(Ordering::SeqCst)
+}
+
+/// How many user processes have exited since boot. For the Stage 12b test.
+pub fn processes_exited() -> u64 {
+    PROCESSES_EXITED.load(Ordering::SeqCst)
 }

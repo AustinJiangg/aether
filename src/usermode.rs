@@ -117,19 +117,14 @@ pub fn enter(user_entry: VirtAddr, user_stack_top: VirtAddr, resume: fn() -> !) 
     RESUME_RSP.store((kernel_rsp & !0xF) - 8, Ordering::SeqCst);
     RESUME_CS.store(u64::from(gdt::kernel_code_selector().0), Ordering::SeqCst);
 
-    // Disable interrupts so no tick fires between arming the hook and the descent.
-    // The user frame's RFLAGS has IF set, so interrupts come back on the instant we
-    // enter ring 3 — and the very next tick then interrupts the ring 3 code.
+    // Disable interrupts so nothing fires between arming the hook and the descent.
+    // Stage 12b runs user processes with IF *cleared* (see `ring3_frame`), so they
+    // stay uninterrupted until their next syscall; interrupts come back on only when
+    // the kernel finally resumes (in `boot_continue`).
     interrupts::disable();
     EXPECT_USER_TICK.store(true, Ordering::SeqCst);
 
-    let user_frame = InterruptStackFrameValue {
-        instruction_pointer: user_entry,
-        code_segment: u64::from(gdt::user_code_selector().0),
-        cpu_flags: 0x202, // reserved bit 1, plus IF (bit 9): ring 3 with interrupts on
-        stack_pointer: user_stack_top, // top of the program's user stack
-        stack_segment: u64::from(gdt::user_data_selector().0),
-    };
+    let user_frame = ring3_frame(user_entry, user_stack_top);
 
     serial_println!(
         "[usermode] entering ring 3 at {:?} (cs={:#x}, ss={:#x})",
@@ -141,11 +136,40 @@ pub fn enter(user_entry: VirtAddr, user_stack_top: VirtAddr, resume: fn() -> !) 
     // SAFETY: the frame describes a valid ring 3 context — `user_entry` is a
     // mapped, user-accessible, executable page; `user_stack_top` is the top of a
     // mapped, user-accessible, writable stack; CS/SS are the GDT's RPL 3 selectors;
-    // RFLAGS is sane with IF set. `rsp0` is installed (Stage 9a), so the first
-    // interrupt taken from ring 3 has a valid kernel stack. `iretq` thus transitions
-    // cleanly to user mode and does not return here. The caller has already switched
-    // CR3 to the address space that maps `user_entry` and `user_stack_top`.
+    // RFLAGS has IF clear (cooperative). `rsp0` is installed (Stage 9a), so a syscall
+    // taken from ring 3 has a valid kernel stack. `iretq` thus transitions cleanly to
+    // user mode and does not return here. The caller has already switched CR3 to the
+    // address space that maps `user_entry` and `user_stack_top`.
     unsafe { user_frame.iretq() }
+}
+
+/// Build the ring 3 interrupt-return frame for a user program: entry point, user
+/// stack, and the GDT's RPL 3 code/data selectors.
+///
+/// RFLAGS clears IF: Stage 12b runs user processes *cooperatively* — no timer
+/// preemption yet — so a process runs uninterrupted until its next syscall, and the
+/// scheduler switches between processes at `exit`. (Stage 12c will set IF and add
+/// preemption, which needs saving a preempted process's full register state.)
+fn ring3_frame(entry: VirtAddr, stack_top: VirtAddr) -> InterruptStackFrameValue {
+    InterruptStackFrameValue {
+        instruction_pointer: entry,
+        code_segment: u64::from(gdt::user_code_selector().0),
+        cpu_flags: 0x002, // reserved bit 1 only; IF clear (no interrupts in ring 3)
+        stack_pointer: stack_top,
+        stack_segment: u64::from(gdt::user_data_selector().0),
+    }
+}
+
+/// Rewrite an in-flight interrupt's return frame so its `iretq` enters ring 3 at
+/// `entry` on `stack_top`. The scheduler uses this from inside the syscall handler
+/// to switch from a just-exited process to the next one; the caller must already
+/// have switched CR3 to the target's address space.
+pub fn switch_to_user(frame: &mut InterruptStackFrame, entry: VirtAddr, stack_top: VirtAddr) {
+    // SAFETY: `ring3_frame` is a valid ring 3 context (RPL 3 selectors, IF clear, a
+    // mapped user entry and stack in the now-active address space). Overwriting the
+    // return frame makes the handler's `iretq` enter that context instead of
+    // returning to the process that just exited.
+    unsafe { frame.as_mut().write(ring3_frame(entry, stack_top)) };
 }
 
 /// Leave ring 3: rewrite `frame` so the in-flight interrupt's `iretq` resumes the
