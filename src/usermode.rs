@@ -1,4 +1,4 @@
-//! Stages 9b and 10b: dropping to user mode (ring 3), running a program there,
+//! Stages 9b/10b/12a: dropping to user mode (ring 3), running a program there,
 //! and returning to the kernel.
 //!
 //! Everything so far has run in ring 0 (full privilege). A real OS runs user
@@ -19,9 +19,11 @@
 //! infinite `jmp .` loop — and the proof was the timer interrupt entering the
 //! kernel through `rsp0` and finding the saved code selector at `CPL == 3` (which
 //! proved both that we ran in ring 3 and that `rsp0` averted a triple fault).
-//! Stage 10b replaces the loop with a real program that calls `write` then `exit`
-//! (see [`map_user_code`]); reaching the kernel through a ring 3 *syscall* is the
-//! same proof by a far more useful route.
+//! Stage 10b replaced the loop with a real program that calls `write` then `exit`;
+//! Stage 11b/12a goes further — the program is now a real ELF that `process.rs`
+//! maps into its *own* address space, and [`enter`] runs it in ring 3 on that
+//! space's CR3 (every space maps the kernel, so the `int 0x80` syscalls still
+//! reach the kernel handler).
 //!
 //! Returning to the kernel: an interrupt handler normally `iretq`s back to where
 //! it came from — the ring 3 code. To resume the *kernel* instead, the handler
@@ -35,25 +37,9 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use x86_64::instructions::interrupts;
 use x86_64::structures::idt::{InterruptStackFrame, InterruptStackFrameValue};
-use x86_64::structures::paging::{
-    FrameAllocator, Mapper, OffsetPageTable, Page, PageTableFlags, PhysFrame, Size4KiB,
-};
 use x86_64::VirtAddr;
 
 use crate::{gdt, serial_println};
-
-/// Virtual address of the single user-accessible page that holds the ring 3 code.
-///
-/// Chosen in an otherwise-empty PML4 slot (index 4, the 32 TiB region) so that no
-/// existing mapping shares its parent page tables. That matters: a ring 3 access
-/// faults unless *every* level on the way down is marked `USER_ACCESSIBLE`, and
-/// `map_to_with_table_flags` can only stamp that bit on tables it creates fresh.
-const USER_PAGE: u64 = 0x2000_0000_0000;
-
-/// Offset within the user page where the program's message string lives — well
-/// clear of the program (at offset 0) and the user stack (growing down from the
-/// top of the page).
-const MSG_OFFSET: u64 = 0x800;
 
 // --- state shared with the timer interrupt handler -------------------------
 
@@ -76,65 +62,6 @@ static RESUME_CS: AtomicU64 = AtomicU64::new(0);
 /// logged by the boot continuation.
 pub fn reached_ring3() -> bool {
     REACHED_RING3.load(Ordering::SeqCst)
-}
-
-/// Map the single ring 3 page, write a small program and its message into it, and
-/// return the user entry point (the virtual address of the first instruction).
-///
-/// The program (hand-assembled by [`build_user_program`]) makes two system calls
-/// and never returns: `write` to print a message through the kernel, then `exit`
-/// to hand control back. Running in ring 3, every privileged action it needs —
-/// printing, exiting — has to go through `int 0x80`.
-pub fn map_user_code(
-    mapper: &mut OffsetPageTable,
-    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
-) -> VirtAddr {
-    let page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(USER_PAGE));
-    let frame: PhysFrame<Size4KiB> = frame_allocator
-        .allocate_frame()
-        .expect("no free frame for the user code page");
-
-    // The final page *and every parent table* must be USER_ACCESSIBLE, or a ring 3
-    // instruction fetch faults at whichever level lacks the bit. Because USER_PAGE
-    // lives in an empty PML4 slot, `map_to_with_table_flags` builds all four levels
-    // fresh and stamps each parent with `parent_flags`. The page is left writable
-    // (so the kernel can write the code below) and executable (no NO_EXECUTE), the
-    // latter being what lets ring 3 fetch from it.
-    let page_flags =
-        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
-    let parent_flags =
-        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
-
-    // SAFETY: `frame` is a fresh, unused frame from the allocator, mapped at a
-    // virtual address (`USER_PAGE`) that nothing else uses, so no aliasing is
-    // created. Making it user-accessible and executable is intentional — ring 3
-    // must be able to fetch its instructions from here.
-    unsafe {
-        mapper
-            .map_to_with_table_flags(page, frame, page_flags, parent_flags, frame_allocator)
-            .expect("failed to map the user code page")
-            .flush();
-    }
-
-    // Lay out the page: the program at offset 0, its message at MSG_OFFSET. SMAP is
-    // not enabled, so ring 0 may write this user page directly.
-    let message = b"hello from ring 3, printed by the kernel via a syscall\n";
-    let program = build_user_program(USER_PAGE + MSG_OFFSET, message.len());
-
-    let base = USER_PAGE as *mut u8;
-    // SAFETY: the page was just mapped present and writable, and both the program
-    // (a couple dozen bytes at offset 0) and the message (at MSG_OFFSET) sit well
-    // inside its 4 KiB; nothing else aliases this address.
-    unsafe {
-        for (i, &byte) in program.iter().enumerate() {
-            base.add(i).write_volatile(byte);
-        }
-        for (i, &byte) in message.iter().enumerate() {
-            base.add(MSG_OFFSET as usize + i).write_volatile(byte);
-        }
-    }
-
-    VirtAddr::new(USER_PAGE)
 }
 
 /// Hand-assemble the ring 3 program `write(msg_ptr, msg_len); exit(0)`.
@@ -175,7 +102,7 @@ pub(crate) fn build_user_program(msg_ptr: u64, msg_len: usize) -> [u8; 23] {
 /// continues *after* the timer has pulled us back out of ring 3; it runs in ring 0
 /// on the current (boot) kernel stack and must never return — it takes over the
 /// rest of boot.
-pub fn enter(user_entry: VirtAddr, resume: fn() -> !) -> ! {
+pub fn enter(user_entry: VirtAddr, user_stack_top: VirtAddr, resume: fn() -> !) -> ! {
     // Capture the current kernel stack pointer; `resume` will run on it. This is
     // the boot stack, already known to be large enough to run the shell (it does
     // today). `enter` never returns, so reusing the stack below this point is safe.
@@ -200,7 +127,7 @@ pub fn enter(user_entry: VirtAddr, resume: fn() -> !) -> ! {
         instruction_pointer: user_entry,
         code_segment: u64::from(gdt::user_code_selector().0),
         cpu_flags: 0x202, // reserved bit 1, plus IF (bit 9): ring 3 with interrupts on
-        stack_pointer: VirtAddr::new(USER_PAGE + 0x1000), // top of the user page (the program's stack)
+        stack_pointer: user_stack_top, // top of the program's user stack
         stack_segment: u64::from(gdt::user_data_selector().0),
     };
 
@@ -212,11 +139,12 @@ pub fn enter(user_entry: VirtAddr, resume: fn() -> !) -> ! {
     );
 
     // SAFETY: the frame describes a valid ring 3 context — `user_entry` is a
-    // mapped, user-accessible, executable page; the stack pointer is inside that
-    // mapped page; CS/SS are the GDT's RPL 3 selectors; RFLAGS is sane with IF set.
-    // `rsp0` is installed (Stage 9a), so the first interrupt taken from ring 3 has
-    // a valid kernel stack. `iretq` thus transitions cleanly to user mode and does
-    // not return here.
+    // mapped, user-accessible, executable page; `user_stack_top` is the top of a
+    // mapped, user-accessible, writable stack; CS/SS are the GDT's RPL 3 selectors;
+    // RFLAGS is sane with IF set. `rsp0` is installed (Stage 9a), so the first
+    // interrupt taken from ring 3 has a valid kernel stack. `iretq` thus transitions
+    // cleanly to user mode and does not return here. The caller has already switched
+    // CR3 to the address space that maps `user_entry` and `user_stack_top`.
     unsafe { user_frame.iretq() }
 }
 

@@ -72,8 +72,12 @@ since bootloader 0.9 keeps the kernel, heap, and physical-memory window in the
 lower half, the clone copies every present top-level entry. Stage 11b adds an
 ELF64 parser (`elf.rs`) and a loader (`process.rs`) that maps a program's
 `PT_LOAD` segments into a fresh space through the physical-memory window (the space
-is not yet active) and verifies the load by translating its entry point; running
-it in ring 3 is Stage 12. `ROADMAP.md` now carries the
+is not yet active) and verifies the load by translating its entry point. **Stage
+12a is also done**: `process::run` maps the image a user stack, switches CR3 to it,
+and `iretq`s into ring 3 — the loaded program runs on its own CR3 (the `int 0x80`
+handler still reaches the kernel because every space maps it), prints via a syscall,
+and `exit`s back to the kernel, which switches CR3 back; this replaced the Stage
+9b/10b hand-mapped excursion. `ROADMAP.md` now carries the
 forward plan (stages 9-18): the
 user-space main line (system calls, per-process address spaces + ELF,
 multiprocessing), plus persistence, APIC/SMP, and networking tracks.
@@ -185,12 +189,13 @@ Exit QEMU: `Ctrl-A` then `X`.
   nodes addressed by `/`-separated paths, exposed as a global `RamFs` behind a
   mutex with `mkdir`/`write`/`read`/`list`/`remove`/`is_dir`. No disk, no
   persistence, no VFS layer.
-- `src/usermode.rs`: Stage 9b/10b user-mode entry — maps one `USER_ACCESSIBLE`
-  page, forges an interrupt-return frame and `iretq`s into ring 3, and returns to
-  the kernel via `resume_kernel` (a frame-rewrite) when the ring 3 program exits or
-  the timer catches it. The program (hand-assembled in `map_user_code`) calls
-  `write` then `exit` through `int 0x80`. (Stage 9a added the ring 3 GDT segments
-  and the TSS `rsp0` stack in `gdt.rs`.)
+- `src/usermode.rs`: the ring 3 entry/return mechanism — `enter` forges an
+  interrupt-return frame (entry point + user stack) and `iretq`s into ring 3;
+  `resume_kernel` (a frame-rewrite) returns to the kernel when the program exits or
+  the timer catches it. Stage 12a generalized `enter` to take a user stack and run
+  whatever program `process.rs` loaded (the old hand-mapped `map_user_code` is
+  gone); `build_user_program` still hand-assembles the demo's `write`+`exit` code.
+  (Stage 9a added the ring 3 GDT segments and the TSS `rsp0` stack in `gdt.rs`.)
 - `src/syscall.rs`: Stage 10 system calls — the `int 0x80` handler (its IDT gate's
   DPL is 3 so ring 3 may invoke it), a stack-based argument ABI, and
   `write`/`getpid`/`exit`. A ring 3 `exit` calls `usermode::resume_kernel` to
@@ -199,12 +204,13 @@ Exit QEMU: `Ctrl-A` then `X`.
 - `src/elf.rs`: Stage 11b minimal ELF64 parser — validates the header (x86-64,
   ET_EXEC), bounds-checks the program-header table, and iterates the `PT_LOAD`
   segments. Pure (reads bytes, no page tables), so it is unit-testable on its own.
-- `src/process.rs`: Stage 11b ELF loader — parses an ELF (via `elf.rs`), clones the
-  kernel into a fresh `AddressSpace`, and maps each `PT_LOAD` segment into it,
-  writing the bytes through the physical-memory window (the space is not yet
-  active). A `UserImage` bundles the space with its entry point; the boot demo
-  loads a hand-built demo ELF and verifies it by translating the entry. (Running it
-  in ring 3 is Stage 12.)
+- `src/process.rs`: Stage 11b ELF loader + Stage 12a runner — parses an ELF (via
+  `elf.rs`), clones the kernel into a fresh `AddressSpace`, maps each `PT_LOAD`
+  segment plus a user stack into it (writing through the physical-memory window
+  while the space is inactive), and bundles the result as a `UserImage` (space,
+  entry, user stack). `run` switches CR3 to the image and enters ring 3 via
+  `usermode::enter`; `return_to_kernel_space` switches CR3 back in the resume
+  continuation. The boot demo loads a hand-built ELF, verifies it, and runs it.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

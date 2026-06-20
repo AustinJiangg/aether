@@ -307,31 +307,38 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // reachable that way. We verify by translating the entry point in the new space
     // and reading the code back; switching to the space and running it in ring 3 is
     // the next step.
-    process::demo_load_elf(&mut frame_allocator, phys_mem_offset);
+    let image = process::demo_load_elf(&mut frame_allocator, phys_mem_offset);
     serial_println!(
         "[ OK ] ELF loaded into a private address space, verified = {}",
         process::elf_load_ok()
     );
     println!("ELF loader live; mapped a program into a new address space (serial log).");
 
-    // Stage 9b/10b: take a brief excursion into user mode (ring 3) before finishing
-    // boot. `map_user_code` maps a ring 3 page holding a small program that calls
-    // `write` then `exit` via `int 0x80`; `enter` forges a ring 3 interrupt frame
-    // and `iretq`s into it. The program's `exit` syscall (or, as a fallback, the
-    // timer catching it) resumes the kernel at `boot_continue`. `enter` never
+    // Stage 12a: run the loaded ELF in ring 3 on its own address space. This
+    // replaces the Stage 9b/10b hand-mapped excursion — the program now comes from
+    // the ELF loader. `process::run` switches CR3 to the image and enters ring 3;
+    // when the program calls `exit` (or the timer catches it), the kernel resumes at
+    // `boot_continue`, which switches CR3 back to the kernel space. `run` never
     // returns here.
-    let user_entry = usermode::map_user_code(&mut mapper, &mut frame_allocator);
-    usermode::enter(user_entry, boot_continue);
+    process::run(&image, boot_continue);
 }
 
-/// Continue (and finish) boot after the Stage 9b ring 3 excursion.
+/// Continue (and finish) boot after the ring 3 excursion (Stage 12a runs a loaded
+/// ELF program there).
 ///
-/// Reached only via [`usermode::on_timer_tick`] rewriting the timer's return frame
-/// to land here in ring 0, on the boot stack that `usermode::enter` saved. From
-/// the kernel's point of view this is simply "the rest of `kernel_main`": it runs
-/// the tests in a `cargo test` build, or launches the interactive shell otherwise.
-/// Never returns.
+/// Reached via [`usermode::resume_kernel`] — triggered by the program's `exit`
+/// syscall, or by [`usermode::on_timer_tick`] catching it spinning — rewriting the
+/// interrupt's return frame to land here in ring 0, on the boot stack that
+/// `usermode::enter` saved. We arrive on the *user program's* CR3 and switch back to
+/// the kernel space first thing. From the kernel's point of view this is simply "the
+/// rest of `kernel_main`": it runs the tests in a `cargo test` build, or launches
+/// the interactive shell otherwise. Never returns.
 fn boot_continue() -> ! {
+    // Stage 12a: we resumed on the *user program's* CR3 (every address space maps
+    // the kernel, so the handful of instructions to get here were fine). Switch back
+    // to the kernel address space before doing anything else.
+    process::return_to_kernel_space();
+
     // We were resumed with interrupts disabled (the rewritten frame cleared IF);
     // re-enable them now that we are safely back on the kernel stack.
     x86_64::instructions::interrupts::enable();
@@ -339,6 +346,11 @@ fn boot_continue() -> ! {
         "[usermode] resumed in the kernel (ring 0); reached ring 3 = {}, ring 3 syscalls = {}",
         usermode::reached_ring3(),
         syscall::ring3_syscall_count()
+    );
+    serial_println!(
+        "[process] the ELF ran on L4 {:#x} (kernel L4 {:#x}); now back on the kernel space",
+        process::last_user_run_l4(),
+        process::kernel_l4(),
     );
     println!("Back from a ring 3 excursion; continuing boot.");
 

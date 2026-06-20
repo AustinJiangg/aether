@@ -43,20 +43,22 @@ unify later.
 
 ### Main line: the road to user space
 
-> **Status:** Stages 9, 10, and 11 are complete. Stage 9 reaches ring 3 (`gdt.rs`,
-> `usermode.rs`): forge an `iretq` frame to descend, a frame-rewrite to return.
-> Stage 10 adds `int 0x80` system calls (`syscall.rs`); the ring 3 program calls
-> `write` then `exit`. Stage 11a adds an `AddressSpace` (`memory.rs`) that clones
-> the active kernel L4 into a fresh frame and switches CR3 onto it and back. Stage
-> 11b adds an ELF64 parser (`elf.rs`) and a loader (`process.rs`) that maps a
-> program's `PT_LOAD` segments into a fresh space — populating it through the
-> physical-memory window, since the space is not yet active — and verifies the load
-> by translating the entry point. Note: under bootloader 0.9 the kernel, heap, and
-> physical-memory window all live in the *lower* half (the present L4 slots are all
-> < 256), so a clone copies every present top-level entry rather than a fixed higher
-> half, and user programs load into an otherwise-empty slot (64) to get private
-> lower-level tables. Stage 12 (switch CR3 to a loaded program and run it in ring 3,
-> then schedule multiple processes) is next.
+> **Status:** Stages 9-11 are complete, and Stage 12a runs a loaded program in ring
+> 3. Stage 9 reaches ring 3 (`gdt.rs`, `usermode.rs`). Stage 10 adds `int 0x80`
+> system calls (`syscall.rs`). Stage 11a adds an `AddressSpace` (`memory.rs`) that
+> clones the kernel L4 and switches CR3; Stage 11b adds an ELF64 parser (`elf.rs`)
+> and loader (`process.rs`) that maps a program's `PT_LOAD` segments into a fresh
+> space through the physical-memory window. Stage 12a (`process::run`) then maps the
+> image a user stack, switches CR3 to it, and `iretq`s into ring 3: the program runs
+> on its own CR3 — the `int 0x80` handler still reaches the kernel because every
+> space maps it — prints via `write`, and `exit`s back, after which the kernel
+> switches CR3 back. This replaced the Stage 9b/10b hand-mapped excursion. Note:
+> under bootloader 0.9 the kernel, heap, and physical-memory window all live in the
+> *lower* half (present L4 slots all < 256), so a clone copies every present
+> top-level entry rather than a fixed higher half, and user programs load into an
+> otherwise-empty slot (64) for private lower-level tables. Stage 12b (tie processes
+> into the scheduler, switching CR3 per context switch so several user programs
+> interleave; add `spawn`/`exit`/`wait`) is next.
 
 | Stage | What to build | OS concepts | Smallest verifiable step |
 |-------|---------------|-------------|--------------------------|

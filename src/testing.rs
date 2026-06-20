@@ -206,3 +206,16 @@ fn elf_parser_reads_demo_program() {
 fn elf_loaded_into_address_space() {
     assert!(crate::process::elf_load_ok());
 }
+
+/// Stage 12a: the loaded ELF program actually executed in ring 3 on its *own*
+/// address space — a different CR3 than the kernel's. During boot `process::run`
+/// switches to the image's CR3 and enters ring 3; the program's `write`/`exit`
+/// syscalls set `usermode::reached_ring3`, and `run` records both L4 frames.
+#[test_case]
+fn elf_ran_in_its_own_address_space() {
+    assert!(crate::usermode::reached_ring3());
+    let user_l4 = crate::process::last_user_run_l4();
+    let kernel_l4 = crate::process::kernel_l4();
+    assert_ne!(user_l4, 0);
+    assert_ne!(user_l4, kernel_l4);
+}
