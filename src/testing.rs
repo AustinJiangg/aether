@@ -1,0 +1,131 @@
+//! In-QEMU unit-test harness.
+//!
+//! A normal Rust test binary links against the standard library's test harness,
+//! which needs an OS underneath it. We have no OS — we *are* the OS — so that
+//! harness is unavailable. Instead we use the unstable `custom_test_frameworks`
+//! feature (enabled in `main.rs`): the compiler collects every `#[test_case]`
+//! function into a slice and hands it to our own [`test_runner`], which the
+//! kernel entry point invokes via the generated `test_main()`.
+//!
+//! Reporting a result is also different with no OS: a freestanding kernel has no
+//! `exit(2)` to set a process status. So we let QEMU do it, via its
+//! `isa-debug-exit` device (wired up in `Cargo.toml`'s `test-args`): writing a
+//! value to I/O port `0xf4` makes QEMU terminate with host status
+//! `(value << 1) | 1`. We pick two values, and `bootimage` maps the "success"
+//! one to a passing `cargo test`.
+//!
+//! The whole module is `#[cfg(test)]` (see the `mod testing;` declaration in
+//! `main.rs`), so none of it is compiled into the real kernel image.
+
+use x86_64::instructions::port::Port;
+
+use crate::{hlt_loop, serial_print, serial_println};
+
+/// Status codes the kernel asks QEMU to exit with. The concrete numbers are
+/// arbitrary — they only need to avoid colliding with codes QEMU itself
+/// produces. `Cargo.toml` tells `bootimage` which one means success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum QemuExitCode {
+    Success = 0x10,
+    Failed = 0x11,
+}
+
+/// Exit QEMU via the `isa-debug-exit` device.
+///
+/// Writing `exit_code` to port `0xf4` (the `iobase` we configure for the device)
+/// makes QEMU terminate with host status `(exit_code << 1) | 1`: `Success`
+/// (`0x10`) → 33 and `Failed` (`0x11`) → 35. `Cargo.toml` sets
+/// `test-success-exit-code = 33`, so `bootimage` reports exit-33 as a passing
+/// test run and any other code (35, or a timeout) as a failure.
+pub fn exit_qemu(exit_code: QemuExitCode) -> ! {
+    // SAFETY: `0xf4` is the iobase declared for the `isa-debug-exit` device in
+    // the `test-args` we pass QEMU. The device's only effect is to terminate the
+    // VM with the written value as its status; no other hardware uses this port.
+    unsafe {
+        let mut port = Port::new(0xf4);
+        port.write(exit_code as u32);
+    }
+    // The write above terminates QEMU, so control never reaches here. The halt
+    // loop exists only to satisfy the `!` return type (and to stop cleanly were
+    // the debug-exit device somehow absent).
+    hlt_loop();
+}
+
+/// Lets [`test_runner`] print a uniform "name ... [ok]" line around each test.
+///
+/// Implemented for every zero-argument function, so any `fn()` used as a
+/// `#[test_case]` automatically prints its own fully-qualified name (via
+/// `type_name`) before running and `[ok]` after. If the test panics instead, the
+/// `#[cfg(test)]` panic handler in `main.rs` prints `[failed]` and exits QEMU.
+pub trait Testable {
+    fn run(&self);
+}
+
+impl<T: Fn()> Testable for T {
+    fn run(&self) {
+        serial_print!("{} ...\t", core::any::type_name::<T>());
+        self();
+        serial_println!("[ok]");
+    }
+}
+
+/// The custom test runner named by `main.rs`'s `#![test_runner(...)]`.
+///
+/// The compiler gathers all `#[test_case]` functions into `tests` and generates
+/// a `test_main()` that calls this. We run each test, then exit QEMU with
+/// `Success` — reaching the end means none of them panicked.
+pub fn test_runner(tests: &[&dyn Testable]) {
+    serial_println!("Running {} test(s)", tests.len());
+    for test in tests {
+        test.run();
+    }
+    exit_qemu(QemuExitCode::Success);
+}
+
+// ---------------------------------------------------------------------------
+// The tests themselves.
+//
+// These run from `kernel_main` *after* the heap and file system are up (the
+// `test_main()` call sits at the end of boot), so they may allocate and touch
+// `fs`. A `#[test_case]` is just a plain `fn()`; `assert!`/`assert_eq!` panic on
+// failure, which the test panic handler turns into a `[failed]` + non-zero exit.
+// ---------------------------------------------------------------------------
+
+/// The simplest possible test: proves the whole harness (collection, running,
+/// serial reporting, QEMU exit) is wired up correctly.
+#[test_case]
+fn trivial_assertion() {
+    assert_eq!(1 + 1, 2);
+}
+
+/// A heap allocation round-trips its value — a smoke test for the global
+/// allocator from Stage 4c.
+#[test_case]
+fn heap_box_alloc() {
+    let value = alloc::boxed::Box::new(42);
+    assert_eq!(*value, 42);
+}
+
+/// Growing a `Vec` forces several reallocations through the allocator.
+#[test_case]
+fn heap_grow_vec() {
+    let mut v = alloc::vec::Vec::new();
+    for i in 0u64..1000 {
+        v.push(i);
+    }
+    assert_eq!(v.len(), 1000);
+    assert_eq!(v[999], 999);
+}
+
+/// Write then read a file through the Stage 8 in-memory file system, and confirm
+/// removal really drops it. Cleans up after itself so test order does not matter.
+#[test_case]
+fn fs_write_read_roundtrip() {
+    use crate::fs;
+    fs::mkdir("/testtmp").unwrap();
+    fs::write("/testtmp/a.txt", b"hello aether").unwrap();
+    assert_eq!(fs::read("/testtmp/a.txt").unwrap(), b"hello aether".to_vec());
+    fs::remove("/testtmp").unwrap();
+    assert!(fs::read("/testtmp/a.txt").is_err());
+}

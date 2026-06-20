@@ -49,6 +49,20 @@
 // Exception/interrupt handlers use the special "x86-interrupt" calling
 // convention, which is still unstable, so we opt in to it here.
 #![feature(abi_x86_interrupt)]
+// `cargo test` for a `#![no_std]` binary can't use the standard library's test
+// harness (it needs an OS). The `custom_test_frameworks` feature lets us supply
+// our own: the compiler gathers every `#[test_case]` and passes them to the
+// runner named below. We reexport the generated harness entry point as
+// `test_main` so `kernel_main` can invoke it after boot. See `src/testing.rs`.
+#![feature(custom_test_frameworks)]
+#![test_runner(crate::testing::test_runner)]
+#![reexport_test_harness_main = "test_main"]
+// In a `cargo test` build the interactive layer (shell + async executor) is
+// excluded via `#[cfg(not(test))]` in `kernel_main`, so every function reachable
+// only from it reads as "never used". Allow dead code in test builds to keep
+// `cargo test` output clean; the normal `cargo build` keeps full dead-code
+// detection, so genuinely-unused code still surfaces there.
+#![cfg_attr(test, allow(dead_code))]
 
 extern crate alloc;
 
@@ -68,6 +82,10 @@ mod task;
 mod thread;
 mod fs;
 mod shell;
+// Test-only: the in-QEMU unit-test harness (runner, QEMU exit, `#[test_case]`s).
+// Compiled solely for `cargo test`, never into the real kernel image.
+#[cfg(test)]
+mod testing;
 
 use core::panic::PanicInfo;
 
@@ -77,9 +95,6 @@ use alloc::vec::Vec;
 use bootloader::{entry_point, BootInfo};
 use x86_64::structures::paging::{FrameAllocator, Page, Translate};
 use x86_64::VirtAddr;
-
-use task::executor::Executor;
-use task::Task;
 
 // Register `kernel_main` as the kernel entry point.
 //
@@ -267,28 +282,64 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_println!("[ OK ] heap works; Box / Vec / Rc are usable");
     println!("Heap is live; Box / Vec / Rc all work (details on the serial log).");
 
+    // From here the two builds diverge (`#[cfg(test)]` compiles exactly one
+    // block). Initialization above is identical for both, so the tests run
+    // against the real, fully-booted kernel. The interactive shell's executor
+    // never returns, so in a test build it would keep the tests from ever
+    // running — instead we hand control to the generated test harness, which runs
+    // every `#[test_case]` and then exits QEMU with a pass/fail status.
+    #[cfg(test)]
+    {
+        test_main(); // runs the tests, then exits QEMU; never returns in practice
+        hlt_loop(); // only to satisfy the `-> !` return type
+    }
+
     // Stage 7: an interactive shell on the revived async executor. First a boot
     // self-test runs a few canned commands through the shell's dispatcher, so the
     // command logic is verifiable even without a keyboard (e.g. headless QEMU).
     // Then we hand the CPU to the executor running the shell task, which reads
     // keystrokes, buffers a line, and dispatches it on Enter. `Executor::run`
     // never returns (`-> !`), so it is the kernel's final call.
-    println!();
-    serial_println!("Kernel starting the interactive shell on the async executor.");
-    shell::selftest();
+    #[cfg(not(test))]
+    {
+        // Imported here, inside the non-test block, so they don't read as unused
+        // when building the test harness (which excludes this whole block).
+        use task::executor::Executor;
+        use task::Task;
 
-    let mut executor = Executor::new();
-    executor.spawn(Task::new(shell::run()));
-    executor.run();
+        println!();
+        serial_println!("Kernel starting the interactive shell on the async executor.");
+        shell::selftest();
+
+        let mut executor = Executor::new();
+        executor.spawn(Task::new(shell::run()));
+        executor.run();
+    }
 }
 
 /// Handler invoked when the kernel panics. On bare metal we must define this
-/// ourselves, otherwise the code won't compile.
+/// ourselves, otherwise the code won't compile. In a normal build we log the
+/// panic and halt forever.
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     serial_println!();
     serial_println!("[PANIC] kernel panicked: {}", info);
     hlt_loop();
+}
+
+/// Panic handler for `cargo test` builds.
+///
+/// A panicking test means an assertion failed (or the kernel faulted) inside a
+/// `#[test_case]`. We print `[failed]` and the message, then exit QEMU with the
+/// `Failed` status so `bootimage` reports the run as a failure — rather than
+/// halting forever and tripping the test timeout.
+#[cfg(test)]
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    serial_println!("[failed]");
+    serial_println!("Error: {}", info);
+    testing::exit_qemu(testing::QemuExitCode::Failed);
 }
 
 /// Repeatedly execute the `hlt` instruction to put the CPU into a low-power wait

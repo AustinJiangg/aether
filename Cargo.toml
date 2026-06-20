@@ -69,6 +69,26 @@ run-args = [
     "-serial", "stdio",
 ]
 
+# `cargo test` runs each test binary through these args instead of `run-args`.
+# - isa-debug-exit : a device the kernel writes to in order to exit QEMU with a
+#   status code (see src/testing.rs); `iobase=0xf4` matches `exit_qemu`.
+# - serial stdio   : the test output ("name ... [ok]" lines) reaches the terminal.
+# - display none   : tests run headless (no window), unlike the interactive
+#   `cargo run`, so they work over SSH / in CI.
+test-args = [
+    "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-serial", "stdio",
+    "-display", "none",
+]
+# When the tests pass, the kernel calls exit_qemu(Success), so QEMU exits with
+# (0x10 << 1) | 1 = 33. Tell bootimage to treat exit code 33 as a passing run
+# (cargo test exit 0); any other code — 35 from a failing test, or a timeout — is
+# reported as a failure.
+test-success-exit-code = 33
+# Fail a run that hangs (a deadlock, or a triple-fault reboot loop) instead of
+# blocking forever. Seconds of wall-clock for the QEMU run itself.
+test-timeout = 120
+
 # Keep debug info in release builds too, to make debugging the kernel with gdb
 # easier later.
 [profile.release]

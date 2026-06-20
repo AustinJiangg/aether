@@ -73,6 +73,17 @@ cargo bootimage
 # Output at target/x86_64-unknown-none/debug/bootimage-aether.bin
 ```
 
+To run the unit tests (headless, inside QEMU):
+
+```bash
+cargo test
+```
+
+The tests boot the real kernel, run the `#[test_case]`s (heap, file system, ...),
+and report each result over the serial log; the kernel then exits QEMU with a
+status code that `cargo test` maps to pass or fail. No window is opened, so this
+also works over SSH / in CI. See [`src/testing.rs`](./src/testing.rs).
+
 ---
 
 ## 3. Project structure
@@ -94,7 +105,8 @@ aether/
 │   ├── task/              # async/await tasks: waker-driven executor + async keyboard
 │   ├── thread/            # Preemptive kernel threads + hand-written context switch
 │   ├── shell.rs           # Interactive shell (REPL) and built-in commands
-│   └── fs.rs              # In-memory hierarchical file system
+│   ├── fs.rs              # In-memory hierarchical file system
+│   └── testing.rs         # In-QEMU unit-test harness (cargo test)
 ├── ROADMAP.md             # Staged iteration plan
 ├── CLAUDE.md              # Project context and conventions for Claude Code
 └── README.md

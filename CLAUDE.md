@@ -110,6 +110,7 @@ mode and real system calls, a disk driver and persistent FS, SMP, networking).
 ```bash
 cargo run            # build and boot the kernel in QEMU
 cargo build          # build only
+cargo test           # run the unit tests headless in QEMU (see src/testing.rs)
 cargo bootimage      # only generate the bootable disk image
 ```
 
@@ -159,6 +160,13 @@ Exit QEMU: `Ctrl-A` then `X`.
   nodes addressed by `/`-separated paths, exposed as a global `RamFs` behind a
   mutex with `mkdir`/`write`/`read`/`list`/`remove`/`is_dir`. No disk, no
   persistence, no VFS layer.
+- `src/testing.rs`: the in-QEMU unit-test harness. Built on the
+  `custom_test_frameworks` feature, it provides a custom `test_runner`,
+  `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run
+  reports a pass/fail status code), and the `#[test_case]`s themselves (heap and
+  file-system checks). The whole module is `#[cfg(test)]`: `cargo test` builds it,
+  but the real kernel image never includes it. `kernel_main` runs the generated
+  `test_main()` instead of the shell when built for testing.
 - `.cargo/config.toml`: the bare-metal target (`x86_64-unknown-none`), build-std,
   and the QEMU runner config.
 - `.claude/settings.json`: pre-approved permissions (cargo + git, including
