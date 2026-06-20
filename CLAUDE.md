@@ -61,7 +61,11 @@ originally planned roadmap (stages 0-8). **Stage 9 is now also done**: user mode
 Stage 9b (`usermode.rs`) maps a user-accessible page holding a tiny ring 3
 program, forges an interrupt-return frame and `iretq`s into it, then proves it —
 the timer handler sees `CPL == 3` — before rewriting that frame to resume the
-kernel in ring 0. `ROADMAP.md` now carries the forward plan (stages 9-18): the
+kernel in ring 0. **Stage 10 is also done**: system calls via `int 0x80`
+(`syscall.rs`) — the gate's DPL is 3 so ring 3 may invoke it, arguments cross on a
+stack-based ABI, and the ring 3 program now calls `write` (the kernel prints on
+its behalf) then `exit` (which hands control back). `ROADMAP.md` now carries the
+forward plan (stages 9-18): the
 user-space main line (system calls, per-process address spaces + ELF,
 multiprocessing), plus persistence, APIC/SMP, and networking tracks.
 
@@ -137,7 +141,8 @@ Exit QEMU: `Ctrl-A` then `X`.
   its EOI to preempt the running thread, and (since Stage 9b) calls
   `usermode::on_timer_tick` so a ring 3 excursion can return to the kernel; the
   keyboard handler (since Stage 5) just pushes the raw scancode onto the async
-  keyboard's queue.
+  keyboard's queue. Stage 10 also registers an `int 0x80` syscall gate (DPL 3)
+  dispatching to `syscall.rs`.
 - `src/memory.rs`: virtual-memory helpers — reads CR3 and builds an
   `OffsetPageTable` over the active page tables (via the bootloader's complete
   physical-memory mapping) for translating virtual addresses, plus a
@@ -168,11 +173,17 @@ Exit QEMU: `Ctrl-A` then `X`.
   nodes addressed by `/`-separated paths, exposed as a global `RamFs` behind a
   mutex with `mkdir`/`write`/`read`/`list`/`remove`/`is_dir`. No disk, no
   persistence, no VFS layer.
-- `src/usermode.rs`: Stage 9b user-mode entry — maps one `USER_ACCESSIBLE` page
-  holding a tiny ring 3 spin program, forges an interrupt-return frame and
-  `iretq`s into ring 3, then proves it: the timer handler (`on_timer_tick`) sees
-  `CPL == 3` and rewrites its return frame to resume the kernel in ring 0. (Stage
-  9a added the ring 3 GDT segments and the TSS `rsp0` stack in `gdt.rs`.)
+- `src/usermode.rs`: Stage 9b/10b user-mode entry — maps one `USER_ACCESSIBLE`
+  page, forges an interrupt-return frame and `iretq`s into ring 3, and returns to
+  the kernel via `resume_kernel` (a frame-rewrite) when the ring 3 program exits or
+  the timer catches it. The program (hand-assembled in `map_user_code`) calls
+  `write` then `exit` through `int 0x80`. (Stage 9a added the ring 3 GDT segments
+  and the TSS `rsp0` stack in `gdt.rs`.)
+- `src/syscall.rs`: Stage 10 system calls — the `int 0x80` handler (its IDT gate's
+  DPL is 3 so ring 3 may invoke it), a stack-based argument ABI, and
+  `write`/`getpid`/`exit`. A ring 3 `exit` calls `usermode::resume_kernel` to
+  return to the kernel; an `invoke` helper drives the same path from ring 0 (the
+  boot demo and the tests).
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

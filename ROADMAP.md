@@ -43,10 +43,11 @@ unify later.
 
 ### Main line: the road to user space
 
-> **Status:** Stage 9 is complete — 9a installed the ring 3 GDT segments and the
-> TSS `rsp0` stack (`gdt.rs`); 9b forges an `iretq` frame to descend into ring 3
-> and uses a frame-rewrite to return to the kernel (`usermode.rs`). Stage 10 is
-> next.
+> **Status:** Stages 9 and 10 are complete. Stage 9 reaches ring 3 (`gdt.rs`,
+> `usermode.rs`): forge an `iretq` frame to descend, a frame-rewrite to return.
+> Stage 10 adds `int 0x80` system calls (`syscall.rs`); the ring 3 program now
+> calls `write` then `exit`. Stage 11 (per-process address spaces + an ELF loader)
+> is next.
 
 | Stage | What to build | OS concepts | Smallest verifiable step |
 |-------|---------------|-------------|--------------------------|
