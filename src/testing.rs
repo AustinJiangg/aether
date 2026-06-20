@@ -165,3 +165,11 @@ fn syscall_dispatch_works() {
     let bad = unsafe { syscall::invoke(9999, 0, 0) };
     assert_eq!(bad, u64::MAX);
 }
+
+/// Stage 10b: the ring 3 program made real system calls. It runs during boot
+/// (before the tests) and calls `write` then `exit` through `int 0x80`, so by the
+/// time the tests run the kernel must have seen at least one syscall from ring 3.
+#[test_case]
+fn ring3_made_a_syscall() {
+    assert!(crate::syscall::ring3_syscall_count() >= 1);
+}

@@ -27,12 +27,23 @@
 //! The exact same byte sequence works whether the caller is in ring 0 (the tests
 //! and the boot demo, via [`invoke`]) or ring 3 (the user program in Stage 10b).
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use x86_64::structures::idt::InterruptStackFrame;
 
 /// Syscall numbers. A real kernel would have dozens; we start with three.
 pub const SYS_EXIT: u64 = 0;
 pub const SYS_WRITE: u64 = 1;
 pub const SYS_GETPID: u64 = 2;
+
+/// Count of syscalls that arrived from ring 3 — proof (for the Stage 10b test)
+/// that the user program really crossed into the kernel through `int 0x80`.
+static RING3_SYSCALLS: AtomicU64 = AtomicU64::new(0);
+
+/// Number of syscalls made from ring 3 since boot.
+pub fn ring3_syscall_count() -> u64 {
+    RING3_SYSCALLS.load(Ordering::SeqCst)
+}
 
 /// The `int 0x80` handler. Registered in `interrupts.rs` with the gate's DPL set
 /// to 3 so ring 3 may invoke it.
@@ -41,7 +52,7 @@ pub const SYS_GETPID: u64 = 2;
 /// above), dispatches, and writes the return value back to the number's slot. The
 /// gate is an *interrupt* gate, so interrupts are disabled for the duration — the
 /// syscall runs to completion without being preempted.
-pub extern "x86-interrupt" fn syscall_handler(frame: InterruptStackFrame) {
+pub extern "x86-interrupt" fn syscall_handler(mut frame: InterruptStackFrame) {
     // `frame.stack_pointer` is the caller's RSP at the `int 0x80`; by our ABI it
     // points at [number, arg1, arg2].
     let args = frame.stack_pointer.as_u64() as *mut u64;
@@ -51,6 +62,21 @@ pub extern "x86-interrupt" fn syscall_handler(frame: InterruptStackFrame) {
     // (A hardened kernel would verify the range lies in the caller's own mapped
     // stack; our single demo program and the ring 0 tests always satisfy that.)
     let (number, arg1, arg2) = unsafe { (args.read(), args.add(1).read(), args.add(2).read()) };
+
+    // The low two bits of the saved code selector are the caller's privilege level.
+    let from_ring3 = frame.code_segment & 0b11 == 3;
+    if from_ring3 {
+        RING3_SYSCALLS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    // `exit` from ring 3 is special: the program is done, so there is no value to
+    // hand back to it. Instead we rewrite this interrupt's return frame (Stage 9b's
+    // mechanism) so the `iretq` below resumes the kernel rather than the user code.
+    if number == SYS_EXIT && from_ring3 {
+        crate::serial_println!("[syscall] exit({}) from ring 3; returning to the kernel", arg1);
+        crate::usermode::resume_kernel(&mut frame);
+        return;
+    }
 
     let result = dispatch(number, arg1, arg2);
 

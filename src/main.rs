@@ -284,11 +284,12 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_println!("[ OK ] heap works; Box / Vec / Rc are usable");
     println!("Heap is live; Box / Vec / Rc all work (details on the serial log).");
 
-    // Stage 9b: take a brief excursion into user mode (ring 3) before finishing
-    // boot. `map_user_code` maps a single ring 3 page holding a spin loop; `enter`
-    // forges a ring 3 interrupt frame and `iretq`s into it. The timer then catches
-    // the CPU running in ring 3 (proving we got there) and resumes the kernel at
-    // `boot_continue`. `enter` never returns here.
+    // Stage 9b/10b: take a brief excursion into user mode (ring 3) before finishing
+    // boot. `map_user_code` maps a ring 3 page holding a small program that calls
+    // `write` then `exit` via `int 0x80`; `enter` forges a ring 3 interrupt frame
+    // and `iretq`s into it. The program's `exit` syscall (or, as a fallback, the
+    // timer catching it) resumes the kernel at `boot_continue`. `enter` never
+    // returns here.
     let user_entry = usermode::map_user_code(&mut mapper, &mut frame_allocator);
     usermode::enter(user_entry, boot_continue);
 }
@@ -305,8 +306,9 @@ fn boot_continue() -> ! {
     // re-enable them now that we are safely back on the kernel stack.
     x86_64::instructions::interrupts::enable();
     serial_println!(
-        "[usermode] resumed in the kernel (ring 0); reached ring 3 = {}",
-        usermode::reached_ring3()
+        "[usermode] resumed in the kernel (ring 0); reached ring 3 = {}, ring 3 syscalls = {}",
+        usermode::reached_ring3(),
+        syscall::ring3_syscall_count()
     );
     println!("Back from a ring 3 excursion; continuing boot.");
 

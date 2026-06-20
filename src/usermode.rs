@@ -1,4 +1,5 @@
-//! Stage 9b: dropping to user mode (ring 3) and proving we got there.
+//! Stages 9b and 10b: dropping to user mode (ring 3), running a program there,
+//! and returning to the kernel.
 //!
 //! Everything so far has run in ring 0 (full privilege). A real OS runs user
 //! programs in ring 3, where they cannot touch kernel memory or execute
@@ -14,20 +15,21 @@
 //! us, so we describe the target context as a struct instead of hand-writing
 //! assembly.)
 //!
-//! Proving it worked: the ring 3 program is two bytes — `EB FE`, an infinite
-//! `jmp .` loop that uses no memory and no stack. It just spins until the timer
-//! interrupt fires. That interrupt enters the kernel through `rsp0`; in the
-//! handler we read the saved code-segment selector, whose low two bits are the
-//! privilege level the CPU came from. Seeing `CPL == 3` proves two things at
-//! once: we really executed in ring 3, and `rsp0` let us take the interrupt
-//! without a triple fault.
+//! Proving it worked: in Stage 9b the ring 3 program was two bytes — `EB FE`, an
+//! infinite `jmp .` loop — and the proof was the timer interrupt entering the
+//! kernel through `rsp0` and finding the saved code selector at `CPL == 3` (which
+//! proved both that we ran in ring 3 and that `rsp0` averted a triple fault).
+//! Stage 10b replaces the loop with a real program that calls `write` then `exit`
+//! (see [`map_user_code`]); reaching the kernel through a ring 3 *syscall* is the
+//! same proof by a far more useful route.
 //!
-//! Returning to the kernel: an interrupt handler normally `iretq`s back to
-//! wherever it came from — here, the spinning ring 3 code. To resume the kernel
-//! instead, the handler *rewrites its own return frame* to a ring 0 context (see
-//! [`on_timer_tick`]). This is exactly the mechanism a scheduler will later use
-//! to switch the CPU between a user process and the kernel; here it just lets boot
-//! continue (into the shell or the tests) after a brief excursion into ring 3.
+//! Returning to the kernel: an interrupt handler normally `iretq`s back to where
+//! it came from — the ring 3 code. To resume the *kernel* instead, the handler
+//! *rewrites its own return frame* to a ring 0 context ([`resume_kernel`]). That
+//! is triggered either by the timer catching a spinning program ([`on_timer_tick`])
+//! or by a ring 3 `exit` syscall. It is exactly the mechanism a scheduler will
+//! later use to switch the CPU between a user process and the kernel; here it just
+//! lets boot continue (into the shell or the tests) after a brief ring 3 excursion.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -47,6 +49,11 @@ use crate::{gdt, serial_println};
 /// faults unless *every* level on the way down is marked `USER_ACCESSIBLE`, and
 /// `map_to_with_table_flags` can only stamp that bit on tables it creates fresh.
 const USER_PAGE: u64 = 0x2000_0000_0000;
+
+/// Offset within the user page where the program's message string lives — well
+/// clear of the program (at offset 0) and the user stack (growing down from the
+/// top of the page).
+const MSG_OFFSET: u64 = 0x800;
 
 // --- state shared with the timer interrupt handler -------------------------
 
@@ -71,12 +78,13 @@ pub fn reached_ring3() -> bool {
     REACHED_RING3.load(Ordering::SeqCst)
 }
 
-/// Map the single ring 3 page and write a "spin forever" program into it; return
-/// the user entry point (the virtual address of its first instruction).
+/// Map the single ring 3 page, write a small program and its message into it, and
+/// return the user entry point (the virtual address of the first instruction).
 ///
-/// The program is the two bytes `EB FE` (`jmp .`): an infinite loop that touches
-/// no memory and uses no stack — the smallest possible ring 3 payload. All it has
-/// to do is keep executing until the timer interrupts it.
+/// The program (hand-assembled by [`build_user_program`]) makes two system calls
+/// and never returns: `write` to print a message through the kernel, then `exit`
+/// to hand control back. Running in ring 3, every privileged action it needs —
+/// printing, exiting — has to go through `int 0x80`.
 pub fn map_user_code(
     mapper: &mut OffsetPageTable,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
@@ -108,17 +116,56 @@ pub fn map_user_code(
             .flush();
     }
 
-    // Write the program. SMAP is not enabled, so ring 0 may write a user page
-    // directly. `EB FE` = `jmp .` (a 2-byte relative jump back to itself).
-    let code: *mut u8 = USER_PAGE as *mut u8;
-    // SAFETY: the page was just mapped present and writable, so these two bytes
-    // land inside it; nothing else aliases this address.
+    // Lay out the page: the program at offset 0, its message at MSG_OFFSET. SMAP is
+    // not enabled, so ring 0 may write this user page directly.
+    let message = b"hello from ring 3, printed by the kernel via a syscall\n";
+    let program = build_user_program(USER_PAGE + MSG_OFFSET, message.len());
+
+    let base = USER_PAGE as *mut u8;
+    // SAFETY: the page was just mapped present and writable, and both the program
+    // (a couple dozen bytes at offset 0) and the message (at MSG_OFFSET) sit well
+    // inside its 4 KiB; nothing else aliases this address.
     unsafe {
-        code.write_volatile(0xEB);
-        code.add(1).write_volatile(0xFE);
+        for (i, &byte) in program.iter().enumerate() {
+            base.add(i).write_volatile(byte);
+        }
+        for (i, &byte) in message.iter().enumerate() {
+            base.add(MSG_OFFSET as usize + i).write_volatile(byte);
+        }
     }
 
     VirtAddr::new(USER_PAGE)
+}
+
+/// Hand-assemble the ring 3 program `write(msg_ptr, msg_len); exit(0)`.
+///
+/// It speaks the kernel's stack-based syscall ABI (see [`crate::syscall`]): push
+/// the arguments, push the number, `int 0x80`. In machine code:
+///
+/// ```text
+///   push msg_len         6A <len>        ; write: arg2 = len (imm8, so len < 128)
+///   mov  rax, msg_ptr    48 B8 <ptr64>   ;        arg1 = ptr (a 64-bit address
+///   push rax             50              ;        needs mov-then-push)
+///   push 1               6A 01           ;        number = SYS_WRITE
+///   int  0x80            CD 80
+///   push 0               6A 00           ; exit:  arg1 = exit code 0
+///   push 0               6A 00           ;        number = SYS_EXIT
+///   int  0x80            CD 80           ;        never returns to ring 3
+/// ```
+fn build_user_program(msg_ptr: u64, msg_len: usize) -> [u8; 23] {
+    let mut program: [u8; 23] = [
+        0x6A, msg_len as u8, // push msg_len
+        0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, // mov rax, imm64 (msg_ptr, filled below)
+        0x50, // push rax
+        0x6A, crate::syscall::SYS_WRITE as u8, // push SYS_WRITE
+        0xCD, 0x80, // int 0x80
+        0x6A, 0x00, // push exit code 0
+        0x6A, crate::syscall::SYS_EXIT as u8, // push SYS_EXIT
+        0xCD, 0x80, // int 0x80
+    ];
+    // Patch the 8-byte little-endian immediate for `mov rax, msg_ptr`.
+    program[4..12].copy_from_slice(&msg_ptr.to_le_bytes());
+    program
 }
 
 /// Drop to ring 3 at `user_entry`; never returns to the caller.
@@ -153,7 +200,7 @@ pub fn enter(user_entry: VirtAddr, resume: fn() -> !) -> ! {
         instruction_pointer: user_entry,
         code_segment: u64::from(gdt::user_code_selector().0),
         cpu_flags: 0x202, // reserved bit 1, plus IF (bit 9): ring 3 with interrupts on
-        stack_pointer: VirtAddr::new(USER_PAGE + 0x1000), // top of the user page (EB FE never uses it)
+        stack_pointer: VirtAddr::new(USER_PAGE + 0x1000), // top of the user page (the program's stack)
         stack_segment: u64::from(gdt::user_data_selector().0),
     };
 
@@ -173,30 +220,23 @@ pub fn enter(user_entry: VirtAddr, resume: fn() -> !) -> ! {
     unsafe { user_frame.iretq() }
 }
 
-/// Called from the timer interrupt handler on every tick.
+/// Leave ring 3: rewrite `frame` so the in-flight interrupt's `iretq` resumes the
+/// kernel continuation (the `resume` passed to [`enter`]) in ring 0, instead of
+/// returning to the user program. Shared by the two triggers below.
 ///
-/// A no-op unless a ring 3 descent is in flight ([`enter`] armed it). On the first
-/// tick that interrupts ring 3 code (`CPL == 3`), it records success and rewrites
-/// the interrupt-return frame so the handler's `iretq` resumes the kernel
-/// continuation in ring 0 instead of returning to the spinning user program.
-pub fn on_timer_tick(stack_frame: &mut InterruptStackFrame) {
-    if !EXPECT_USER_TICK.load(Ordering::SeqCst) {
-        return;
+/// Idempotent via an atomic test-and-clear: whichever fires first — the timer
+/// catching a spinning program, or a ring 3 `exit` syscall — wins, and any later
+/// call is a no-op.
+pub fn resume_kernel(frame: &mut InterruptStackFrame) {
+    if !EXPECT_USER_TICK.swap(false, Ordering::SeqCst) {
+        return; // already left ring 3 once
     }
-    // The low two bits of the saved code selector are the privilege level the
-    // interrupt came from. 3 means the timer struck while the CPU was in ring 3.
-    if stack_frame.code_segment & 0b11 != 3 {
-        return;
-    }
-
-    EXPECT_USER_TICK.store(false, Ordering::SeqCst);
     REACHED_RING3.store(true, Ordering::SeqCst);
-    serial_println!("[usermode] timer interrupted ring 3 code (CPL=3); returning to the kernel");
 
-    // Rewrite the return frame to a ring 0 context: the kernel continuation's RIP,
-    // the kernel code selector, the kernel stack we saved in `enter`, SS = 0 (the
-    // kernel runs with a null stack selector in long mode), and IF cleared so the
-    // continuation re-enables interrupts deliberately.
+    // A ring 0 context: the kernel continuation's RIP, the kernel code selector,
+    // the kernel stack we saved in `enter`, SS = 0 (the kernel runs with a null
+    // stack selector in long mode), and IF cleared so the continuation re-enables
+    // interrupts deliberately.
     let resumed = InterruptStackFrameValue {
         instruction_pointer: VirtAddr::new(RESUME_RIP.load(Ordering::SeqCst)),
         code_segment: RESUME_CS.load(Ordering::SeqCst),
@@ -208,5 +248,21 @@ pub fn on_timer_tick(stack_frame: &mut InterruptStackFrame) {
     // SAFETY: we overwrite the interrupt-return frame with a valid ring 0 context
     // (kernel CS, a kernel stack pointer captured in `enter`, RIP at the kernel
     // continuation). The handler's `iretq` then resumes kernel execution there.
-    unsafe { stack_frame.as_mut().write(resumed) };
+    unsafe { frame.as_mut().write(resumed) };
+}
+
+/// Called from the timer interrupt handler on every tick. A no-op unless a ring 3
+/// descent is in flight and this tick caught the CPU in ring 3 (`CPL == 3`).
+///
+/// This is the *fallback* return path, for a user program that spins (Stage 9b's
+/// `EB FE`). Stage 10b's program exits via a syscall before a tick lands, so in
+/// practice [`resume_kernel`] is usually reached through `exit` instead.
+pub fn on_timer_tick(frame: &mut InterruptStackFrame) {
+    // The low two bits of the saved code selector are the privilege level the
+    // interrupt came from; 3 means the timer struck while the CPU was in ring 3.
+    if !EXPECT_USER_TICK.load(Ordering::SeqCst) || frame.code_segment & 0b11 != 3 {
+        return;
+    }
+    serial_println!("[usermode] timer interrupted ring 3 code (CPL=3); returning to the kernel");
+    resume_kernel(frame);
 }
