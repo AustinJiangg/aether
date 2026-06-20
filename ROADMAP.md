@@ -43,17 +43,20 @@ unify later.
 
 ### Main line: the road to user space
 
-> **Status:** Stages 9 and 10 are complete, and Stage 11a (the first half of 11)
-> is done. Stage 9 reaches ring 3 (`gdt.rs`, `usermode.rs`): forge an `iretq` frame
-> to descend, a frame-rewrite to return. Stage 10 adds `int 0x80` system calls
-> (`syscall.rs`); the ring 3 program calls `write` then `exit`. Stage 11a adds an
-> `AddressSpace` (`memory.rs`) that clones the active kernel L4 into a fresh frame
-> and can switch CR3 onto it and back, proving a process can run on its own page
-> table without the kernel vanishing. Note: under bootloader 0.9 the kernel, heap,
-> and physical-memory window all live in the *lower* half (the boot log shows the
-> present L4 slots are all < 256), so the clone copies every present top-level
-> entry rather than a fixed higher half. Stage 11b (a minimal ELF64 loader that
-> maps `PT_LOAD` segments into a new space) is next.
+> **Status:** Stages 9, 10, and 11 are complete. Stage 9 reaches ring 3 (`gdt.rs`,
+> `usermode.rs`): forge an `iretq` frame to descend, a frame-rewrite to return.
+> Stage 10 adds `int 0x80` system calls (`syscall.rs`); the ring 3 program calls
+> `write` then `exit`. Stage 11a adds an `AddressSpace` (`memory.rs`) that clones
+> the active kernel L4 into a fresh frame and switches CR3 onto it and back. Stage
+> 11b adds an ELF64 parser (`elf.rs`) and a loader (`process.rs`) that maps a
+> program's `PT_LOAD` segments into a fresh space — populating it through the
+> physical-memory window, since the space is not yet active — and verifies the load
+> by translating the entry point. Note: under bootloader 0.9 the kernel, heap, and
+> physical-memory window all live in the *lower* half (the present L4 slots are all
+> < 256), so a clone copies every present top-level entry rather than a fixed higher
+> half, and user programs load into an otherwise-empty slot (64) to get private
+> lower-level tables. Stage 12 (switch CR3 to a loaded program and run it in ring 3,
+> then schedule multiple processes) is next.
 
 | Stage | What to build | OS concepts | Smallest verifiable step |
 |-------|---------------|-------------|--------------------------|

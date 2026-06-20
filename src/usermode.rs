@@ -152,7 +152,7 @@ pub fn map_user_code(
 ///   push 0               6A 00           ;        number = SYS_EXIT
 ///   int  0x80            CD 80           ;        never returns to ring 3
 /// ```
-fn build_user_program(msg_ptr: u64, msg_len: usize) -> [u8; 23] {
+pub(crate) fn build_user_program(msg_ptr: u64, msg_len: usize) -> [u8; 23] {
     let mut program: [u8; 23] = [
         0x6A, msg_len as u8, // push msg_len
         0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, // mov rax, imm64 (msg_ptr, filled below)

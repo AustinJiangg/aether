@@ -183,3 +183,26 @@ fn ring3_made_a_syscall() {
 fn address_space_clone_roundtrip() {
     assert!(crate::memory::address_space_clone_ok());
 }
+
+/// Stage 11b: the ELF parser reads the demo program's header correctly. Pure — it
+/// needs no page tables, so it exercises `elf.rs` directly on the bytes.
+#[test_case]
+fn elf_parser_reads_demo_program() {
+    use crate::elf::ElfFile;
+    use crate::process;
+    let bytes = process::demo_elf();
+    let elf = ElfFile::parse(&bytes).expect("demo ELF must parse");
+    assert_eq!(elf.entry(), process::USER_LOAD_BASE + 120);
+    let segments: alloc::vec::Vec<_> = elf.load_segments().collect();
+    assert_eq!(segments.len(), 1);
+    assert_eq!(segments[0].vaddr, process::USER_LOAD_BASE);
+    assert!(segments[0].is_executable());
+}
+
+/// Stage 11b: the loader mapped the demo ELF into a fresh address space and the
+/// entry's code reads back correctly. The load runs during boot (in `kernel_main`,
+/// before this harness) via `process::demo_load_elf`, which records the outcome.
+#[test_case]
+fn elf_loaded_into_address_space() {
+    assert!(crate::process::elf_load_ok());
+}

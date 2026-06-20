@@ -269,6 +269,26 @@ impl AddressSpace {
         self.l4_frame
     }
 
+    /// Build an [`OffsetPageTable`] over this space's L4, so the caller can install
+    /// mappings into it — even while the space is *inactive*. The new tables are
+    /// reached and edited through the physical-memory window, not through the user
+    /// virtual addresses (which only become reachable once CR3 points here).
+    ///
+    /// Takes `&mut self` so the borrow checker forbids two live mappers over the
+    /// same space at once, which would alias its L4 table.
+    pub fn mapper(&mut self, physical_memory_offset: VirtAddr) -> OffsetPageTable<'_> {
+        // SAFETY: this points at the space's own L4 frame through the
+        // physical-memory window. Nothing else references that frame while the
+        // `&mut self` borrow is held, so the `&mut PageTable` is unaliased.
+        let level_4_table: &mut PageTable = unsafe {
+            &mut *(physical_memory_offset + self.l4_frame.start_address().as_u64())
+                .as_mut_ptr::<PageTable>()
+        };
+        // SAFETY: all physical memory is mapped at `physical_memory_offset`, so the
+        // mapper can follow this space's lower-level tables.
+        unsafe { OffsetPageTable::new(level_4_table, physical_memory_offset) }
+    }
+
     /// Make this address space active: load its L4 frame into CR3. Returns the
     /// previously-active `(frame, flags)`, which [`restore_address_space`] takes to
     /// switch back.

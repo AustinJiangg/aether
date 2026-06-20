@@ -64,7 +64,16 @@ the timer handler sees `CPL == 3` — before rewriting that frame to resume the
 kernel in ring 0. **Stage 10 is also done**: system calls via `int 0x80`
 (`syscall.rs`) — the gate's DPL is 3 so ring 3 may invoke it, arguments cross on a
 stack-based ABI, and the ring 3 program now calls `write` (the kernel prints on
-its behalf) then `exit` (which hands control back). `ROADMAP.md` now carries the
+its behalf) then `exit` (which hands control back). **Stage 11 is also done**:
+per-process address spaces and an ELF loader. Stage 11a (`memory.rs`) adds an
+`AddressSpace` that clones the active kernel L4 into a fresh frame and switches CR3
+onto it and back — every space must map the kernel, or the switch triple-faults;
+since bootloader 0.9 keeps the kernel, heap, and physical-memory window in the
+lower half, the clone copies every present top-level entry. Stage 11b adds an
+ELF64 parser (`elf.rs`) and a loader (`process.rs`) that maps a program's
+`PT_LOAD` segments into a fresh space through the physical-memory window (the space
+is not yet active) and verifies the load by translating its entry point; running
+it in ring 3 is Stage 12. `ROADMAP.md` now carries the
 forward plan (stages 9-18): the
 user-space main line (system calls, per-process address spaces + ELF,
 multiprocessing), plus persistence, APIC/SMP, and networking tracks.
@@ -147,7 +156,10 @@ Exit QEMU: `Ctrl-A` then `X`.
   `OffsetPageTable` over the active page tables (via the bootloader's complete
   physical-memory mapping) for translating virtual addresses, plus a
   `BootInfoFrameAllocator` that hands out usable physical frames from the memory
-  map and a helper that creates new page mappings.
+  map and a helper that creates new page mappings. Stage 11a also adds an
+  `AddressSpace` (a process's L4) that clones the kernel's present top-level
+  entries into a fresh frame, hands out an `OffsetPageTable` over it (to map an
+  inactive space), and switches CR3 onto it and back.
 - `src/allocator.rs`: the kernel heap — maps a fixed virtual range to frames and
   registers a `#[global_allocator]` (a hand-written fixed-size block allocator
   over a linked-list fallback), so the `alloc` crate's `Box`/`Vec`/`Rc`/`String`
@@ -184,6 +196,15 @@ Exit QEMU: `Ctrl-A` then `X`.
   `write`/`getpid`/`exit`. A ring 3 `exit` calls `usermode::resume_kernel` to
   return to the kernel; an `invoke` helper drives the same path from ring 0 (the
   boot demo and the tests).
+- `src/elf.rs`: Stage 11b minimal ELF64 parser — validates the header (x86-64,
+  ET_EXEC), bounds-checks the program-header table, and iterates the `PT_LOAD`
+  segments. Pure (reads bytes, no page tables), so it is unit-testable on its own.
+- `src/process.rs`: Stage 11b ELF loader — parses an ELF (via `elf.rs`), clones the
+  kernel into a fresh `AddressSpace`, and maps each `PT_LOAD` segment into it,
+  writing the bytes through the physical-memory window (the space is not yet
+  active). A `UserImage` bundles the space with its entry point; the boot demo
+  loads a hand-built demo ELF and verifies it by translating the entry. (Running it
+  in ring 3 is Stage 12.)
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

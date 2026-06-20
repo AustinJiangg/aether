@@ -84,6 +84,8 @@ mod fs;
 mod shell;
 mod syscall;
 mod usermode;
+mod elf;
+mod process;
 // Test-only: the in-QEMU unit-test harness (runner, QEMU exit, `#[test_case]`s).
 // Compiled solely for `cargo test`, never into the real kernel image.
 #[cfg(test)]
@@ -297,6 +299,20 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         memory::address_space_clone_ok()
     );
     println!("Address spaces live; cloned the kernel space and switched CR3 (serial log).");
+
+    // Stage 11b: load a real ELF64 program into its own address space. The loader
+    // parses the ELF, then maps each PT_LOAD segment into a fresh space (cloned
+    // from the kernel in 11a) and copies the bytes in through the physical-memory
+    // window — because the new space is not active yet, the user addresses are only
+    // reachable that way. We verify by translating the entry point in the new space
+    // and reading the code back; switching to the space and running it in ring 3 is
+    // the next step.
+    process::demo_load_elf(&mut frame_allocator, phys_mem_offset);
+    serial_println!(
+        "[ OK ] ELF loaded into a private address space, verified = {}",
+        process::elf_load_ok()
+    );
+    println!("ELF loader live; mapped a program into a new address space (serial log).");
 
     // Stage 9b/10b: take a brief excursion into user mode (ring 3) before finishing
     // boot. `map_user_code` maps a ring 3 page holding a small program that calls
