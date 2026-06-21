@@ -27,11 +27,9 @@
 //!
 //! Returning to the kernel: an interrupt handler normally `iretq`s back to where
 //! it came from — the ring 3 code. To resume the *kernel* instead, the handler
-//! *rewrites its own return frame* to a ring 0 context ([`resume_kernel`]). That
-//! is triggered either by the timer catching a spinning program ([`on_timer_tick`])
-//! or by a ring 3 `exit` syscall. It is exactly the mechanism a scheduler will
-//! later use to switch the CPU between a user process and the kernel; here it just
-//! lets boot continue (into the shell or the tests) after a brief ring 3 excursion.
+//! *rewrites its own return frame* to a ring 0 context ([`resume_kernel`]). The
+//! scheduler triggers this when the *last* user process exits (Stage 12b); it then
+//! lets boot continue (into the shell or the tests) after the ring 3 excursion.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -43,15 +41,15 @@ use crate::{gdt, serial_println};
 
 // --- state shared with the timer interrupt handler -------------------------
 
-/// Set while a descent to ring 3 is in flight: it tells [`on_timer_tick`] to watch
-/// for the tick that interrupts ring 3 and to perform the one-time return rewrite.
+/// Set while a ring 3 excursion is in flight; [`resume_kernel`] swaps it back to
+/// `false` so it performs the one-time return-to-kernel rewrite exactly once.
 static EXPECT_USER_TICK: AtomicBool = AtomicBool::new(false);
 
 /// Set once the timer has observed the CPU running in ring 3 (`CPL == 3`). Read by
 /// the Stage 9b test and logged during boot.
 static REACHED_RING3: AtomicBool = AtomicBool::new(false);
 
-/// Where [`on_timer_tick`] resumes the kernel after pulling us out of ring 3: the
+/// Where [`resume_kernel`] resumes the kernel after the ring 3 excursion: the
 /// continuation's instruction pointer, the kernel stack pointer to run it on, and
 /// the ring 0 code selector. Filled in by [`enter`] before the descent.
 static RESUME_RIP: AtomicU64 = AtomicU64::new(0);
@@ -66,7 +64,7 @@ pub fn reached_ring3() -> bool {
 
 /// Drop to ring 3 at `user_entry`; never returns to the caller.
 ///
-/// We record where to resume the kernel (for [`on_timer_tick`]), then forge a ring
+/// We record where to resume the kernel (for [`resume_kernel`]), then forge a ring
 /// 3 interrupt-return frame and `iretq` into it. `resume` is where the kernel
 /// continues *after* the timer has pulled us back out of ring 3; it runs in ring 0
 /// on the current (boot) kernel stack and must never return — it takes over the
@@ -182,18 +180,3 @@ pub fn resume_kernel(frame: &mut InterruptStackFrame) {
     unsafe { frame.as_mut().write(resumed) };
 }
 
-/// Called from the timer interrupt handler on every tick. A no-op unless a ring 3
-/// descent is in flight and this tick caught the CPU in ring 3 (`CPL == 3`).
-///
-/// This is the *fallback* return path, for a user program that spins (Stage 9b's
-/// `EB FE`). Stage 10b's program exits via a syscall before a tick lands, so in
-/// practice [`resume_kernel`] is usually reached through `exit` instead.
-pub fn on_timer_tick(frame: &mut InterruptStackFrame) {
-    // The low two bits of the saved code selector are the privilege level the
-    // interrupt came from; 3 means the timer struck while the CPU was in ring 3.
-    if !EXPECT_USER_TICK.load(Ordering::SeqCst) || frame.code_segment & 0b11 != 3 {
-        return;
-    }
-    serial_println!("[usermode] timer interrupted ring 3 code (CPL=3); returning to the kernel");
-    resume_kernel(frame);
-}

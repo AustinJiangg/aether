@@ -159,12 +159,12 @@ Exit QEMU: `Ctrl-A` then `X`.
   dedicated IST stack for the double fault handler (loaded before the IDT).
 - `src/interrupts.rs`: the IDT, the CPU exception handlers (breakpoint and
   double fault), and the hardware interrupt handlers along with the 8259 PIC
-  setup — the timer counts ticks, (since Stage 6b) calls `thread::schedule` after
-  its EOI to preempt the running thread, and (since Stage 9b) calls
-  `usermode::on_timer_tick` so a ring 3 excursion can return to the kernel; the
-  keyboard handler (since Stage 5) just pushes the raw scancode onto the async
-  keyboard's queue. Stage 10 also registers an `int 0x80` syscall gate (DPL 3)
-  dispatching to `syscall.rs`.
+  setup. Since Stage 12c the timer (IRQ0) uses a hand-written *naked* entry
+  (`timer_interrupt_entry`) that pushes the full register set into a `TrapFrame`
+  and calls `timer_dispatch` (count tick, EOI, `thread::schedule`) — the capture
+  needed to preempt a user process at any instruction. The keyboard handler (since
+  Stage 5) just pushes the raw scancode onto the async keyboard's queue. Stage 10
+  also registers an `int 0x80` syscall gate (DPL 3) dispatching to `syscall.rs`.
 - `src/memory.rs`: virtual-memory helpers — reads CR3 and builds an
   `OffsetPageTable` over the active page tables (via the bootloader's complete
   physical-memory mapping) for translating virtual addresses, plus a

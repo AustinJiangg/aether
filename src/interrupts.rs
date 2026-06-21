@@ -23,13 +23,16 @@
 //!
 //! Later stages add more handlers (e.g. page fault).
 
+use core::arch::naked_asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use pic8259::ChainedPics;
 use spin::{Lazy, Mutex};
 use x86_64::instructions::port::Port;
-use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
-use x86_64::PrivilegeLevel;
+use x86_64::structures::idt::{
+    InterruptDescriptorTable, InterruptStackFrame, InterruptStackFrameValue,
+};
+use x86_64::{PrivilegeLevel, VirtAddr};
 
 use crate::{gdt, hlt_loop, println, serial_println};
 
@@ -54,7 +57,15 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     }
     // Hardware interrupts: the timer (IRQ0) and the keyboard (IRQ1). Indexing
     // the IDT by vector number reaches the entries past the 32 exception slots.
-    idt[InterruptIndex::Timer.as_usize()].set_handler_fn(timer_interrupt_handler);
+    // The timer uses a hand-written *naked* entry (Stage 12c) so it can capture the
+    // full register set for preemption; the keyboard keeps the typed handler.
+    // SAFETY: `timer_interrupt_entry` is a real naked interrupt entry that saves all
+    // registers and ends in `iretq`; registering its address as the timer gate (a
+    // default interrupt gate: present, DPL 0, IF cleared on entry) is sound.
+    unsafe {
+        idt[InterruptIndex::Timer.as_usize()]
+            .set_handler_addr(VirtAddr::from_ptr(timer_interrupt_entry as *const ()));
+    }
     idt[InterruptIndex::Keyboard.as_usize()].set_handler_fn(keyboard_interrupt_handler);
     // Stage 10: the syscall vector. Setting the gate's DPL to 3 is what lets ring 3
     // execute `int 0x80` (a gate's DPL is the highest-numbered ring allowed to
@@ -165,28 +176,112 @@ extern "x86-interrupt" fn double_fault_handler(
     hlt_loop();
 }
 
-/// Handler for the timer interrupt (IRQ0, remapped to vector 32).
+/// The full register state of an interrupted context: every general-purpose
+/// register followed by the interrupt frame the CPU pushed.
 ///
-/// The PIC raises this periodically on its own; unlike `int3`, nothing in our
-/// code asks for it. We count the tick (logging it occasionally), acknowledge the
-/// interrupt, and then — since Stage 6b — drive preemptive scheduling.
+/// [`timer_interrupt_entry`] lays this out on the kernel stack — it pushes the GP
+/// registers so that, read from the lowest address up, they are `rax, rbx, ..., r15`
+/// (`#[repr(C)]` keeps the struct in that exact order), then the CPU's already-pushed
+/// `iframe` sits on top. So `rsp` after the stub's pushes is a `*mut TrapFrame`.
+/// Stage 12c uses it to preempt a user process at *any* instruction: an asynchronous
+/// timer interrupt can strike between any two instructions, so unlike a syscall
+/// (where the program chose to trap) we must save the scratch registers too.
+#[repr(C)]
+pub struct TrapFrame {
+    pub rax: u64,
+    pub rbx: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub rbp: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    pub iframe: InterruptStackFrameValue,
+}
+
+/// Naked entry point for the timer interrupt (IRQ0, vector 32) — Stage 12c.
 ///
-/// Acknowledgement (EOI) is mandatory and is sent *before* we reschedule: until
-/// the PIC receives the EOI it delivers no further timer interrupt, and the
-/// `thread::schedule` call below may switch to another thread and not return here
-/// for a while. Sending the EOI first guarantees each timer IRQ is acknowledged
-/// exactly once regardless of switching.
+/// Unlike an `extern "x86-interrupt"` handler (which only exposes the interrupt
+/// frame), this captures the *full* register set so the scheduler can preempt a user
+/// process running at any instruction. It pushes every general-purpose register
+/// (building a [`TrapFrame`] on the kernel stack), hands a pointer to it to
+/// [`timer_dispatch`], then restores the registers and `iretq`s. In Stage 12c the
+/// dispatch may swap the `TrapFrame`'s contents (and CR3) to another process, so the
+/// `pop`s below can restore a *different* context than was saved.
+#[unsafe(naked)]
+unsafe extern "C" fn timer_interrupt_entry() {
+    naked_asm!(
+        // Save all GP registers. Pushed highest-numbered first so that in memory,
+        // read upward from the final rsp, they are rax, rbx, ... r15 (TrapFrame order).
+        "push r15",
+        "push r14",
+        "push r13",
+        "push r12",
+        "push r11",
+        "push r10",
+        "push r9",
+        "push r8",
+        "push rbp",
+        "push rdi",
+        "push rsi",
+        "push rdx",
+        "push rcx",
+        "push rbx",
+        "push rax",
+        "mov rdi, rsp", // arg 1: pointer to the TrapFrame we just built
+        "call {dispatch}",
+        // Restore (possibly a different process's context after a preemptive switch).
+        "pop rax",
+        "pop rbx",
+        "pop rcx",
+        "pop rdx",
+        "pop rsi",
+        "pop rdi",
+        "pop rbp",
+        "pop r8",
+        "pop r9",
+        "pop r10",
+        "pop r11",
+        "pop r12",
+        "pop r13",
+        "pop r14",
+        "pop r15",
+        "iretq",
+        dispatch = sym timer_dispatch,
+    );
+}
+
+/// Rust side of the timer interrupt. Receives a pointer to the interrupted context's
+/// [`TrapFrame`] on the kernel stack.
 ///
-/// `thread::schedule` is a no-op until the thread scheduler is armed
-/// (`thread::run`). When it does switch, it swaps to another thread's stack and
-/// returns to *this* handler only once the current thread is scheduled again; at
-/// that point this handler's epilogue runs `iretq`, resuming the thread exactly
-/// where the timer originally struck.
-extern "x86-interrupt" fn timer_interrupt_handler(mut stack_frame: InterruptStackFrame) {
+/// Counts the tick and sends the EOI (mandatory, and *before* any reschedule: until
+/// the PIC is acknowledged it delivers no further timer IRQ). Stage 12c-1 stops here
+/// — behavior matches the old handler; Stage 12c-2 will, when the interrupted context
+/// is a user process, save `*tf` and round-robin to the next process.
+extern "C" fn timer_dispatch(tf: *mut TrapFrame) {
     let count = TIMER_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
-    // Log the first tick (proof the IRQ fired and EOI works), then every 100th,
-    // so the serial log shows the timer running steadily without flooding it.
-    if count == 1 || count % 100 == 0 {
+    if count == 1 {
+        // Prove the naked stub captured a real context: log the interrupted
+        // instruction/stack pointers and a register. (At this point interrupts only
+        // fire in the kernel — ring 3 runs with IF clear until Stage 12c-2 — so this
+        // shows a ring 0 context.)
+        // SAFETY: `tf` points at this interrupt's TrapFrame on the kernel stack.
+        let f = unsafe { &*tf };
+        serial_println!(
+            "[timer] first tick: captured rip={:?} cs={:#x} rsp={:?} rax={:#x}",
+            f.iframe.instruction_pointer,
+            f.iframe.code_segment,
+            f.iframe.stack_pointer,
+            f.rax,
+        );
+    } else if count % 100 == 0 {
         serial_println!("[timer] tick {}", count);
     }
     // SAFETY: we send the EOI for exactly the vector we are currently servicing.
@@ -195,13 +290,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(mut stack_frame: InterruptStac
         PICS.lock()
             .notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
     }
-    // Stage 9b: if a ring 3 excursion is in flight, this may be the tick that
-    // caught the CPU in ring 3. `on_timer_tick` then rewrites our return frame so
-    // the `iretq` below resumes the kernel instead of the user code. A no-op on
-    // every other tick.
-    crate::usermode::on_timer_tick(&mut stack_frame);
-    // Preemptively reschedule. Must run after the EOI (see above) and with the
-    // PICS lock already released, so we do not hold it across a context switch.
+    // Stage 6b's kernel-thread scheduler (dormant) still gets its tick.
     crate::thread::schedule();
 }
 

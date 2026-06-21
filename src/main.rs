@@ -342,10 +342,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 /// Continue (and finish) boot after the ring 3 excursion (Stage 12a runs a loaded
 /// ELF program there).
 ///
-/// Reached via [`usermode::resume_kernel`] — triggered by the program's `exit`
-/// syscall, or by [`usermode::on_timer_tick`] catching it spinning — rewriting the
-/// interrupt's return frame to land here in ring 0, on the boot stack that
-/// `usermode::enter` saved. We arrive on the *user program's* CR3 and switch back to
+/// Reached via [`usermode::resume_kernel`] — triggered by the scheduler when the
+/// last user process `exit`s — rewriting the interrupt's return frame to land here in
+/// ring 0, on the boot stack that `usermode::enter` saved. We arrive on the *last
+/// user program's* CR3 and switch back to
 /// the kernel space first thing. From the kernel's point of view this is simply "the
 /// rest of `kernel_main`": it runs the tests in a `cargo test` build, or launches
 /// the interactive shell otherwise. Never returns.
