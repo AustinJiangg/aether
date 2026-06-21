@@ -23,13 +23,13 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use alloc::vec::Vec;
 use spin::Mutex;
 use x86_64::registers::control::{Cr3, Cr3Flags};
-use x86_64::structures::idt::{InterruptStackFrame, InterruptStackFrameValue};
 use x86_64::structures::paging::{
     FrameAllocator, Mapper, OffsetPageTable, Page, PageTableFlags, PhysFrame, Size4KiB, Translate,
 };
 use x86_64::{PhysAddr, VirtAddr};
 
 use crate::elf::{ElfError, ElfFile, ProgramHeader, PF_R, PF_W, PF_X, PT_LOAD};
+use crate::interrupts::TrapFrame;
 use crate::memory::{self, AddressSpace};
 use crate::serial_println;
 use crate::usermode;
@@ -409,14 +409,16 @@ static PROCESSES_EXITED: AtomicU64 = AtomicU64::new(0);
 static PROCESSES_YIELDED: AtomicU64 = AtomicU64::new(0);
 
 /// A user process: a unique id, its loaded image (address space, entry, stack), and
-/// its saved execution context (`frame`) — where to resume it. The context is just
-/// the interrupt frame (instruction/stack pointers, flags, selectors); the demo
-/// programs keep no live state in general-purpose registers across a `yield`, so we
-/// need not save those yet. (Timer preemption in Stage 12c will, via a trap frame.)
+/// its saved execution context (`context`) — where, and in what register state, to
+/// resume it. As of Stage 12c-2 the context is a full [`TrapFrame`]: every
+/// general-purpose register plus the interrupt frame (instruction/stack pointers,
+/// flags, selectors). Saving the GP registers too — not just the interrupt frame —
+/// is what makes a process resumable after being switched out at *any* instruction,
+/// the prerequisite for timer preemption (Stage 12c-3).
 struct Process {
     id: u64,
     image: UserImage,
-    frame: InterruptStackFrameValue,
+    context: TrapFrame,
 }
 
 /// A minimal cooperative scheduler: a FIFO queue of ready processes plus the one
@@ -436,13 +438,18 @@ static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler {
 });
 
 /// Add a loaded program to the scheduler's ready queue; returns its process id. Its
-/// initial context is an entry frame (start at the program's entry on a fresh stack).
+/// initial context starts at the program's entry on a fresh user stack with every
+/// general-purpose register zero (see [`TrapFrame::new`]).
 pub fn spawn(image: UserImage) -> u64 {
     let mut sched = SCHEDULER.lock();
     let id = sched.next_id;
     sched.next_id += 1;
-    let frame = usermode::initial_user_frame(image.entry, image.user_stack_top);
-    sched.ready.push(Process { id, image, frame });
+    let iframe = usermode::initial_user_frame(image.entry, image.user_stack_top);
+    sched.ready.push(Process {
+        id,
+        image,
+        context: TrapFrame::new(iframe),
+    });
     id
 }
 
@@ -490,37 +497,39 @@ pub fn run(resume: fn() -> !) -> ! {
 }
 
 /// Pop the next ready process, switch CR3 to its address space, make it current, and
-/// return its `(id, saved frame)` so the caller can resume it. `None` if the ready
+/// return its `(id, saved context)` so the caller can resume it. `None` if the ready
 /// queue is empty. The caller must hold the scheduler lock.
-fn activate_next(sched: &mut Scheduler) -> Option<(u64, InterruptStackFrameValue)> {
+fn activate_next(sched: &mut Scheduler) -> Option<(u64, TrapFrame)> {
     if sched.ready.is_empty() {
         return None;
     }
     let next = sched.ready.remove(0);
     let id = next.id;
-    let frame = next.frame;
+    let context = next.context;
     RAN_USER_L4_ADDR.store(
         next.image.space.l4_frame().start_address().as_u64(),
         Ordering::SeqCst,
     );
     // SAFETY: the next image clones the kernel, so its space maps the running kernel;
     // switching CR3 to it from the handler is sound — the rsp0 stack holding the
-    // interrupt frame is mapped identically in every address space.
+    // TrapFrame is mapped identically in every address space.
     unsafe { next.image.space.activate() };
     sched.current = Some(next);
-    Some((id, frame))
+    Some((id, context))
 }
 
-/// Called by the `yield` syscall: save the running process's resume point, put it
-/// back at the end of the ready queue, and switch to the next one. With two
-/// processes this alternates them, interleaving their output.
-pub fn on_user_yield(frame: &mut InterruptStackFrame) {
+/// Called by the `yield` syscall: save the running process's full register context,
+/// put it back at the end of the ready queue, and switch to the next one. With two
+/// processes this alternates them, interleaving their output. `tf` is the caller's
+/// [`TrapFrame`] on the kernel stack; rewriting it makes the syscall stub's `iretq`
+/// resume a *different* process.
+pub fn on_user_yield(tf: &mut TrapFrame) {
     PROCESSES_YIELDED.fetch_add(1, Ordering::SeqCst);
 
     let next = {
         let mut sched = SCHEDULER.lock();
         let yielded_id = if let Some(mut current) = sched.current.take() {
-            current.frame = usermode::save_frame(frame); // where to resume it later
+            current.context = *tf; // save the caller's full context to resume later
             let id = current.id;
             sched.ready.push(current); // back of the queue (round-robin)
             id
@@ -535,16 +544,16 @@ pub fn on_user_yield(frame: &mut InterruptStackFrame) {
     };
 
     // `next` is always `Some` here (we just re-queued the yielding process), but the
-    // match keeps it total: with nothing to run we simply return to the same frame.
-    if let Some((_, target)) = next {
-        usermode::load_frame(frame, target);
+    // match keeps it total: with nothing to run we simply resume the same context.
+    if let Some((_, context)) = next {
+        *tf = context; // restore the next process's full register context
     }
 }
 
 /// Called by the `exit` syscall when a ring 3 process terminates (see `syscall.rs`).
 /// Drops the finished process and, if another is ready, switches to it; if none
 /// remain, resumes the kernel instead.
-pub fn on_user_exit(frame: &mut InterruptStackFrame, code: u64) {
+pub fn on_user_exit(tf: &mut TrapFrame, code: u64) {
     PROCESSES_EXITED.fetch_add(1, Ordering::SeqCst);
 
     let next = {
@@ -568,8 +577,10 @@ pub fn on_user_exit(frame: &mut InterruptStackFrame, code: u64) {
     };
 
     match next {
-        Some((_, target)) => usermode::load_frame(frame, target),
-        None => usermode::resume_kernel(frame),
+        // Resume the next process's full context (the dropped one is gone for good).
+        Some((_, context)) => *tf = context,
+        // No process left: rewrite the interrupt frame to resume the kernel instead.
+        None => usermode::resume_kernel(&mut tf.iframe),
     }
 }
 

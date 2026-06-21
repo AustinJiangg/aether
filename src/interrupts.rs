@@ -70,10 +70,18 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     // Stage 10: the syscall vector. Setting the gate's DPL to 3 is what lets ring 3
     // execute `int 0x80` (a gate's DPL is the highest-numbered ring allowed to
     // invoke it); with the default DPL 0, a ring 3 `int 0x80` would raise a #GP
-    // instead of entering the handler.
-    idt[0x80]
-        .set_handler_fn(crate::syscall::syscall_handler)
-        .set_privilege_level(PrivilegeLevel::Ring3);
+    // instead of entering the handler. Since Stage 12c-2 the syscall, like the timer,
+    // enters through a hand-written *naked* stub that captures a full `TrapFrame`, so
+    // the scheduler can save and restore a process's complete register state when a
+    // `yield`/`exit` switches processes.
+    // SAFETY: `syscall_entry` is a real naked interrupt entry that saves all
+    // registers and ends in `iretq`; registering its address as the `int 0x80` gate
+    // (an interrupt gate: present, IF cleared on entry) with DPL 3 is sound.
+    unsafe {
+        idt[0x80]
+            .set_handler_addr(VirtAddr::from_ptr(crate::syscall::syscall_entry as *const ()))
+            .set_privilege_level(PrivilegeLevel::Ring3);
+    }
     idt
 });
 
@@ -179,13 +187,18 @@ extern "x86-interrupt" fn double_fault_handler(
 /// The full register state of an interrupted context: every general-purpose
 /// register followed by the interrupt frame the CPU pushed.
 ///
-/// [`timer_interrupt_entry`] lays this out on the kernel stack — it pushes the GP
-/// registers so that, read from the lowest address up, they are `rax, rbx, ..., r15`
+/// Both kernel entries that can trigger a context switch build this *same* layout on
+/// the kernel stack: [`timer_interrupt_entry`] (Stage 12c-1) and, as of Stage 12c-2,
+/// the syscall stub [`crate::syscall::syscall_entry`]. Each pushes the GP registers
+/// so that, read from the lowest address up, they are `rax, rbx, ..., r15`
 /// (`#[repr(C)]` keeps the struct in that exact order), then the CPU's already-pushed
-/// `iframe` sits on top. So `rsp` after the stub's pushes is a `*mut TrapFrame`.
-/// Stage 12c uses it to preempt a user process at *any* instruction: an asynchronous
-/// timer interrupt can strike between any two instructions, so unlike a syscall
-/// (where the program chose to trap) we must save the scratch registers too.
+/// `iframe` sits on top — so `rsp` after the pushes is a `*mut TrapFrame`. Saving and
+/// restoring the *whole* frame is what lets the scheduler switch processes without
+/// corrupting registers, whether the switch is a voluntary `yield`/`exit` syscall or
+/// (Stage 12c-3) an asynchronous timer preemption that can strike between any two
+/// instructions — where, unlike a syscall the program chose to make, any register may
+/// hold live state.
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct TrapFrame {
     pub rax: u64,
@@ -204,6 +217,33 @@ pub struct TrapFrame {
     pub r14: u64,
     pub r15: u64,
     pub iframe: InterruptStackFrameValue,
+}
+
+impl TrapFrame {
+    /// A fresh context for a not-yet-run process: begin executing at `iframe` with
+    /// every general-purpose register zero. The scheduler overwrites these the first
+    /// time the process is switched *out* (saving its live registers); a brand-new
+    /// program reads no register before first writing it, so zero is a safe start.
+    pub fn new(iframe: InterruptStackFrameValue) -> TrapFrame {
+        TrapFrame {
+            rax: 0,
+            rbx: 0,
+            rcx: 0,
+            rdx: 0,
+            rsi: 0,
+            rdi: 0,
+            rbp: 0,
+            r8: 0,
+            r9: 0,
+            r10: 0,
+            r11: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+            iframe,
+        }
+    }
 }
 
 /// Naked entry point for the timer interrupt (IRQ0, vector 32) — Stage 12c.
@@ -262,15 +302,16 @@ unsafe extern "C" fn timer_interrupt_entry() {
 /// [`TrapFrame`] on the kernel stack.
 ///
 /// Counts the tick and sends the EOI (mandatory, and *before* any reschedule: until
-/// the PIC is acknowledged it delivers no further timer IRQ). Stage 12c-1 stops here
-/// — behavior matches the old handler; Stage 12c-2 will, when the interrupted context
-/// is a user process, save `*tf` and round-robin to the next process.
+/// the PIC is acknowledged it delivers no further timer IRQ). Through Stage 12c-2 the
+/// timer behavior is unchanged (count, EOI, dormant kernel-thread reschedule); Stage
+/// 12c-3 will, when the interrupted context is a user process, save `*tf` and
+/// round-robin to the next process — true preemption.
 extern "C" fn timer_dispatch(tf: *mut TrapFrame) {
     let count = TIMER_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     if count == 1 {
         // Prove the naked stub captured a real context: log the interrupted
         // instruction/stack pointers and a register. (At this point interrupts only
-        // fire in the kernel — ring 3 runs with IF clear until Stage 12c-2 — so this
+        // fire in the kernel — ring 3 runs with IF clear until Stage 12c-3 — so this
         // shows a ring 0 context.)
         // SAFETY: `tf` points at this interrupt's TrapFrame on the kernel stack.
         let f = unsafe { &*tf };

@@ -34,7 +34,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use x86_64::instructions::interrupts;
-use x86_64::structures::idt::{InterruptStackFrame, InterruptStackFrameValue};
+use x86_64::structures::idt::InterruptStackFrameValue;
 use x86_64::VirtAddr;
 
 use crate::{gdt, serial_println};
@@ -113,10 +113,11 @@ pub fn enter(user_entry: VirtAddr, user_stack_top: VirtAddr, resume: fn() -> !) 
 /// Build the ring 3 interrupt-return frame for a freshly-started user program:
 /// entry point, user stack, and the GDT's RPL 3 code/data selectors.
 ///
-/// RFLAGS clears IF: Stage 12b runs user processes *cooperatively* — no timer
-/// preemption yet — so a process runs uninterrupted until it `yield`s or `exit`s,
-/// and the scheduler switches processes only at those points. (Stage 12c will set IF
-/// and add preemption, which needs saving a preempted process's full register state.)
+/// RFLAGS clears IF: through Stage 12c-2 user processes still run *cooperatively* —
+/// no timer preemption yet — so a process runs uninterrupted until it `yield`s or
+/// `exit`s, and the scheduler switches only at those points. The full-register
+/// `TrapFrame` those switches now save (Stage 12c-2) is the groundwork for Stage
+/// 12c-3, which will set IF here so the timer can preempt a process mid-execution.
 pub(crate) fn initial_user_frame(
     entry: VirtAddr,
     stack_top: VirtAddr,
@@ -130,53 +131,35 @@ pub(crate) fn initial_user_frame(
     }
 }
 
-/// Read the execution point an in-flight interrupt will return to — a running user
-/// process's context (instruction pointer, stack pointer, flags, selectors). The
-/// scheduler captures this when a process `yield`s, to resume it later.
-pub fn save_frame(frame: &InterruptStackFrame) -> InterruptStackFrameValue {
-    **frame
-}
-
-/// Rewrite an in-flight interrupt's return frame so its `iretq` resumes `target` — a
-/// user process's context. The scheduler uses this from inside the syscall handler
-/// to switch to another process; the caller must already have switched CR3 to that
-/// process's address space.
-pub fn load_frame(frame: &mut InterruptStackFrame, target: InterruptStackFrameValue) {
-    // SAFETY: `target` is a valid ring 3 context (RPL 3 selectors, a mapped entry and
-    // stack in the now-active address space) — either a fresh entry frame from
-    // `initial_user_frame` or one previously captured by `save_frame`. Overwriting
-    // the return frame makes the handler's `iretq` enter it.
-    unsafe { frame.as_mut().write(target) };
-}
-
-/// Leave ring 3: rewrite `frame` so the in-flight interrupt's `iretq` resumes the
+/// Leave ring 3: rewrite `iframe` so the in-flight interrupt's `iretq` resumes the
 /// kernel continuation (the `resume` passed to [`enter`]) in ring 0, instead of
-/// returning to the user program. Shared by the two triggers below.
+/// returning to the user program. Called by the scheduler from the `exit` syscall
+/// when the *last* user process terminates; `iframe` is the interrupt frame inside
+/// that syscall's [`crate::interrupts::TrapFrame`].
 ///
-/// Idempotent via an atomic test-and-clear: whichever fires first — the timer
-/// catching a spinning program, or a ring 3 `exit` syscall — wins, and any later
-/// call is a no-op.
-pub fn resume_kernel(frame: &mut InterruptStackFrame) {
+/// Idempotent via an atomic test-and-clear (armed in [`enter`]): a stray second call
+/// is a harmless no-op.
+pub fn resume_kernel(iframe: &mut InterruptStackFrameValue) {
     if !EXPECT_USER_TICK.swap(false, Ordering::SeqCst) {
         return; // already left ring 3 once
     }
     REACHED_RING3.store(true, Ordering::SeqCst);
 
-    // A ring 0 context: the kernel continuation's RIP, the kernel code selector,
-    // the kernel stack we saved in `enter`, SS = 0 (the kernel runs with a null
-    // stack selector in long mode), and IF cleared so the continuation re-enables
+    // A ring 0 context: the kernel continuation's RIP, the kernel code selector, the
+    // kernel stack we saved in `enter`, SS = 0 (the kernel runs with a null stack
+    // selector in long mode), and IF cleared so the continuation re-enables
     // interrupts deliberately.
-    let resumed = InterruptStackFrameValue {
+    //
+    // A plain assignment (not a volatile write) is correct: `iframe` points into the
+    // TrapFrame on the kernel stack, which the syscall stub reads back via its
+    // explicit `pop`/`iretq` after `syscall_dispatch` returns — the compiler cannot
+    // elide a write another (assembly) reader observes.
+    *iframe = InterruptStackFrameValue {
         instruction_pointer: VirtAddr::new(RESUME_RIP.load(Ordering::SeqCst)),
         code_segment: RESUME_CS.load(Ordering::SeqCst),
         cpu_flags: 0x002,
         stack_pointer: VirtAddr::new(RESUME_RSP.load(Ordering::SeqCst)),
         stack_segment: 0,
     };
-
-    // SAFETY: we overwrite the interrupt-return frame with a valid ring 0 context
-    // (kernel CS, a kernel stack pointer captured in `enter`, RIP at the kernel
-    // continuation). The handler's `iretq` then resumes kernel execution there.
-    unsafe { frame.as_mut().write(resumed) };
 }
 

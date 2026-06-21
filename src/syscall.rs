@@ -3,33 +3,42 @@
 //! A system call is how ring 3 asks the kernel to do something it is not allowed
 //! to do itself (write to the screen, exit, ...). The user executes `int 0x80`;
 //! the CPU switches to ring 0 through the IDT (the gate's DPL is set to 3 in
-//! `interrupts.rs` so ring 3 is permitted to invoke it) and runs [`syscall_handler`].
+//! `interrupts.rs` so ring 3 is permitted to invoke it) and runs [`syscall_entry`].
 //! This is the single, controlled doorway between user and kernel — the thing the
 //! shell's `dispatch` only *pretended* to be while everything still ran in ring 0.
 //!
 //! ## Calling convention (and why it is unusual)
 //!
 //! Real kernels pass the syscall number and arguments in *registers* (Linux uses
-//! `rax` for the number, `rdi`/`rsi`/`rdx`/... for arguments). We can't read those
-//! easily: an `extern "x86-interrupt"` handler only receives the
-//! [`InterruptStackFrame`], and the compiler-generated prologue has already used
-//! the general registers by the time our code runs — capturing them would need a
-//! hand-written `#[naked]` assembly stub. To keep this stage about the *mechanism*
-//! rather than fiddly assembly, we use a **stack-based** convention instead:
+//! `rax` for the number, `rdi`/`rsi`/`rdx`/... for arguments). We use a simpler
+//! **stack-based** convention instead, so the demo's hand-assembled programs and the
+//! ring 0 [`invoke`] helper can share one tiny push/`int`/pop sequence:
 //!
 //! - the caller pushes the arguments, then the syscall number (number on top),
 //!   then executes `int 0x80`;
-//! - the handler finds them through `frame.stack_pointer` (the caller's stack
-//!   pointer, which the CPU saved in the interrupt frame), runs the call, and
+//! - the handler finds them through the saved `iframe.stack_pointer` (the caller's
+//!   stack pointer, which the CPU saved in the interrupt frame), runs the call, and
 //!   writes the return value back over the number's slot;
 //! - the caller pops the return value.
 //!
 //! The exact same byte sequence works whether the caller is in ring 0 (the tests
-//! and the boot demo, via [`invoke`]) or ring 3 (the user program in Stage 10b).
+//! and the boot demo, via [`invoke`]) or ring 3 (the user programs).
+//!
+//! ## Entry stub (Stage 12c-2)
+//!
+//! Originally the handler was an `extern "x86-interrupt"` function, which only
+//! exposes the `InterruptStackFrame` — not the general-purpose registers. That was
+//! fine while switches were cooperative and the demo kept no live register state
+//! across a `yield`. Preemption raises the stakes: a process must be resumable with
+//! its *exact* registers, so [`syscall_entry`] is now a hand-written *naked* stub
+//! (mirroring the timer's) that captures the full [`TrapFrame`]. Both kernel entries
+//! then save and restore identical state, and the scheduler can move a process
+//! between them without corrupting a register.
 
+use core::arch::naked_asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use x86_64::structures::idt::InterruptStackFrame;
+use crate::interrupts::TrapFrame;
 
 /// Syscall numbers. A real kernel would have dozens; we start with a handful.
 pub const SYS_EXIT: u64 = 0;
@@ -48,40 +57,102 @@ pub fn ring3_syscall_count() -> u64 {
     RING3_SYSCALLS.load(Ordering::SeqCst)
 }
 
-/// The `int 0x80` handler. Registered in `interrupts.rs` with the gate's DPL set
-/// to 3 so ring 3 may invoke it.
+/// Naked entry for `int 0x80` (Stage 12c-2). Registered in `interrupts.rs` with the
+/// gate's DPL set to 3 so ring 3 may invoke it.
+///
+/// Mirrors [`crate::interrupts::timer_interrupt_entry`]: it pushes every
+/// general-purpose register to build a [`TrapFrame`] on the kernel stack, hands a
+/// pointer to it to [`syscall_dispatch`], then restores the registers and `iretq`s.
+/// Capturing the *full* register set — rather than the partial state an
+/// `extern "x86-interrupt"` handler exposes — is what lets a `yield`/`exit` save the
+/// caller's complete context and restore the next process's, the same fidelity the
+/// timer needs for preemption (Stage 12c-3). When `syscall_dispatch` switches
+/// processes it overwrites this `TrapFrame` (and CR3), so the `pop`s below restore a
+/// *different* context than was saved — that *is* the switch.
+#[unsafe(naked)]
+pub unsafe extern "C" fn syscall_entry() {
+    naked_asm!(
+        // Save all GP registers in TrapFrame order (see `timer_interrupt_entry`):
+        // pushed highest-numbered first so that, read upward from the final rsp, they
+        // are rax, rbx, ... r15. The CPU already pushed the interrupt frame above.
+        "push r15",
+        "push r14",
+        "push r13",
+        "push r12",
+        "push r11",
+        "push r10",
+        "push r9",
+        "push r8",
+        "push rbp",
+        "push rdi",
+        "push rsi",
+        "push rdx",
+        "push rcx",
+        "push rbx",
+        "push rax",
+        "mov rdi, rsp", // arg 1: pointer to the TrapFrame we just built
+        "call {dispatch}",
+        // Restore (possibly a different process's context after a yield/exit switch).
+        "pop rax",
+        "pop rbx",
+        "pop rcx",
+        "pop rdx",
+        "pop rsi",
+        "pop rdi",
+        "pop rbp",
+        "pop r8",
+        "pop r9",
+        "pop r10",
+        "pop r11",
+        "pop r12",
+        "pop r13",
+        "pop r14",
+        "pop r15",
+        "iretq",
+        dispatch = sym syscall_dispatch,
+    );
+}
+
+/// Rust side of `int 0x80`. Receives a pointer to the caller's [`TrapFrame`] on the
+/// kernel stack, built by [`syscall_entry`].
 ///
 /// It reads the syscall number and two arguments from the caller's stack (our ABI,
 /// above), dispatches, and writes the return value back to the number's slot. The
 /// gate is an *interrupt* gate, so interrupts are disabled for the duration — the
-/// syscall runs to completion without being preempted.
-pub extern "x86-interrupt" fn syscall_handler(mut frame: InterruptStackFrame) {
-    // `frame.stack_pointer` is the caller's RSP at the `int 0x80`; by our ABI it
+/// syscall runs to completion without being preempted. A ring 3 `yield`/`exit`
+/// instead hands off to the scheduler, which rewrites this `TrapFrame` (and CR3) to
+/// resume another process (or, for `exit` with none left, the kernel).
+extern "C" fn syscall_dispatch(tf_ptr: *mut TrapFrame) {
+    // SAFETY: `tf_ptr` is the TrapFrame `syscall_entry` just built at the kernel
+    // stack top; it is valid and uniquely referenced for the duration of this call.
+    let tf = unsafe { &mut *tf_ptr };
+
+    // `iframe.stack_pointer` is the caller's RSP at the `int 0x80`; by our ABI it
     // points at [number, arg1, arg2].
-    let args = frame.stack_pointer.as_u64() as *mut u64;
+    let args = tf.iframe.stack_pointer.as_u64() as *mut u64;
 
     // SAFETY: the caller pushed the number and two arguments at its stack top
     // immediately before trapping, so these three slots exist and are writable.
     // (A hardened kernel would verify the range lies in the caller's own mapped
-    // stack; our single demo program and the ring 0 tests always satisfy that.)
+    // stack; our demo programs and the ring 0 tests always satisfy that.)
     let (number, arg1, arg2) = unsafe { (args.read(), args.add(1).read(), args.add(2).read()) };
 
     // The low two bits of the saved code selector are the caller's privilege level.
-    let from_ring3 = frame.code_segment & 0b11 == 3;
+    let from_ring3 = tf.iframe.code_segment & 0b11 == 3;
     if from_ring3 {
         RING3_SYSCALLS.fetch_add(1, Ordering::SeqCst);
     }
 
     // `yield` and `exit` from ring 3 are control transfers, not value-returning
-    // calls: both hand off to the scheduler, which rewrites this interrupt's return
-    // frame to resume a different process (or, for `exit` with none left, the
-    // kernel). `yield` re-queues the caller; `exit` drops it.
+    // calls: both hand off to the scheduler, which rewrites this `TrapFrame` (and
+    // CR3) to resume a different process (or, for `exit` with none left, the kernel).
+    // `yield` re-queues the caller; `exit` drops it.
     if number == SYS_YIELD && from_ring3 {
-        crate::process::on_user_yield(&mut frame);
+        crate::process::on_user_yield(tf);
         return;
     }
     if number == SYS_EXIT && from_ring3 {
-        crate::process::on_user_exit(&mut frame, arg1);
+        crate::process::on_user_exit(tf, arg1);
         return;
     }
 
