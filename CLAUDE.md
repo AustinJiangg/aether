@@ -92,9 +92,12 @@ just the interrupt frame. 12c-3 sets IF in the ring 3 frame and, on a timer tick
 interrupted ring 3, has `timer_dispatch` save the running process's `TrapFrame` and
 round-robin to the next process (`process::on_timer_tick`) — true preemption: two
 programs busy-spinning between writes interleave with no `yield` required (the
-`yield`/`exit` syscalls remain as voluntary switch points). The remaining Stage 12
-piece is a `wait` syscall (a parent blocking on a child's exit), the immediate next
-step. `ROADMAP.md` carries the forward plan (stages 9-18): the
+`yield`/`exit` syscalls remain as voluntary switch points). Stage 12 also adds `wait`:
+a parent blocks until its child exits and collects the child's exit code (delivered in
+rax, since the kernel often wakes the parent from the child's exit in a *different*
+address space where the parent's user stack is unreachable). A later step is
+process-creation syscalls so a process can spawn another (today the kernel spawns them
+all at boot). `ROADMAP.md` carries the forward plan (stages 9-18): the
 user-space main line (system calls, per-process address spaces + ELF,
 multiprocessing), plus persistence, APIC/SMP, and networking tracks.
 
@@ -237,9 +240,12 @@ Exit QEMU: `Ctrl-A` then `X`.
   kernel CR3 for the return), the `yield`/`exit` syscalls (`on_user_yield`/
   `on_user_exit`) round-robin voluntarily, and since Stage 12c-3 the timer preempts via
   `on_timer_tick` — each switching CR3 and the saved `TrapFrame`, or `resume_kernel`
-  when none remain. `return_to_kernel_space` switches CR3 back in the resume
-  continuation. The boot demo loads two `write`+busy-spin+`yield` looping programs and
-  runs them interleaved under preemption.
+  when none remain. Stage 12's `wait` (`on_user_wait`) blocks a parent (into a `blocked`
+  list) until a child exits, when `on_user_exit` wakes it with the child's code in rax
+  (or leaves a `Zombie` if the parent has not waited yet). `return_to_kernel_space`
+  switches CR3 back in the resume continuation. The boot demo runs two
+  `write`+busy-spin+`yield` workers interleaved under preemption, plus a parent that
+  `wait`s for a child.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

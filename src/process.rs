@@ -57,6 +57,14 @@ const DEMO_ROUND_LEN: usize = 17 + 12 + 4;
 /// Length of the hand-assembled demo program: the rounds plus a 6-byte `exit`.
 const DEMO_CODE_LEN: usize = DEMO_ITERATIONS * DEMO_ROUND_LEN + 6;
 
+/// Exit code the Stage 12 wait-demo child passes to `exit`, for its parent's `wait` to
+/// collect.
+const CHILD_EXIT_CODE: u8 = 42;
+/// Length of the wait-demo child's code: a 17-byte `write` + a 6-byte `exit`.
+const CHILD_CODE_LEN: usize = 17 + 6;
+/// Length of the wait-demo parent's code: `write` + `wait` (4 B) + `write` + `exit`.
+const PARENT_CODE_LEN: usize = 17 + 4 + 17 + 6;
+
 /// Top of the program's user stack (the initial user `rsp`). It sits in the same
 /// private L4 slot as the loaded image, well above the code page; the stack grows
 /// down from here. An ELF does not describe a stack — setting one up is the OS's
@@ -238,71 +246,106 @@ fn map_segment(
 
 // --- demo ELF + boot verification ------------------------------------------
 
-/// Hand-assemble a ring 3 program that runs `iterations` rounds of
-/// `write(msg); busy_spin(); yield()` and then `exit(0)`, speaking the stack-based
-/// syscall ABI (push args, push number, `int 0x80`).
-///
-/// The busy-spin — `mov rcx, DEMO_SPIN; dec rcx; jnz` — is a ring-3 delay long enough
-/// that a ~55 ms timer tick lands in the middle of it and *preempts* the process
-/// (Stage 12c-3). Crucially `rcx` is live throughout the spin: a correct preemption
-/// must save and restore it (and every other register), so the spin doubles as a check
-/// that the full-register `TrapFrame` switch works — were `rcx` lost, the spin would
-/// mis-count and likely never terminate, hanging boot. Each round also `yield`s, so
-/// the program exercises both cooperative and preemptive switching.
-///
-/// The syscall pushes are never popped; the stack just drifts down a little each round,
-/// well within the 16 KiB user stack.
+// --- ring 3 machine-code emitters (shared by the demo program builders) ----
+//
+// All hand-assembled; see the per-line opcode comments. Each demo program is a flat
+// sequence of these, speaking the stack-based syscall ABI: push the arguments, push the
+// syscall number, `int 0x80`. The pushes are never popped — the user stack just drifts
+// down a little, well within its 16 KiB.
+
+/// `write(msg_ptr, msg_len)` — 17 bytes. Reloads its arguments from immediates, so it
+/// needs no incoming register value to survive a context switch.
+fn emit_write(code: &mut Vec<u8>, msg_ptr: u64, msg_len: u8) {
+    code.extend_from_slice(&[0x6A, msg_len]); // push msg_len
+    code.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 ...
+    code.extend_from_slice(&msg_ptr.to_le_bytes()); // ... = msg_ptr
+    code.push(0x50); // push rax
+    code.extend_from_slice(&[0x6A, crate::syscall::SYS_WRITE as u8]); // push SYS_WRITE
+    code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
+}
+
+/// A zero-argument syscall — `push number; int 0x80` (4 bytes). Used for `yield`, and
+/// for `wait` (whose result the kernel returns in rax, so the program reads rax after).
+fn emit_syscall0(code: &mut Vec<u8>, number: u8) {
+    code.extend_from_slice(&[0x6A, number]); // push number
+    code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
+}
+
+/// `exit(exit_code)` — 6 bytes. Never returns.
+fn emit_exit(code: &mut Vec<u8>, exit_code: u8) {
+    code.extend_from_slice(&[0x6A, exit_code]); // push exit_code
+    code.extend_from_slice(&[0x6A, crate::syscall::SYS_EXIT as u8]); // push SYS_EXIT
+    code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
+}
+
+/// A busy-spin of `count` iterations — `mov rcx, count; dec rcx; jnz` (12 bytes). A
+/// ring-3 delay long enough that a ~55 ms timer tick lands mid-spin and *preempts* the
+/// process (Stage 12c-3). `rcx` is live throughout, so a correct preemption must save
+/// and restore it — were `rcx` lost the spin would mis-count and likely never
+/// terminate, hanging boot, which makes the spin a built-in check of the full-register
+/// `TrapFrame` switch.
+fn emit_spin(code: &mut Vec<u8>, count: u32) {
+    code.extend_from_slice(&[0x48, 0xC7, 0xC1]); // mov rcx, imm32 (sign-extended to 64)
+    code.extend_from_slice(&count.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0xFF, 0xC9]); // dec rcx
+    code.extend_from_slice(&[0x75, 0xFB]); // jnz -5 -> back to `dec rcx`
+}
+
+/// Hand-assemble the Stage 12c interleaving demo: `iterations` rounds of
+/// `write(msg); busy_spin(); yield()`, then `exit(0)`. Two of these interleave via both
+/// timer preemption (during the spin) and cooperative `yield`.
 fn build_looping_program(msg_ptr: u64, msg_len: u8, iterations: usize) -> Vec<u8> {
     let mut code = Vec::new();
     for _ in 0..iterations {
-        // write(msg_ptr, msg_len)
-        code.extend_from_slice(&[0x6A, msg_len]); // push msg_len
-        code.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 ...
-        code.extend_from_slice(&msg_ptr.to_le_bytes()); // ... = msg_ptr
-        code.push(0x50); // push rax
-        code.extend_from_slice(&[0x6A, crate::syscall::SYS_WRITE as u8]); // push SYS_WRITE
-        code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
-        // busy_spin: mov rcx, DEMO_SPIN; spin: dec rcx; jnz spin
-        // A ring-3 delay so a timer tick lands here and preempts us; rcx is live across
-        // that preemption, so the full-register TrapFrame switch must preserve it.
-        code.extend_from_slice(&[0x48, 0xC7, 0xC1]); // mov rcx, imm32 (sign-extended to 64)
-        code.extend_from_slice(&DEMO_SPIN.to_le_bytes());
-        code.extend_from_slice(&[0x48, 0xFF, 0xC9]); // dec rcx
-        code.extend_from_slice(&[0x75, 0xFB]); // jnz -5 -> back to `dec rcx`
-        // yield()
-        code.extend_from_slice(&[0x6A, crate::syscall::SYS_YIELD as u8]); // push SYS_YIELD
-        code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
+        emit_write(&mut code, msg_ptr, msg_len);
+        emit_spin(&mut code, DEMO_SPIN);
+        emit_syscall0(&mut code, crate::syscall::SYS_YIELD as u8);
     }
-    // exit(0)
-    code.extend_from_slice(&[0x6A, 0x00]); // push exit code 0
-    code.extend_from_slice(&[0x6A, crate::syscall::SYS_EXIT as u8]); // push SYS_EXIT
-    code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
+    emit_exit(&mut code, 0);
+    debug_assert_eq!(code.len(), iterations * DEMO_ROUND_LEN + 6);
     code
 }
 
-/// Build a tiny but valid ELF64 executable for the loader to chew on.
+/// Hand-assemble the Stage 12 wait-demo *child*: `write(msg); exit(CHILD_EXIT_CODE)`.
+/// Produces exactly [`CHILD_CODE_LEN`] bytes.
+fn build_child(msg_ptr: u64, msg_len: u8) -> Vec<u8> {
+    let mut code = Vec::new();
+    emit_write(&mut code, msg_ptr, msg_len);
+    emit_exit(&mut code, CHILD_EXIT_CODE);
+    debug_assert_eq!(code.len(), CHILD_CODE_LEN);
+    code
+}
+
+/// Hand-assemble the Stage 12 wait-demo *parent*: `write(msg); wait(); write(msg);
+/// exit(0)`. Writing the same message before and after `wait()` makes the two lines
+/// bracket the child's output — visibly proving the parent blocked, then resumed once
+/// the child exited. Produces exactly [`PARENT_CODE_LEN`] bytes.
+fn build_parent(msg_ptr: u64, msg_len: u8) -> Vec<u8> {
+    let mut code = Vec::new();
+    emit_write(&mut code, msg_ptr, msg_len);
+    emit_syscall0(&mut code, crate::syscall::SYS_WAIT as u8);
+    emit_write(&mut code, msg_ptr, msg_len);
+    emit_exit(&mut code, 0);
+    debug_assert_eq!(code.len(), PARENT_CODE_LEN);
+    code
+}
+
+/// Assemble a tiny but valid ELF64 `ET_EXEC` from raw `code` and a `msg` string.
 ///
-/// One `PT_LOAD` segment covers the whole file and asks to be loaded at
-/// [`USER_LOAD_BASE`]; the entry point sits just past the headers. The code (the
-/// same `write`-then-`exit` sequence the Stage 10 ring 3 program used) and its
-/// message follow. Layout within the file / segment:
+/// One `PT_LOAD` segment covers the whole file, loaded at [`USER_LOAD_BASE`]; the entry
+/// sits just past the headers. The caller must have built `code` to reference `msg` at
+/// its final virtual address — `USER_LOAD_BASE + DEMO_ENTRY_OFFSET + code.len()` (see
+/// [`msg_vaddr`]). Layout within the file / segment:
 ///
 /// ```text
-///   [0   .. 64 )  ELF header
-///   [64  .. 120)  one program header (PT_LOAD)
-///   [120 .. 143)  code  (entry point = USER_LOAD_BASE + 120)
-///   [143 ..    )  message string
+///   [0   .. 64 )            ELF header
+///   [64  .. 120)            one program header (PT_LOAD)
+///   [120 .. 120+code)       code  (entry point = USER_LOAD_BASE + 120)
+///   [120+code ..   )        message string
 /// ```
-pub fn demo_elf(msg: &[u8]) -> Vec<u8> {
-    let msg_offset = DEMO_ENTRY_OFFSET + DEMO_CODE_LEN;
+fn build_elf(code: &[u8], msg: &[u8]) -> Vec<u8> {
+    let msg_offset = DEMO_ENTRY_OFFSET + code.len();
     let total = msg_offset + msg.len();
-
-    // The code references the message at its final virtual address.
-    let code = build_looping_program(
-        USER_LOAD_BASE + msg_offset as u64,
-        msg.len() as u8,
-        DEMO_ITERATIONS,
-    );
 
     let mut v = alloc::vec![0u8; total];
 
@@ -332,10 +375,60 @@ pub fn demo_elf(msg: &[u8]) -> Vec<u8> {
     v[p + 48..p + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
 
     // --- code + message ---
-    v[DEMO_ENTRY_OFFSET..DEMO_ENTRY_OFFSET + DEMO_CODE_LEN].copy_from_slice(&code);
+    v[DEMO_ENTRY_OFFSET..DEMO_ENTRY_OFFSET + code.len()].copy_from_slice(code);
     v[msg_offset..msg_offset + msg.len()].copy_from_slice(msg);
 
     v
+}
+
+/// The virtual address a program's message lands at, given its code length: the message
+/// follows the code, which follows the headers.
+fn msg_vaddr(code_len: usize) -> u64 {
+    USER_LOAD_BASE + (DEMO_ENTRY_OFFSET + code_len) as u64
+}
+
+/// Build the Stage 12c interleaving demo ELF (the `write` + busy-spin + `yield` loop).
+pub fn demo_elf(msg: &[u8]) -> Vec<u8> {
+    let code = build_looping_program(msg_vaddr(DEMO_CODE_LEN), msg.len() as u8, DEMO_ITERATIONS);
+    build_elf(&code, msg)
+}
+
+/// Build the Stage 12 wait-demo *child* ELF (`write`; `exit(CHILD_EXIT_CODE)`).
+fn child_elf() -> Vec<u8> {
+    let msg = b"  child: running, then exiting\n";
+    let code = build_child(msg_vaddr(CHILD_CODE_LEN), msg.len() as u8);
+    build_elf(&code, msg)
+}
+
+/// Build the Stage 12 wait-demo *parent* ELF (`write`; `wait`; `write`; `exit(0)`).
+fn parent_elf() -> Vec<u8> {
+    let msg = b"parent: before/after wait()\n";
+    let code = build_parent(msg_vaddr(PARENT_CODE_LEN), msg.len() as u8);
+    build_elf(&code, msg)
+}
+
+/// Stage 12 boot demo for `wait`: load and spawn a parent that `wait`s for its child.
+/// The child `write`s then `exit`s with [`CHILD_EXIT_CODE`]; the parent blocks in
+/// `wait` until then and collects the code (recorded for the test). Returns the two
+/// process ids. Spawned alongside the Stage 12c interleaving workers, so all run
+/// together under the scheduler — the wait logic matches a parent to *its* child by id,
+/// regardless of the other unrelated processes.
+pub fn spawn_wait_demo(
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    physical_memory_offset: VirtAddr,
+) -> (u64, u64) {
+    let parent_img = load(&parent_elf(), frame_allocator, physical_memory_offset)
+        .expect("failed to load the wait-demo parent");
+    let child_img = load(&child_elf(), frame_allocator, physical_memory_offset)
+        .expect("failed to load the wait-demo child");
+    let parent_id = spawn(parent_img, None);
+    let child_id = spawn(child_img, Some(parent_id));
+    serial_println!(
+        "[sched] wait-demo: spawned parent {} and its child {}",
+        parent_id,
+        child_id
+    );
+    (parent_id, child_id)
 }
 
 /// Set once the boot demo has loaded the demo ELF into a fresh space and verified
@@ -431,18 +524,33 @@ static PROCESSES_EXITED: AtomicU64 = AtomicU64::new(0);
 static PROCESSES_YIELDED: AtomicU64 = AtomicU64::new(0);
 /// How many times the timer has *preempted* a running user process — Stage 12c-3 test.
 static PROCESSES_PREEMPTED: AtomicU64 = AtomicU64::new(0);
+/// How many times a parent collected an exited child via `wait` — Stage 12 test.
+static PROCESSES_WAITED: AtomicU64 = AtomicU64::new(0);
+/// Exit code the most recent `wait` returned (`u64::MAX` = none yet) — Stage 12 test.
+static LAST_WAITED_CODE: AtomicU64 = AtomicU64::new(u64::MAX);
 
-/// A user process: a unique id, its loaded image (address space, entry, stack), and
-/// its saved execution context (`context`) — where, and in what register state, to
-/// resume it. As of Stage 12c-2 the context is a full [`TrapFrame`]: every
-/// general-purpose register plus the interrupt frame (instruction/stack pointers,
-/// flags, selectors). Saving the GP registers too — not just the interrupt frame —
-/// is what makes a process resumable after being switched out at *any* instruction,
-/// the prerequisite for timer preemption (Stage 12c-3).
+/// A user process: a unique id, its loaded image (address space, entry, stack), its
+/// saved execution context (`context`), and its `parent`. As of Stage 12c-2 the context
+/// is a full [`TrapFrame`]: every general-purpose register plus the interrupt frame
+/// (instruction/stack pointers, flags, selectors). Saving the GP registers too — not
+/// just the interrupt frame — is what makes a process resumable after being switched
+/// out at *any* instruction, the prerequisite for timer preemption (Stage 12c-3).
 struct Process {
     id: u64,
     image: UserImage,
     context: TrapFrame,
+    /// The process that may collect this one's exit code via `wait` (Stage 12); `None`
+    /// for the root processes the kernel spawns directly at boot.
+    parent: Option<u64>,
+}
+
+/// An exited child whose parent has not yet `wait`ed for it — a "zombie". We keep only
+/// the ids and exit code (the child's image/space is dropped when it exits); a later
+/// `wait` from the parent collects the code. (Stage 12.)
+struct Zombie {
+    parent: u64,
+    child: u64,
+    code: u64,
 }
 
 /// A minimal round-robin scheduler: a FIFO queue of ready processes plus the one
@@ -450,22 +558,34 @@ struct Process {
 /// (see [`on_user_yield`] / [`on_user_exit`]) and, since Stage 12c-3, by the timer
 /// preempting a running process ([`on_timer_tick`]) — processes now run with interrupts
 /// *on*, so a switch can happen at any instruction, not only at voluntary points.
+///
+/// Stage 12 adds `wait`: a parent blocking on a child's exit goes into `blocked` (out of
+/// the round-robin) until a child exits and wakes it; a child that exits *before* its
+/// parent waits leaves a [`Zombie`] in `zombies` for the parent to collect later.
 struct Scheduler {
     ready: Vec<Process>,
     current: Option<Process>,
+    /// Processes blocked in `wait`, waiting for a child to exit (Stage 12).
+    blocked: Vec<Process>,
+    /// Exited children whose parents have not yet collected them via `wait` (Stage 12).
+    zombies: Vec<Zombie>,
     next_id: u64,
 }
 
 static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler {
     ready: Vec::new(),
     current: None,
+    blocked: Vec::new(),
+    zombies: Vec::new(),
     next_id: 1,
 });
 
-/// Add a loaded program to the scheduler's ready queue; returns its process id. Its
-/// initial context starts at the program's entry on a fresh user stack with every
-/// general-purpose register zero (see [`TrapFrame::new`]).
-pub fn spawn(image: UserImage) -> u64 {
+/// Add a loaded program to the scheduler's ready queue; returns its process id.
+///
+/// `parent` is the process that may `wait` for this one (`None` for a root process the
+/// kernel spawns at boot). Its initial context starts at the program's entry on a fresh
+/// user stack with every general-purpose register zero (see [`TrapFrame::new`]).
+pub fn spawn(image: UserImage, parent: Option<u64>) -> u64 {
     let mut sched = SCHEDULER.lock();
     let id = sched.next_id;
     sched.next_id += 1;
@@ -474,6 +594,7 @@ pub fn spawn(image: UserImage) -> u64 {
         id,
         image,
         context: TrapFrame::new(iframe),
+        parent,
     });
     id
 }
@@ -576,14 +697,38 @@ pub fn on_user_yield(tf: &mut TrapFrame) {
 }
 
 /// Called by the `exit` syscall when a ring 3 process terminates (see `syscall.rs`).
-/// Drops the finished process and, if another is ready, switches to it; if none
-/// remain, resumes the kernel instead.
+/// Drops the finished process; if it has a parent, delivers its exit code to that
+/// parent — waking it if it is blocked in `wait` (returning the code in rax), otherwise
+/// leaving a [`Zombie`] for a later `wait` to collect. Then switches to the next ready
+/// process, or resumes the kernel if none remain.
 pub fn on_user_exit(tf: &mut TrapFrame, code: u64) {
     PROCESSES_EXITED.fetch_add(1, Ordering::SeqCst);
 
     let next = {
         let mut sched = SCHEDULER.lock();
-        let finished_id = sched.current.take().map(|p| p.id).unwrap_or(0);
+        // Take (and drop) the exiting process, remembering its id and parent.
+        let (finished_id, parent) = match sched.current.take() {
+            Some(p) => (p.id, p.parent),
+            None => (0, None),
+        };
+
+        // Deliver the exit code to the parent, if there is one.
+        if let Some(parent_id) = parent {
+            if let Some(idx) = sched.blocked.iter().position(|p| p.id == parent_id) {
+                // The parent is blocked in wait(): wake it, returning `code` in rax.
+                let mut waiting = sched.blocked.remove(idx);
+                waiting.context.rax = code;
+                sched.ready.push(waiting);
+                PROCESSES_WAITED.fetch_add(1, Ordering::SeqCst);
+                LAST_WAITED_CODE.store(code, Ordering::SeqCst);
+                serial_println!("[sched] child {} woke waiting parent {} (code {})", finished_id, parent_id, code);
+            } else {
+                // The parent has not waited yet: leave a zombie for it to collect.
+                sched.zombies.push(Zombie { parent: parent_id, child: finished_id, code });
+                serial_println!("[sched] child {} became a zombie for parent {} (code {})", finished_id, parent_id, code);
+            }
+        }
+
         let next = activate_next(&mut sched);
         match next {
             Some((id, _)) => serial_println!(
@@ -606,6 +751,63 @@ pub fn on_user_exit(tf: &mut TrapFrame, code: u64) {
         Some((_, context)) => *tf = context,
         // No process left: rewrite the interrupt frame to resume the kernel instead.
         None => usermode::resume_kernel(&mut tf.iframe),
+    }
+}
+
+/// Called by the `wait` syscall (ring 3): block the caller until one of its children
+/// exits, then return that child's exit code. Three cases:
+/// - a child already exited (a [`Zombie`] is queued): collect it and resume immediately;
+/// - the caller has a live child: save its context, move it to `blocked`, and switch to
+///   another process — the child's eventual `exit` ([`on_user_exit`]) wakes the parent;
+/// - the caller has no children: return `u64::MAX` (-1) immediately.
+///
+/// Unlike the stack-based ABI of the other syscalls, `wait` returns its result in
+/// **rax**. The kernel often delivers it asynchronously, from a child's `exit` running
+/// in a *different* address space where the parent's user stack is not reachable — but
+/// the parent's saved `TrapFrame.rax` always is. The demo's parent reads rax after the
+/// `int 0x80`.
+pub fn on_user_wait(tf: &mut TrapFrame) {
+    let mut sched = SCHEDULER.lock();
+    let parent = match sched.current.take() {
+        Some(p) => p,
+        None => return, // no current process — should not happen from a ring 3 syscall
+    };
+    let pid = parent.id;
+
+    // (1) A child already exited? Collect the zombie and resume the parent immediately.
+    if let Some(idx) = sched.zombies.iter().position(|z| z.parent == pid) {
+        let Zombie { child, code, .. } = sched.zombies.remove(idx);
+        sched.current = Some(parent); // the parent keeps running
+        PROCESSES_WAITED.fetch_add(1, Ordering::SeqCst);
+        LAST_WAITED_CODE.store(code, Ordering::SeqCst);
+        serial_println!("[sched] process {} waited; reaped zombie child {} (code {})", pid, child, code);
+        tf.rax = code; // wait() returns the child's exit code in rax
+        return;
+    }
+
+    // (2) Any live child to block on? (a child sits in `ready` or `blocked`.)
+    let has_live_child = sched.ready.iter().any(|p| p.parent == Some(pid))
+        || sched.blocked.iter().any(|p| p.parent == Some(pid));
+    if !has_live_child {
+        sched.current = Some(parent);
+        serial_println!("[sched] process {} called wait with no children; returning -1", pid);
+        tf.rax = u64::MAX; // -1: nothing to wait for
+        return;
+    }
+
+    // (3) Block the parent until a child exits.
+    let mut parent = parent;
+    parent.context = *tf; // resume point; rax is filled in when the child exits
+    serial_println!("[sched] process {} blocked in wait", pid);
+    sched.blocked.push(parent);
+    match activate_next(&mut sched) {
+        Some((_, context)) => *tf = context,
+        None => {
+            // Nothing else to run while the parent waits — a deadlock in general, but in
+            // the demo a child is always ready here, so this is defensive.
+            serial_println!("[sched] nothing to run while process {} waits; resuming kernel", pid);
+            usermode::resume_kernel(&mut tf.iframe);
+        }
     }
 }
 
@@ -690,4 +892,15 @@ pub fn processes_yielded() -> u64 {
 /// 12c-3 test.
 pub fn processes_preempted() -> u64 {
     PROCESSES_PREEMPTED.load(Ordering::SeqCst)
+}
+
+/// How many times a parent collected an exited child via `wait`. For the Stage 12 test.
+pub fn processes_waited() -> u64 {
+    PROCESSES_WAITED.load(Ordering::SeqCst)
+}
+
+/// The exit code the most recent `wait` returned (`u64::MAX` if none yet). For the
+/// Stage 12 test.
+pub fn last_waited_code() -> u64 {
+    LAST_WAITED_CODE.load(Ordering::SeqCst)
 }

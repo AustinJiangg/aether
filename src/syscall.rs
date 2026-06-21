@@ -47,6 +47,10 @@ pub const SYS_GETPID: u64 = 2;
 /// `yield()` — voluntarily give up the CPU so the scheduler runs another process
 /// (Stage 12b cooperative multitasking). Meaningful only from ring 3.
 pub const SYS_YIELD: u64 = 3;
+/// `wait()` — block until a child process exits, returning its exit code (Stage 12).
+/// Meaningful only from ring 3; unlike the others it returns its result in `rax` (see
+/// [`crate::process::on_user_wait`]).
+pub const SYS_WAIT: u64 = 4;
 
 /// Count of syscalls that arrived from ring 3 — proof (for the Stage 10b test)
 /// that the user program really crossed into the kernel through `int 0x80`.
@@ -153,6 +157,11 @@ extern "C" fn syscall_dispatch(tf_ptr: *mut TrapFrame) {
     }
     if number == SYS_EXIT && from_ring3 {
         crate::process::on_user_exit(tf, arg1);
+        return;
+    }
+    if number == SYS_WAIT && from_ring3 {
+        // `wait` blocks/returns its result in rax (set by on_user_wait), not the stack.
+        crate::process::on_user_wait(tf);
         return;
     }
 

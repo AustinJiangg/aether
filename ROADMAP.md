@@ -43,8 +43,9 @@ unify later.
 
 ### Main line: the road to user space
 
-> **Status:** Stages 9-11 are complete; Stage 12 is nearly complete (12a-12c done;
-> a `wait` syscall is the immediate next step). Stage 9 reaches
+> **Status:** Stages 9-11 are complete; Stage 12 is complete (12a-12c plus a `wait`
+> syscall). Process-creation syscalls (so a process can spawn another, rather than the
+> kernel spawning them all at boot) are a later step. Stage 9 reaches
 > ring 3 (`gdt.rs`, `usermode.rs`); Stage 10 adds `int 0x80` system calls
 > (`syscall.rs`); Stage 11a adds an `AddressSpace` (`memory.rs`) that clones the
 > kernel L4 and switches CR3; Stage 11b adds an ELF64 parser (`elf.rs`) and loader
@@ -68,9 +69,11 @@ unify later.
 > voluntary switch points). Note: under bootloader 0.9 the kernel, heap, and
 > physical-memory window all live in the *lower* half (present L4 slots all < 256), so a
 > clone copies every present top-level entry, and user programs load into an
-> otherwise-empty slot (64) for private lower-level tables. Remaining for Stage 12: a
-> `wait` syscall (a parent blocking on its child's exit — the immediate next step) and,
-> later, process-creation syscalls so a process can spawn another (today the kernel
+> otherwise-empty slot (64) for private lower-level tables. Stage 12 also adds `wait`: a
+> parent blocks until its child exits and collects the child's exit code (returned in
+> rax — the kernel often wakes the parent from the child's exit running in a *different*
+> address space, where only the saved register, not the user stack, is reachable). Still
+> later: process-creation syscalls so a process can spawn another (today the kernel
 > spawns them all at boot).
 
 | Stage | What to build | OS concepts | Smallest verifiable step |

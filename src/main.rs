@@ -327,15 +327,20 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     );
     println!("ELF loader live; loaded two programs into separate address spaces (serial log).");
 
-    // Stage 12b: spawn both programs and start the cooperative scheduler. Each demo
-    // program runs several rounds of `write` then `yield`; on each `yield` the
-    // scheduler saves the caller's resume point and switches to the other process, so
-    // their output interleaves (#1, #2, #1, #2, ...). When a program finishes its
-    // rounds it `exit`s; once both have exited, the kernel resumes at `boot_continue`
-    // (which switches CR3 back to the kernel space). `run` never returns here.
-    let p1 = process::spawn(img1);
-    let p2 = process::spawn(img2);
-    serial_println!("[sched] spawned processes {} and {}", p1, p2);
+    // Stage 12c: spawn the two interleaving workers and start the scheduler. Each runs
+    // several rounds of `write` + busy-spin + `yield`; the timer preempts them mid-spin
+    // and they also `yield`, so their output interleaves (#1, #2, #1, #2, ...).
+    let p1 = process::spawn(img1, None);
+    let p2 = process::spawn(img2, None);
+    // Stage 12: also spawn a parent that blocks in `wait()` until its child exits. All
+    // four processes run together; the parent collects the child's exit code on wakeup.
+    let (parent, child) = process::spawn_wait_demo(&mut frame_allocator, phys_mem_offset);
+    serial_println!(
+        "[sched] spawned workers {} and {}, wait-demo parent {} + child {}",
+        p1, p2, parent, child
+    );
+    // When the last process exits, the kernel resumes at `boot_continue` (which switches
+    // CR3 back to the kernel space). `run` never returns here.
     process::run(boot_continue);
 }
 
@@ -370,6 +375,11 @@ fn boot_continue() -> ! {
         process::processes_preempted(),
         process::last_user_run_l4(),
         process::kernel_l4(),
+    );
+    serial_println!(
+        "[sched] wait: {} parent(s) collected a child, last child exit code = {}",
+        process::processes_waited(),
+        process::last_waited_code(),
     );
     println!("Back from running user processes; continuing boot.");
 

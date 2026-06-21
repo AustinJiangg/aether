@@ -245,3 +245,13 @@ fn processes_interleaved_via_yield() {
 fn timer_preempted_a_process() {
     assert!(crate::process::processes_preempted() >= 1);
 }
+
+/// Stage 12: the `wait` syscall worked — a parent blocked until its child exited and
+/// collected the child's exit code. The boot demo spawns a parent that `wait`s and a
+/// child that `exit`s with code 42, so by the time this harness runs the parent must
+/// have collected exactly that code (delivered in rax when the child exited).
+#[test_case]
+fn parent_waited_for_child() {
+    assert!(crate::process::processes_waited() >= 1);
+    assert_eq!(crate::process::last_waited_code(), 42); // == CHILD_EXIT_CODE
+}
