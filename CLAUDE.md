@@ -84,10 +84,17 @@ and CR3 from inside the handler). `yield` saves the caller's resume point and
 round-robins to the next; `exit` drops it. Two programs that each run several
 `write`+`yield` rounds therefore interleave their output (#1, #2, #1, #2, ...), and
 being byte-identical yet printing different messages from the same virtual address,
-they also prove address-space isolation. Processes run with interrupts off
-(cooperative — only the instruction/stack pointers are saved, no general-purpose
-registers; timer preemption is Stage 12c). `ROADMAP.md` now carries the
-forward plan (stages 9-18): the
+they also prove address-space isolation. **Stage 12c is also done**: preemptive
+scheduling, in three sub-steps. 12c-1 and 12c-2 route the timer *and* the `int 0x80`
+syscall through hand-written *naked* stubs that capture the full register set into a
+`TrapFrame`, so a context switch saves and restores every general-purpose register, not
+just the interrupt frame. 12c-3 sets IF in the ring 3 frame and, on a timer tick that
+interrupted ring 3, has `timer_dispatch` save the running process's `TrapFrame` and
+round-robin to the next process (`process::on_timer_tick`) — true preemption: two
+programs busy-spinning between writes interleave with no `yield` required (the
+`yield`/`exit` syscalls remain as voluntary switch points). The remaining Stage 12
+piece is a `wait` syscall (a parent blocking on a child's exit), the immediate next
+step. `ROADMAP.md` carries the forward plan (stages 9-18): the
 user-space main line (system calls, per-process address spaces + ELF,
 multiprocessing), plus persistence, APIC/SMP, and networking tracks.
 
@@ -161,10 +168,14 @@ Exit QEMU: `Ctrl-A` then `X`.
   double fault), and the hardware interrupt handlers along with the 8259 PIC
   setup. Since Stage 12c the timer (IRQ0) uses a hand-written *naked* entry
   (`timer_interrupt_entry`) that pushes the full register set into a `TrapFrame`
-  and calls `timer_dispatch` (count tick, EOI, `thread::schedule`) — the capture
-  needed to preempt a user process at any instruction. The keyboard handler (since
-  Stage 5) just pushes the raw scancode onto the async keyboard's queue. Stage 10
-  also registers an `int 0x80` syscall gate (DPL 3) dispatching to `syscall.rs`.
+  and calls `timer_dispatch`, which counts the tick, sends the EOI, then — if the
+  tick interrupted ring 3 — preempts the running user process via
+  `process::on_timer_tick` (a ring 0 tick instead feeds the dormant
+  `thread::schedule`). The keyboard handler (since Stage 5) just pushes the raw
+  scancode onto the async keyboard's queue. Stage 10 registers the `int 0x80`
+  syscall gate (DPL 3); since Stage 12c-2 it too points at a naked stub
+  (`syscall::syscall_entry`) that builds the same `TrapFrame`, so a `yield`/`exit`
+  saves and restores a full register context.
 - `src/memory.rs`: virtual-memory helpers — reads CR3 and builds an
   `OffsetPageTable` over the active page tables (via the bootloader's complete
   physical-memory mapping) for translating virtual addresses, plus a
@@ -199,33 +210,36 @@ Exit QEMU: `Ctrl-A` then `X`.
   mutex with `mkdir`/`write`/`read`/`list`/`remove`/`is_dir`. No disk, no
   persistence, no VFS layer.
 - `src/usermode.rs`: the ring 3 entry/return mechanism — `enter` forges an
-  interrupt-return frame (`ring3_frame`: entry point + user stack, IF clear) and
-  `iretq`s into ring 3; `switch_to_user` rewrites an in-flight interrupt's frame to
-  enter another process (the scheduler uses it on `exit`); `resume_kernel` rewrites
-  the frame to return to the kernel. Stage 12a generalized `enter` to take a user
-  stack (the old hand-mapped `map_user_code` is gone); `build_user_program` still
-  hand-assembles the demo's `write`+`exit` code. (Stage 9a added the ring 3 GDT
-  segments and the TSS `rsp0` stack in `gdt.rs`.)
-- `src/syscall.rs`: Stage 10 system calls — the `int 0x80` handler (its IDT gate's
-  DPL is 3 so ring 3 may invoke it), a stack-based argument ABI, and
-  `write`/`getpid`/`exit`/`yield`. Ring 3 `yield`/`exit` call
+  interrupt-return frame (`initial_user_frame`: entry point + user stack; since Stage
+  12c-3 IF is *set* so the process is preemptible) and `iretq`s into ring 3;
+  `resume_kernel` rewrites an in-flight interrupt's frame to return to the kernel (the
+  scheduler uses it when the last process exits). The per-process context is now a full
+  `TrapFrame` saved/restored by `process.rs`, so the old `save_frame`/`load_frame`
+  helpers are gone. (Stage 9a added the ring 3 GDT segments and the TSS `rsp0` stack in
+  `gdt.rs`.)
+- `src/syscall.rs`: Stage 10 system calls over `int 0x80` (its IDT gate's DPL is 3 so
+  ring 3 may invoke it) with a stack-based argument ABI: `write`/`getpid`/`exit`/`yield`.
+  Since Stage 12c-2 the entry is a hand-written *naked* stub (`syscall_entry`) that
+  builds a full `TrapFrame` and calls `syscall_dispatch`, mirroring the timer — so the
+  general-purpose registers survive a context switch. Ring 3 `yield`/`exit` call
   `process::on_user_yield`/`on_user_exit` (which switch to another process or resume
   the kernel); an `invoke` helper drives the value-returning calls from ring 0 (the
   boot demo and the tests).
 - `src/elf.rs`: Stage 11b minimal ELF64 parser — validates the header (x86-64,
   ET_EXEC), bounds-checks the program-header table, and iterates the `PT_LOAD`
   segments. Pure (reads bytes, no page tables), so it is unit-testable on its own.
-- `src/process.rs`: Stage 11b ELF loader + Stage 12a/12b scheduler — parses an ELF
+- `src/process.rs`: Stage 11b ELF loader + Stage 12 scheduler — parses an ELF
   (via `elf.rs`), clones the kernel into a fresh `AddressSpace`, maps each `PT_LOAD`
   segment plus a user stack into it (writing through the physical-memory window
-  while the space is inactive), and bundles it as a `UserImage`. A cooperative
-  `Scheduler` (a `Mutex`-guarded ready queue) holds `Process`es, each carrying its
-  saved resume frame: `spawn` enqueues, `run` enters the first in ring 3 (saving the
-  kernel CR3 for the return), and `on_user_yield`/`on_user_exit` — called from the
-  `yield`/`exit` syscalls — round-robin to the next process (switching CR3 and
-  rewriting the interrupt frame) or `resume_kernel` when none remain.
-  `return_to_kernel_space` switches CR3 back in the resume continuation. The boot
-  demo loads two `write`+`yield` looping programs and runs them interleaved.
+  while the space is inactive), and bundles it as a `UserImage`. A round-robin
+  `Scheduler` (a `Mutex`-guarded ready queue) holds `Process`es, each carrying a full
+  `TrapFrame` context: `spawn` enqueues, `run` enters the first in ring 3 (saving the
+  kernel CR3 for the return), the `yield`/`exit` syscalls (`on_user_yield`/
+  `on_user_exit`) round-robin voluntarily, and since Stage 12c-3 the timer preempts via
+  `on_timer_tick` — each switching CR3 and the saved `TrapFrame`, or `resume_kernel`
+  when none remain. `return_to_kernel_space` switches CR3 back in the resume
+  continuation. The boot demo loads two `write`+busy-spin+`yield` looping programs and
+  runs them interleaved under preemption.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

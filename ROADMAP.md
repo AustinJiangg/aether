@@ -43,7 +43,8 @@ unify later.
 
 ### Main line: the road to user space
 
-> **Status:** Stages 9-11 are complete; Stage 12 is in progress. Stage 9 reaches
+> **Status:** Stages 9-11 are complete; Stage 12 is nearly complete (12a-12c done;
+> a `wait` syscall is the immediate next step). Stage 9 reaches
 > ring 3 (`gdt.rs`, `usermode.rs`); Stage 10 adds `int 0x80` system calls
 > (`syscall.rs`); Stage 11a adds an `AddressSpace` (`memory.rs`) that clones the
 > kernel L4 and switches CR3; Stage 11b adds an ELF64 parser (`elf.rs`) and loader
@@ -56,14 +57,21 @@ unify later.
 > round-robins to the next; `exit` drops it. Two programs that each run several
 > `write`+`yield` rounds therefore *interleave* their output (#1, #2, #1, #2, ...),
 > and being byte-identical yet printing different messages from the same virtual
-> address, they also prove address-space isolation. Processes run with interrupts off
-> (purely cooperative — saving only each one's instruction/stack pointers, no
-> general-purpose registers). Note: under bootloader 0.9 the kernel, heap,
-> and physical-memory window all live in the *lower* half (present L4 slots all <
-> 256), so a clone copies every present top-level entry, and user programs load into
-> an otherwise-empty slot (64) for private lower-level tables. Stage 12c (set IF and
-> add timer preemption — interleave processes mid-execution, which needs saving a
-> preempted process's full register context; plus `wait`) is next.
+> address, they also prove address-space isolation. Stage 12c then made scheduling
+> **preemptive** in three sub-steps: 12c-1 and 12c-2 route the timer *and* the
+> `int 0x80` syscall through hand-written *naked* stubs that capture the full register
+> set into a `TrapFrame` (so a switch saves and restores every register, not just the
+> interrupt frame), and 12c-3 sets IF in the ring 3 frame and has the timer — on a
+> tick that interrupted ring 3 — save the running process's `TrapFrame` and round-robin
+> to the next. Two programs busy-spinning between writes therefore interleave under
+> timer preemption with no `yield` required (the `yield`/`exit` syscalls remain as
+> voluntary switch points). Note: under bootloader 0.9 the kernel, heap, and
+> physical-memory window all live in the *lower* half (present L4 slots all < 256), so a
+> clone copies every present top-level entry, and user programs load into an
+> otherwise-empty slot (64) for private lower-level tables. Remaining for Stage 12: a
+> `wait` syscall (a parent blocking on its child's exit — the immediate next step) and,
+> later, process-creation syscalls so a process can spawn another (today the kernel
+> spawns them all at boot).
 
 | Stage | What to build | OS concepts | Smallest verifiable step |
 |-------|---------------|-------------|--------------------------|
