@@ -235,3 +235,13 @@ fn scheduler_ran_multiple_processes() {
 fn processes_interleaved_via_yield() {
     assert!(crate::process::processes_yielded() >= 4);
 }
+
+/// Stage 12c-3: the timer *preempted* a running user process. The demo programs busy-
+/// spin in ring 3 (no syscall) between writes, long enough that a ~55 ms timer tick
+/// lands mid-spin; the scheduler then switches processes without their cooperation. So
+/// by the time this harness runs, at least one preemption must have happened — proof of
+/// timer-driven scheduling, not just cooperative `yield`.
+#[test_case]
+fn timer_preempted_a_process() {
+    assert!(crate::process::processes_preempted() >= 1);
+}

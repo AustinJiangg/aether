@@ -310,29 +310,41 @@ extern "C" fn timer_dispatch(tf: *mut TrapFrame) {
     let count = TIMER_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     if count == 1 {
         // Prove the naked stub captured a real context: log the interrupted
-        // instruction/stack pointers and a register. (At this point interrupts only
-        // fire in the kernel — ring 3 runs with IF clear until Stage 12c-3 — so this
-        // shows a ring 0 context.)
+        // instruction/stack pointers, the privilege level (CPL = the low 2 bits of the
+        // saved CS — 0 in the kernel, 3 in a user process), and a register.
         // SAFETY: `tf` points at this interrupt's TrapFrame on the kernel stack.
         let f = unsafe { &*tf };
         serial_println!(
-            "[timer] first tick: captured rip={:?} cs={:#x} rsp={:?} rax={:#x}",
+            "[timer] first tick: captured rip={:?} cs={:#x} (CPL {}) rsp={:?} rax={:#x}",
             f.iframe.instruction_pointer,
             f.iframe.code_segment,
+            f.iframe.code_segment & 3,
             f.iframe.stack_pointer,
             f.rax,
         );
     } else if count % 100 == 0 {
         serial_println!("[timer] tick {}", count);
     }
-    // SAFETY: we send the EOI for exactly the vector we are currently servicing.
-    // Signaling the wrong vector could acknowledge an interrupt that never fired.
+    // SAFETY: we send the EOI for exactly the vector we are currently servicing, and
+    // *before* any reschedule — until the PIC is acknowledged it delivers no further
+    // timer IRQ. Signaling the wrong vector could acknowledge an interrupt that never
+    // fired.
     unsafe {
         PICS.lock()
             .notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
     }
-    // Stage 6b's kernel-thread scheduler (dormant) still gets its tick.
-    crate::thread::schedule();
+    // Stage 12c-3: if the tick interrupted a *user* process (ring 3), preempt it and
+    // round-robin to the next one; a tick in ring 0 instead feeds the (dormant)
+    // kernel-thread scheduler, exactly as before. (Syscalls run with IF clear, so a
+    // tick never lands inside one — only in user code or plain kernel code.)
+    // SAFETY: `tf` points at this interrupt's TrapFrame; `on_timer_tick` may rewrite it
+    // (and switch CR3) to resume a different process, which the stub's `iretq` enters.
+    let frame = unsafe { &mut *tf };
+    if frame.iframe.code_segment & 3 == 3 {
+        crate::process::on_timer_tick(frame);
+    } else {
+        crate::thread::schedule();
+    }
 }
 
 /// Handler for the keyboard interrupt (IRQ1, remapped to vector 33).

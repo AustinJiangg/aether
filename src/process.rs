@@ -43,11 +43,19 @@ pub const USER_LOAD_BASE: u64 = 0x2000_0000_0000;
 /// Offset of the entry point within the demo image: ELF header (64) + one program
 /// header (56). The code sits right after the headers.
 const DEMO_ENTRY_OFFSET: usize = 64 + 56;
-/// How many `write`+`yield` rounds the demo program runs before `exit`.
+/// How many `write` + busy-spin + `yield` rounds the demo program runs before `exit`.
 const DEMO_ITERATIONS: usize = 3;
-/// Length of the hand-assembled demo program: each round is a 17-byte `write` plus a
-/// 4-byte `yield`, followed by a 6-byte `exit`.
-const DEMO_CODE_LEN: usize = DEMO_ITERATIONS * (17 + 4) + 6;
+/// Iterations of the ring-3 busy-spin each round performs (a `dec rcx; jnz` loop, see
+/// [`build_looping_program`]). Sized so the spin lasts well over one ~55 ms timer tick
+/// under QEMU, so a tick reliably lands mid-spin and *preempts* the process — proving
+/// timer-driven scheduling, not just cooperative `yield`. Tune if boot drags or no
+/// preemption is observed.
+const DEMO_SPIN: u32 = 50_000_000;
+/// Bytes of machine code per round: a 17-byte `write`, a 12-byte busy-spin, and a
+/// 4-byte `yield` (see [`build_looping_program`]).
+const DEMO_ROUND_LEN: usize = 17 + 12 + 4;
+/// Length of the hand-assembled demo program: the rounds plus a 6-byte `exit`.
+const DEMO_CODE_LEN: usize = DEMO_ITERATIONS * DEMO_ROUND_LEN + 6;
 
 /// Top of the program's user stack (the initial user `rsp`). It sits in the same
 /// private L4 slot as the loaded image, well above the code page; the stack grows
@@ -231,12 +239,19 @@ fn map_segment(
 // --- demo ELF + boot verification ------------------------------------------
 
 /// Hand-assemble a ring 3 program that runs `iterations` rounds of
-/// `write(msg); yield()` and then `exit(0)`, speaking the stack-based syscall ABI
-/// (push args, push number, `int 0x80`). Each `write` reloads its arguments from
-/// immediates, so the program needs no register to survive a `yield` — which is what
-/// lets the cooperative scheduler resume it by restoring only its saved instruction
-/// and stack pointers (no general-purpose registers). The pushes are never popped;
-/// the stack just drifts down a little each round, well within the 16 KiB user stack.
+/// `write(msg); busy_spin(); yield()` and then `exit(0)`, speaking the stack-based
+/// syscall ABI (push args, push number, `int 0x80`).
+///
+/// The busy-spin — `mov rcx, DEMO_SPIN; dec rcx; jnz` — is a ring-3 delay long enough
+/// that a ~55 ms timer tick lands in the middle of it and *preempts* the process
+/// (Stage 12c-3). Crucially `rcx` is live throughout the spin: a correct preemption
+/// must save and restore it (and every other register), so the spin doubles as a check
+/// that the full-register `TrapFrame` switch works — were `rcx` lost, the spin would
+/// mis-count and likely never terminate, hanging boot. Each round also `yield`s, so
+/// the program exercises both cooperative and preemptive switching.
+///
+/// The syscall pushes are never popped; the stack just drifts down a little each round,
+/// well within the 16 KiB user stack.
 fn build_looping_program(msg_ptr: u64, msg_len: u8, iterations: usize) -> Vec<u8> {
     let mut code = Vec::new();
     for _ in 0..iterations {
@@ -247,6 +262,13 @@ fn build_looping_program(msg_ptr: u64, msg_len: u8, iterations: usize) -> Vec<u8
         code.push(0x50); // push rax
         code.extend_from_slice(&[0x6A, crate::syscall::SYS_WRITE as u8]); // push SYS_WRITE
         code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
+        // busy_spin: mov rcx, DEMO_SPIN; spin: dec rcx; jnz spin
+        // A ring-3 delay so a timer tick lands here and preempts us; rcx is live across
+        // that preemption, so the full-register TrapFrame switch must preserve it.
+        code.extend_from_slice(&[0x48, 0xC7, 0xC1]); // mov rcx, imm32 (sign-extended to 64)
+        code.extend_from_slice(&DEMO_SPIN.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0xFF, 0xC9]); // dec rcx
+        code.extend_from_slice(&[0x75, 0xFB]); // jnz -5 -> back to `dec rcx`
         // yield()
         code.extend_from_slice(&[0x6A, crate::syscall::SYS_YIELD as u8]); // push SYS_YIELD
         code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
@@ -407,6 +429,8 @@ static RAN_USER_L4_ADDR: AtomicU64 = AtomicU64::new(0);
 static PROCESSES_EXITED: AtomicU64 = AtomicU64::new(0);
 /// How many times a process has `yield`ed — for the Stage 12b interleaving test.
 static PROCESSES_YIELDED: AtomicU64 = AtomicU64::new(0);
+/// How many times the timer has *preempted* a running user process — Stage 12c-3 test.
+static PROCESSES_PREEMPTED: AtomicU64 = AtomicU64::new(0);
 
 /// A user process: a unique id, its loaded image (address space, entry, stack), and
 /// its saved execution context (`context`) — where, and in what register state, to
@@ -421,10 +445,11 @@ struct Process {
     context: TrapFrame,
 }
 
-/// A minimal cooperative scheduler: a FIFO queue of ready processes plus the one
-/// currently running. Dispatch is driven by the `yield` and `exit` syscalls (see
-/// [`on_user_yield`] / [`on_user_exit`]), not the timer — processes run with
-/// interrupts off and switch only at those voluntary points.
+/// A minimal round-robin scheduler: a FIFO queue of ready processes plus the one
+/// currently running. Dispatch is driven both by the voluntary `yield`/`exit` syscalls
+/// (see [`on_user_yield`] / [`on_user_exit`]) and, since Stage 12c-3, by the timer
+/// preempting a running process ([`on_timer_tick`]) — processes now run with interrupts
+/// *on*, so a switch can happen at any instruction, not only at voluntary points.
 struct Scheduler {
     ready: Vec<Process>,
     current: Option<Process>,
@@ -584,6 +609,48 @@ pub fn on_user_exit(tf: &mut TrapFrame, code: u64) {
     }
 }
 
+/// Called from the timer interrupt when it fires while a *user* process runs in ring 3
+/// — Stage 12c-3 preemption. Saves the running process's full register context,
+/// round-robins it to the back of the ready queue, switches to the next ready process
+/// (its CR3 and full context), and rewrites `tf` so the timer stub's `iretq` resumes
+/// *that* process. Unlike `yield`, the preempted process does not cooperate — it is
+/// switched out wherever the tick happened to strike.
+///
+/// A no-op (the same process simply resumes) when a switch is impossible:
+/// - `try_lock`, never `lock`: at boot `spawn`/`run` briefly hold this lock with
+///   interrupts enabled, so a tick landing then must skip rather than deadlock. (Once a
+///   process actually runs in ring 3 no kernel code holds the lock, so it is free.)
+/// - if `ready` is empty there is only one process, so nothing to switch to.
+pub fn on_timer_tick(tf: &mut TrapFrame) {
+    let mut sched = match SCHEDULER.try_lock() {
+        Some(sched) => sched,
+        None => return,
+    };
+    if sched.current.is_none() || sched.ready.is_empty() {
+        return;
+    }
+
+    PROCESSES_PREEMPTED.fetch_add(1, Ordering::SeqCst);
+
+    // Save the preempted process's full context, then round-robin it to the back.
+    let preempted_id = {
+        let mut current = sched.current.take().expect("current is_some, checked above");
+        current.context = *tf;
+        let id = current.id;
+        sched.ready.push(current);
+        id
+    };
+
+    // `ready` was non-empty and we just pushed onto it, so this is always `Some`.
+    let (next_id, context) = activate_next(&mut sched).expect("ready queue is non-empty");
+    serial_println!(
+        "[sched] preempted process {}; switching to process {}",
+        preempted_id,
+        next_id
+    );
+    *tf = context;
+}
+
 /// Switch CR3 back to the kernel address space saved by [`run`]. Call once, at the
 /// very start of the `resume` continuation, before using kernel-only mappings.
 pub fn return_to_kernel_space() {
@@ -617,4 +684,10 @@ pub fn processes_exited() -> u64 {
 /// How many times a process has `yield`ed since boot. For the Stage 12b test.
 pub fn processes_yielded() -> u64 {
     PROCESSES_YIELDED.load(Ordering::SeqCst)
+}
+
+/// How many times the timer preempted a running user process since boot. For the Stage
+/// 12c-3 test.
+pub fn processes_preempted() -> u64 {
+    PROCESSES_PREEMPTED.load(Ordering::SeqCst)
 }

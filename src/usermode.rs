@@ -84,10 +84,10 @@ pub fn enter(user_entry: VirtAddr, user_stack_top: VirtAddr, resume: fn() -> !) 
     RESUME_RSP.store((kernel_rsp & !0xF) - 8, Ordering::SeqCst);
     RESUME_CS.store(u64::from(gdt::kernel_code_selector().0), Ordering::SeqCst);
 
-    // Disable interrupts so nothing fires between arming the hook and the descent.
-    // Stage 12b runs user processes with IF *cleared* (see `initial_user_frame`), so they
-    // stay uninterrupted until their next syscall; interrupts come back on only when
-    // the kernel finally resumes (in `boot_continue`).
+    // Disable interrupts so none fires on the kernel stack between arming the hook and
+    // the descent. The `iretq` below loads the user frame's RFLAGS, which has IF set
+    // (Stage 12c-3), so interrupts turn back on *atomically* as the CPU enters ring 3
+    // — the first tick then preempts the process, not this half-finished descent.
     interrupts::disable();
     EXPECT_USER_TICK.store(true, Ordering::SeqCst);
 
@@ -103,21 +103,23 @@ pub fn enter(user_entry: VirtAddr, user_stack_top: VirtAddr, resume: fn() -> !) 
     // SAFETY: the frame describes a valid ring 3 context — `user_entry` is a
     // mapped, user-accessible, executable page; `user_stack_top` is the top of a
     // mapped, user-accessible, writable stack; CS/SS are the GDT's RPL 3 selectors;
-    // RFLAGS has IF clear (cooperative). `rsp0` is installed (Stage 9a), so a syscall
-    // taken from ring 3 has a valid kernel stack. `iretq` thus transitions cleanly to
-    // user mode and does not return here. The caller has already switched CR3 to the
-    // address space that maps `user_entry` and `user_stack_top`.
+    // RFLAGS has IF set (Stage 12c-3 preemption). `rsp0` is installed (Stage 9a), so a
+    // timer interrupt or syscall taken from ring 3 switches to a valid kernel stack.
+    // `iretq` thus transitions cleanly to user mode and does not return here. The
+    // caller has already switched CR3 to the address space that maps `user_entry` and
+    // `user_stack_top`.
     unsafe { user_frame.iretq() }
 }
 
 /// Build the ring 3 interrupt-return frame for a freshly-started user program:
 /// entry point, user stack, and the GDT's RPL 3 code/data selectors.
 ///
-/// RFLAGS clears IF: through Stage 12c-2 user processes still run *cooperatively* —
-/// no timer preemption yet — so a process runs uninterrupted until it `yield`s or
-/// `exit`s, and the scheduler switches only at those points. The full-register
-/// `TrapFrame` those switches now save (Stage 12c-2) is the groundwork for Stage
-/// 12c-3, which will set IF here so the timer can preempt a process mid-execution.
+/// RFLAGS sets IF (Stage 12c-3): a user process runs with interrupts *enabled*, so a
+/// timer tick can preempt it mid-execution and the scheduler can switch to another
+/// process without its cooperation (`yield`/`exit` remain voluntary switch points).
+/// Resuming a preempted process correctly relies on the full-register `TrapFrame` that
+/// every switch now saves (Stage 12c-2) — a tick can strike between any two
+/// instructions, with live state in any register.
 pub(crate) fn initial_user_frame(
     entry: VirtAddr,
     stack_top: VirtAddr,
@@ -125,7 +127,7 @@ pub(crate) fn initial_user_frame(
     InterruptStackFrameValue {
         instruction_pointer: entry,
         code_segment: u64::from(gdt::user_code_selector().0),
-        cpu_flags: 0x002, // reserved bit 1 only; IF clear (no interrupts in ring 3)
+        cpu_flags: 0x202, // reserved bit 1 + IF (bit 9): interrupts enabled in ring 3
         stack_pointer: stack_top,
         stack_segment: u64::from(gdt::user_data_selector().0),
     }

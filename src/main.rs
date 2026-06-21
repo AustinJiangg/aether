@@ -364,9 +364,10 @@ fn boot_continue() -> ! {
         syscall::ring3_syscall_count()
     );
     serial_println!(
-        "[sched] {} processes ran with {} yields (last on L4 {:#x}, kernel L4 {:#x}); back on the kernel space",
+        "[sched] {} processes ran with {} yields and {} preemptions (last on L4 {:#x}, kernel L4 {:#x}); back on the kernel space",
         process::processes_exited(),
         process::processes_yielded(),
+        process::processes_preempted(),
         process::last_user_run_l4(),
         process::kernel_l4(),
     );
