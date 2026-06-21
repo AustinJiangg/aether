@@ -64,37 +64,6 @@ pub fn reached_ring3() -> bool {
     REACHED_RING3.load(Ordering::SeqCst)
 }
 
-/// Hand-assemble the ring 3 program `write(msg_ptr, msg_len); exit(0)`.
-///
-/// It speaks the kernel's stack-based syscall ABI (see [`crate::syscall`]): push
-/// the arguments, push the number, `int 0x80`. In machine code:
-///
-/// ```text
-///   push msg_len         6A <len>        ; write: arg2 = len (imm8, so len < 128)
-///   mov  rax, msg_ptr    48 B8 <ptr64>   ;        arg1 = ptr (a 64-bit address
-///   push rax             50              ;        needs mov-then-push)
-///   push 1               6A 01           ;        number = SYS_WRITE
-///   int  0x80            CD 80
-///   push 0               6A 00           ; exit:  arg1 = exit code 0
-///   push 0               6A 00           ;        number = SYS_EXIT
-///   int  0x80            CD 80           ;        never returns to ring 3
-/// ```
-pub(crate) fn build_user_program(msg_ptr: u64, msg_len: usize) -> [u8; 23] {
-    let mut program: [u8; 23] = [
-        0x6A, msg_len as u8, // push msg_len
-        0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, // mov rax, imm64 (msg_ptr, filled below)
-        0x50, // push rax
-        0x6A, crate::syscall::SYS_WRITE as u8, // push SYS_WRITE
-        0xCD, 0x80, // int 0x80
-        0x6A, 0x00, // push exit code 0
-        0x6A, crate::syscall::SYS_EXIT as u8, // push SYS_EXIT
-        0xCD, 0x80, // int 0x80
-    ];
-    // Patch the 8-byte little-endian immediate for `mov rax, msg_ptr`.
-    program[4..12].copy_from_slice(&msg_ptr.to_le_bytes());
-    program
-}
-
 /// Drop to ring 3 at `user_entry`; never returns to the caller.
 ///
 /// We record where to resume the kernel (for [`on_timer_tick`]), then forge a ring
@@ -118,13 +87,13 @@ pub fn enter(user_entry: VirtAddr, user_stack_top: VirtAddr, resume: fn() -> !) 
     RESUME_CS.store(u64::from(gdt::kernel_code_selector().0), Ordering::SeqCst);
 
     // Disable interrupts so nothing fires between arming the hook and the descent.
-    // Stage 12b runs user processes with IF *cleared* (see `ring3_frame`), so they
+    // Stage 12b runs user processes with IF *cleared* (see `initial_user_frame`), so they
     // stay uninterrupted until their next syscall; interrupts come back on only when
     // the kernel finally resumes (in `boot_continue`).
     interrupts::disable();
     EXPECT_USER_TICK.store(true, Ordering::SeqCst);
 
-    let user_frame = ring3_frame(user_entry, user_stack_top);
+    let user_frame = initial_user_frame(user_entry, user_stack_top);
 
     serial_println!(
         "[usermode] entering ring 3 at {:?} (cs={:#x}, ss={:#x})",
@@ -143,14 +112,17 @@ pub fn enter(user_entry: VirtAddr, user_stack_top: VirtAddr, resume: fn() -> !) 
     unsafe { user_frame.iretq() }
 }
 
-/// Build the ring 3 interrupt-return frame for a user program: entry point, user
-/// stack, and the GDT's RPL 3 code/data selectors.
+/// Build the ring 3 interrupt-return frame for a freshly-started user program:
+/// entry point, user stack, and the GDT's RPL 3 code/data selectors.
 ///
 /// RFLAGS clears IF: Stage 12b runs user processes *cooperatively* — no timer
-/// preemption yet — so a process runs uninterrupted until its next syscall, and the
-/// scheduler switches between processes at `exit`. (Stage 12c will set IF and add
-/// preemption, which needs saving a preempted process's full register state.)
-fn ring3_frame(entry: VirtAddr, stack_top: VirtAddr) -> InterruptStackFrameValue {
+/// preemption yet — so a process runs uninterrupted until it `yield`s or `exit`s,
+/// and the scheduler switches processes only at those points. (Stage 12c will set IF
+/// and add preemption, which needs saving a preempted process's full register state.)
+pub(crate) fn initial_user_frame(
+    entry: VirtAddr,
+    stack_top: VirtAddr,
+) -> InterruptStackFrameValue {
     InterruptStackFrameValue {
         instruction_pointer: entry,
         code_segment: u64::from(gdt::user_code_selector().0),
@@ -160,16 +132,23 @@ fn ring3_frame(entry: VirtAddr, stack_top: VirtAddr) -> InterruptStackFrameValue
     }
 }
 
-/// Rewrite an in-flight interrupt's return frame so its `iretq` enters ring 3 at
-/// `entry` on `stack_top`. The scheduler uses this from inside the syscall handler
-/// to switch from a just-exited process to the next one; the caller must already
-/// have switched CR3 to the target's address space.
-pub fn switch_to_user(frame: &mut InterruptStackFrame, entry: VirtAddr, stack_top: VirtAddr) {
-    // SAFETY: `ring3_frame` is a valid ring 3 context (RPL 3 selectors, IF clear, a
-    // mapped user entry and stack in the now-active address space). Overwriting the
-    // return frame makes the handler's `iretq` enter that context instead of
-    // returning to the process that just exited.
-    unsafe { frame.as_mut().write(ring3_frame(entry, stack_top)) };
+/// Read the execution point an in-flight interrupt will return to — a running user
+/// process's context (instruction pointer, stack pointer, flags, selectors). The
+/// scheduler captures this when a process `yield`s, to resume it later.
+pub fn save_frame(frame: &InterruptStackFrame) -> InterruptStackFrameValue {
+    **frame
+}
+
+/// Rewrite an in-flight interrupt's return frame so its `iretq` resumes `target` — a
+/// user process's context. The scheduler uses this from inside the syscall handler
+/// to switch to another process; the caller must already have switched CR3 to that
+/// process's address space.
+pub fn load_frame(frame: &mut InterruptStackFrame, target: InterruptStackFrameValue) {
+    // SAFETY: `target` is a valid ring 3 context (RPL 3 selectors, a mapped entry and
+    // stack in the now-active address space) — either a fresh entry frame from
+    // `initial_user_frame` or one previously captured by `save_frame`. Overwriting
+    // the return frame makes the handler's `iretq` enter it.
+    unsafe { frame.as_mut().write(target) };
 }
 
 /// Leave ring 3: rewrite `frame` so the in-flight interrupt's `iretq` resumes the

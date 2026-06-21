@@ -79,11 +79,14 @@ handler still reaches the kernel because every space maps it), prints via a sysc
 and `exit`s back to the kernel, which switches CR3 back; this replaced the Stage
 9b/10b hand-mapped excursion. **Stage 12b is also done**: a cooperative scheduler in
 `process.rs` — `spawn` queues loaded programs, `run` enters the first in ring 3, and
-the ring 3 `exit` syscall dispatches the next (rewriting the interrupt frame and CR3
-from inside the handler) until none remain, then resumes the kernel. Two
-byte-identical programs print their own message from the same virtual address,
-proving address-space isolation; processes run with interrupts off (cooperative — no
-preemption yet). `ROADMAP.md` now carries the
+the ring 3 `yield`/`exit` syscalls switch processes (rewriting the interrupt frame
+and CR3 from inside the handler). `yield` saves the caller's resume point and
+round-robins to the next; `exit` drops it. Two programs that each run several
+`write`+`yield` rounds therefore interleave their output (#1, #2, #1, #2, ...), and
+being byte-identical yet printing different messages from the same virtual address,
+they also prove address-space isolation. Processes run with interrupts off
+(cooperative — only the instruction/stack pointers are saved, no general-purpose
+registers; timer preemption is Stage 12c). `ROADMAP.md` now carries the
 forward plan (stages 9-18): the
 user-space main line (system calls, per-process address spaces + ELF,
 multiprocessing), plus persistence, APIC/SMP, and networking tracks.
@@ -205,9 +208,10 @@ Exit QEMU: `Ctrl-A` then `X`.
   segments and the TSS `rsp0` stack in `gdt.rs`.)
 - `src/syscall.rs`: Stage 10 system calls — the `int 0x80` handler (its IDT gate's
   DPL is 3 so ring 3 may invoke it), a stack-based argument ABI, and
-  `write`/`getpid`/`exit`. A ring 3 `exit` calls `process::on_user_exit` (which
-  dispatches the next process or resumes the kernel); an `invoke` helper drives the
-  same path from ring 0 (the boot demo and the tests).
+  `write`/`getpid`/`exit`/`yield`. Ring 3 `yield`/`exit` call
+  `process::on_user_yield`/`on_user_exit` (which switch to another process or resume
+  the kernel); an `invoke` helper drives the value-returning calls from ring 0 (the
+  boot demo and the tests).
 - `src/elf.rs`: Stage 11b minimal ELF64 parser — validates the header (x86-64,
   ET_EXEC), bounds-checks the program-header table, and iterates the `PT_LOAD`
   segments. Pure (reads bytes, no page tables), so it is unit-testable on its own.
@@ -215,12 +219,13 @@ Exit QEMU: `Ctrl-A` then `X`.
   (via `elf.rs`), clones the kernel into a fresh `AddressSpace`, maps each `PT_LOAD`
   segment plus a user stack into it (writing through the physical-memory window
   while the space is inactive), and bundles it as a `UserImage`. A cooperative
-  `Scheduler` (a `Mutex`-guarded ready queue) holds processes: `spawn` enqueues,
-  `run` enters the first in ring 3 (saving the kernel CR3 for the return), and
-  `on_user_exit` — called from the `exit` syscall — switches CR3 and rewrites the
-  interrupt frame to the next process, or `resume_kernel`s when none remain.
+  `Scheduler` (a `Mutex`-guarded ready queue) holds `Process`es, each carrying its
+  saved resume frame: `spawn` enqueues, `run` enters the first in ring 3 (saving the
+  kernel CR3 for the return), and `on_user_yield`/`on_user_exit` — called from the
+  `yield`/`exit` syscalls — round-robin to the next process (switching CR3 and
+  rewriting the interrupt frame) or `resume_kernel` when none remain.
   `return_to_kernel_space` switches CR3 back in the resume continuation. The boot
-  demo loads two programs, verifies one, and runs both.
+  demo loads two `write`+`yield` looping programs and runs them interleaved.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

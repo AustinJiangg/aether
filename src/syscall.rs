@@ -31,10 +31,13 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use x86_64::structures::idt::InterruptStackFrame;
 
-/// Syscall numbers. A real kernel would have dozens; we start with three.
+/// Syscall numbers. A real kernel would have dozens; we start with a handful.
 pub const SYS_EXIT: u64 = 0;
 pub const SYS_WRITE: u64 = 1;
 pub const SYS_GETPID: u64 = 2;
+/// `yield()` — voluntarily give up the CPU so the scheduler runs another process
+/// (Stage 12b cooperative multitasking). Meaningful only from ring 3.
+pub const SYS_YIELD: u64 = 3;
 
 /// Count of syscalls that arrived from ring 3 — proof (for the Stage 10b test)
 /// that the user program really crossed into the kernel through `int 0x80`.
@@ -69,10 +72,14 @@ pub extern "x86-interrupt" fn syscall_handler(mut frame: InterruptStackFrame) {
         RING3_SYSCALLS.fetch_add(1, Ordering::SeqCst);
     }
 
-    // `exit` from ring 3 is special: the program is done, so there is no value to
-    // hand back to it. Hand off to the scheduler, which rewrites this interrupt's
-    // return frame to switch to the next ready process (Stage 12b) or, if none
-    // remain, to resume the kernel (Stage 9b's mechanism).
+    // `yield` and `exit` from ring 3 are control transfers, not value-returning
+    // calls: both hand off to the scheduler, which rewrites this interrupt's return
+    // frame to resume a different process (or, for `exit` with none left, the
+    // kernel). `yield` re-queues the caller; `exit` drops it.
+    if number == SYS_YIELD && from_ring3 {
+        crate::process::on_user_yield(&mut frame);
+        return;
+    }
     if number == SYS_EXIT && from_ring3 {
         crate::process::on_user_exit(&mut frame, arg1);
         return;

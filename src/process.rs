@@ -23,7 +23,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use alloc::vec::Vec;
 use spin::Mutex;
 use x86_64::registers::control::{Cr3, Cr3Flags};
-use x86_64::structures::idt::InterruptStackFrame;
+use x86_64::structures::idt::{InterruptStackFrame, InterruptStackFrameValue};
 use x86_64::structures::paging::{
     FrameAllocator, Mapper, OffsetPageTable, Page, PageTableFlags, PhysFrame, Size4KiB, Translate,
 };
@@ -43,8 +43,11 @@ pub const USER_LOAD_BASE: u64 = 0x2000_0000_0000;
 /// Offset of the entry point within the demo image: ELF header (64) + one program
 /// header (56). The code sits right after the headers.
 const DEMO_ENTRY_OFFSET: usize = 64 + 56;
-/// Length of the hand-assembled ring 3 program (`write` then `exit`).
-const DEMO_CODE_LEN: usize = 23;
+/// How many `write`+`yield` rounds the demo program runs before `exit`.
+const DEMO_ITERATIONS: usize = 3;
+/// Length of the hand-assembled demo program: each round is a 17-byte `write` plus a
+/// 4-byte `yield`, followed by a 6-byte `exit`.
+const DEMO_CODE_LEN: usize = DEMO_ITERATIONS * (17 + 4) + 6;
 
 /// Top of the program's user stack (the initial user `rsp`). It sits in the same
 /// private L4 slot as the loaded image, well above the code page; the stack grows
@@ -227,6 +230,34 @@ fn map_segment(
 
 // --- demo ELF + boot verification ------------------------------------------
 
+/// Hand-assemble a ring 3 program that runs `iterations` rounds of
+/// `write(msg); yield()` and then `exit(0)`, speaking the stack-based syscall ABI
+/// (push args, push number, `int 0x80`). Each `write` reloads its arguments from
+/// immediates, so the program needs no register to survive a `yield` — which is what
+/// lets the cooperative scheduler resume it by restoring only its saved instruction
+/// and stack pointers (no general-purpose registers). The pushes are never popped;
+/// the stack just drifts down a little each round, well within the 16 KiB user stack.
+fn build_looping_program(msg_ptr: u64, msg_len: u8, iterations: usize) -> Vec<u8> {
+    let mut code = Vec::new();
+    for _ in 0..iterations {
+        // write(msg_ptr, msg_len)
+        code.extend_from_slice(&[0x6A, msg_len]); // push msg_len
+        code.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 ...
+        code.extend_from_slice(&msg_ptr.to_le_bytes()); // ... = msg_ptr
+        code.push(0x50); // push rax
+        code.extend_from_slice(&[0x6A, crate::syscall::SYS_WRITE as u8]); // push SYS_WRITE
+        code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
+        // yield()
+        code.extend_from_slice(&[0x6A, crate::syscall::SYS_YIELD as u8]); // push SYS_YIELD
+        code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
+    }
+    // exit(0)
+    code.extend_from_slice(&[0x6A, 0x00]); // push exit code 0
+    code.extend_from_slice(&[0x6A, crate::syscall::SYS_EXIT as u8]); // push SYS_EXIT
+    code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
+    code
+}
+
 /// Build a tiny but valid ELF64 executable for the loader to chew on.
 ///
 /// One `PT_LOAD` segment covers the whole file and asks to be loaded at
@@ -241,11 +272,15 @@ fn map_segment(
 ///   [143 ..    )  message string
 /// ```
 pub fn demo_elf(msg: &[u8]) -> Vec<u8> {
-    let msg_offset = DEMO_ENTRY_OFFSET + DEMO_CODE_LEN; // 143
+    let msg_offset = DEMO_ENTRY_OFFSET + DEMO_CODE_LEN;
     let total = msg_offset + msg.len();
 
     // The code references the message at its final virtual address.
-    let code = crate::usermode::build_user_program(USER_LOAD_BASE + msg_offset as u64, msg.len());
+    let code = build_looping_program(
+        USER_LOAD_BASE + msg_offset as u64,
+        msg.len() as u8,
+        DEMO_ITERATIONS,
+    );
 
     let mut v = alloc::vec![0u8; total];
 
@@ -370,18 +405,24 @@ static KERNEL_L4_FLAGS: AtomicU64 = AtomicU64::new(0);
 static RAN_USER_L4_ADDR: AtomicU64 = AtomicU64::new(0);
 /// How many user processes have exited — for the Stage 12b test.
 static PROCESSES_EXITED: AtomicU64 = AtomicU64::new(0);
+/// How many times a process has `yield`ed — for the Stage 12b interleaving test.
+static PROCESSES_YIELDED: AtomicU64 = AtomicU64::new(0);
 
-/// A user process: a unique id plus its loaded image (address space, entry, stack).
-/// Stage 12b runs processes cooperatively to completion; a later stage adds a saved
-/// register context so a process can be preempted and resumed mid-execution.
+/// A user process: a unique id, its loaded image (address space, entry, stack), and
+/// its saved execution context (`frame`) — where to resume it. The context is just
+/// the interrupt frame (instruction/stack pointers, flags, selectors); the demo
+/// programs keep no live state in general-purpose registers across a `yield`, so we
+/// need not save those yet. (Timer preemption in Stage 12c will, via a trap frame.)
 struct Process {
     id: u64,
     image: UserImage,
+    frame: InterruptStackFrameValue,
 }
 
 /// A minimal cooperative scheduler: a FIFO queue of ready processes plus the one
-/// currently running. Dispatch is driven by the `exit` syscall (see [`on_user_exit`]),
-/// not the timer — processes run with interrupts off and yield only by exiting.
+/// currently running. Dispatch is driven by the `yield` and `exit` syscalls (see
+/// [`on_user_yield`] / [`on_user_exit`]), not the timer — processes run with
+/// interrupts off and switch only at those voluntary points.
 struct Scheduler {
     ready: Vec<Process>,
     current: Option<Process>,
@@ -394,12 +435,14 @@ static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler {
     next_id: 1,
 });
 
-/// Add a loaded program to the scheduler's ready queue; returns its process id.
+/// Add a loaded program to the scheduler's ready queue; returns its process id. Its
+/// initial context is an entry frame (start at the program's entry on a fresh stack).
 pub fn spawn(image: UserImage) -> u64 {
     let mut sched = SCHEDULER.lock();
     let id = sched.next_id;
     sched.next_id += 1;
-    sched.ready.push(Process { id, image });
+    let frame = usermode::initial_user_frame(image.entry, image.user_stack_top);
+    sched.ready.push(Process { id, image, frame });
     id
 }
 
@@ -446,47 +489,86 @@ pub fn run(resume: fn() -> !) -> ! {
     }
 }
 
+/// Pop the next ready process, switch CR3 to its address space, make it current, and
+/// return its `(id, saved frame)` so the caller can resume it. `None` if the ready
+/// queue is empty. The caller must hold the scheduler lock.
+fn activate_next(sched: &mut Scheduler) -> Option<(u64, InterruptStackFrameValue)> {
+    if sched.ready.is_empty() {
+        return None;
+    }
+    let next = sched.ready.remove(0);
+    let id = next.id;
+    let frame = next.frame;
+    RAN_USER_L4_ADDR.store(
+        next.image.space.l4_frame().start_address().as_u64(),
+        Ordering::SeqCst,
+    );
+    // SAFETY: the next image clones the kernel, so its space maps the running kernel;
+    // switching CR3 to it from the handler is sound — the rsp0 stack holding the
+    // interrupt frame is mapped identically in every address space.
+    unsafe { next.image.space.activate() };
+    sched.current = Some(next);
+    Some((id, frame))
+}
+
+/// Called by the `yield` syscall: save the running process's resume point, put it
+/// back at the end of the ready queue, and switch to the next one. With two
+/// processes this alternates them, interleaving their output.
+pub fn on_user_yield(frame: &mut InterruptStackFrame) {
+    PROCESSES_YIELDED.fetch_add(1, Ordering::SeqCst);
+
+    let next = {
+        let mut sched = SCHEDULER.lock();
+        let yielded_id = if let Some(mut current) = sched.current.take() {
+            current.frame = usermode::save_frame(frame); // where to resume it later
+            let id = current.id;
+            sched.ready.push(current); // back of the queue (round-robin)
+            id
+        } else {
+            0
+        };
+        let next = activate_next(&mut sched);
+        if let Some((id, _)) = next {
+            serial_println!("[sched] process {} yielded; switching to process {}", yielded_id, id);
+        }
+        next
+    };
+
+    // `next` is always `Some` here (we just re-queued the yielding process), but the
+    // match keeps it total: with nothing to run we simply return to the same frame.
+    if let Some((_, target)) = next {
+        usermode::load_frame(frame, target);
+    }
+}
+
 /// Called by the `exit` syscall when a ring 3 process terminates (see `syscall.rs`).
-/// Drops the finished process and, if another is ready, switches to it — rewriting
-/// the interrupt's return frame and CR3 so the handler's `iretq` enters the next
-/// program. If none remain, resumes the kernel instead.
+/// Drops the finished process and, if another is ready, switches to it; if none
+/// remain, resumes the kernel instead.
 pub fn on_user_exit(frame: &mut InterruptStackFrame, code: u64) {
     PROCESSES_EXITED.fetch_add(1, Ordering::SeqCst);
 
     let next = {
         let mut sched = SCHEDULER.lock();
         let finished_id = sched.current.take().map(|p| p.id).unwrap_or(0);
-        if sched.ready.is_empty() {
-            serial_println!(
-                "[sched] process {} exited (code {}); no more ready, returning to the kernel",
+        let next = activate_next(&mut sched);
+        match next {
+            Some((id, _)) => serial_println!(
+                "[sched] process {} exited (code {}); switching to process {}",
                 finished_id,
                 code,
-            );
-            None
-        } else {
-            let next = sched.ready.remove(0);
-            let entry = next.image.entry;
-            let stack = next.image.user_stack_top;
-            let l4 = next.image.space.l4_frame();
-            RAN_USER_L4_ADDR.store(l4.start_address().as_u64(), Ordering::SeqCst);
-            serial_println!(
-                "[sched] process {} exited (code {}); switching to process {} on L4 {:?}",
+                id,
+            ),
+            None => serial_println!(
+                "[sched] process {} exited (code {}); none left, returning to the kernel",
                 finished_id,
                 code,
-                next.id,
-                l4.start_address(),
-            );
-            // SAFETY: the next image clones the kernel, so its space maps the running
-            // kernel; switching CR3 to it from the handler is sound — the rsp0 stack
-            // holding `frame` is mapped identically in every address space.
-            unsafe { next.image.space.activate() };
-            sched.current = Some(next);
-            Some((entry, stack))
+            ),
         }
+        next
     };
 
     match next {
-        Some((entry, stack)) => usermode::switch_to_user(frame, entry, stack),
+        Some((_, target)) => usermode::load_frame(frame, target),
         None => usermode::resume_kernel(frame),
     }
 }
@@ -519,4 +601,9 @@ pub fn kernel_l4() -> u64 {
 /// How many user processes have exited since boot. For the Stage 12b test.
 pub fn processes_exited() -> u64 {
     PROCESSES_EXITED.load(Ordering::SeqCst)
+}
+
+/// How many times a process has `yield`ed since boot. For the Stage 12b test.
+pub fn processes_yielded() -> u64 {
+    PROCESSES_YIELDED.load(Ordering::SeqCst)
 }

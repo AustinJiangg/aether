@@ -327,10 +327,12 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     );
     println!("ELF loader live; loaded two programs into separate address spaces (serial log).");
 
-    // Stage 12b: spawn both programs and start the cooperative scheduler. It enters
-    // process #1 in ring 3 on its own CR3; when #1 calls `exit`, the syscall handler
-    // dispatches #2; when #2 exits, the kernel resumes at `boot_continue` (which
-    // switches CR3 back to the kernel space). `run` never returns here.
+    // Stage 12b: spawn both programs and start the cooperative scheduler. Each demo
+    // program runs several rounds of `write` then `yield`; on each `yield` the
+    // scheduler saves the caller's resume point and switches to the other process, so
+    // their output interleaves (#1, #2, #1, #2, ...). When a program finishes its
+    // rounds it `exit`s; once both have exited, the kernel resumes at `boot_continue`
+    // (which switches CR3 back to the kernel space). `run` never returns here.
     let p1 = process::spawn(img1);
     let p2 = process::spawn(img2);
     serial_println!("[sched] spawned processes {} and {}", p1, p2);
@@ -362,8 +364,9 @@ fn boot_continue() -> ! {
         syscall::ring3_syscall_count()
     );
     serial_println!(
-        "[sched] {} user process(es) ran (last on L4 {:#x}, kernel L4 {:#x}); back on the kernel space",
+        "[sched] {} processes ran with {} yields (last on L4 {:#x}, kernel L4 {:#x}); back on the kernel space",
         process::processes_exited(),
+        process::processes_yielded(),
         process::last_user_run_l4(),
         process::kernel_l4(),
     );

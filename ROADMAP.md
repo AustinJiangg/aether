@@ -51,11 +51,14 @@ unify later.
 > 12a runs one loaded program in ring 3 on its own CR3 (the `int 0x80` handler still
 > reaches the kernel because every space maps it). Stage 12b adds a cooperative
 > scheduler (`process.rs`): `spawn` queues loaded programs, `run` enters the first in
-> ring 3, and the `exit` syscall dispatches the next — rewriting the interrupt frame
-> and switching CR3 from inside the handler — until none remain, then resumes the
-> kernel. Two byte-identical programs each print their own message from the same
-> virtual address, proving the address spaces are isolated. Processes run with
-> interrupts off (purely cooperative). Note: under bootloader 0.9 the kernel, heap,
+> ring 3, and the `yield`/`exit` syscalls switch processes — rewriting the interrupt
+> frame and CR3 from inside the handler. `yield` saves the caller's resume point and
+> round-robins to the next; `exit` drops it. Two programs that each run several
+> `write`+`yield` rounds therefore *interleave* their output (#1, #2, #1, #2, ...),
+> and being byte-identical yet printing different messages from the same virtual
+> address, they also prove address-space isolation. Processes run with interrupts off
+> (purely cooperative — saving only each one's instruction/stack pointers, no
+> general-purpose registers). Note: under bootloader 0.9 the kernel, heap,
 > and physical-memory window all live in the *lower* half (present L4 slots all <
 > 256), so a clone copies every present top-level entry, and user programs load into
 > an otherwise-empty slot (64) for private lower-level tables. Stage 12c (set IF and

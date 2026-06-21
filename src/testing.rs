@@ -227,3 +227,11 @@ fn elf_ran_in_its_own_address_space() {
 fn scheduler_ran_multiple_processes() {
     assert!(crate::process::processes_exited() >= 2);
 }
+
+/// Stage 12b: the two demo programs interleaved through the cooperative `yield`
+/// syscall — each runs several `write`+`yield` rounds before exiting, so by the time
+/// this harness runs the scheduler must have handled several yields.
+#[test_case]
+fn processes_interleaved_via_yield() {
+    assert!(crate::process::processes_yielded() >= 4);
+}
