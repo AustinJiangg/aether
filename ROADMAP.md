@@ -43,9 +43,9 @@ unify later.
 
 ### Main line: the road to user space
 
-> **Status:** Stages 9-11 are complete; Stage 12 is complete (12a-12c plus a `wait`
-> syscall). Process-creation syscalls (so a process can spawn another, rather than the
-> kernel spawning them all at boot) are a later step. Stage 9 reaches
+> **Status:** Stages 9-11 are complete; Stage 12 is complete (12a-12c, a `wait` syscall,
+> and 12d a `spawn` syscall — a process can now create another at runtime, rather than the
+> kernel spawning them all at boot). Stage 9 reaches
 > ring 3 (`gdt.rs`, `usermode.rs`); Stage 10 adds `int 0x80` system calls
 > (`syscall.rs`); Stage 11a adds an `AddressSpace` (`memory.rs`) that clones the
 > kernel L4 and switches CR3; Stage 11b adds an ELF64 parser (`elf.rs`) and loader
@@ -72,9 +72,12 @@ unify later.
 > otherwise-empty slot (64) for private lower-level tables. Stage 12 also adds `wait`: a
 > parent blocks until its child exits and collects the child's exit code (returned in
 > rax — the kernel often wakes the parent from the child's exit running in a *different*
-> address space, where only the saved register, not the user stack, is reachable). Still
-> later: process-creation syscalls so a process can spawn another (today the kernel
-> spawns them all at boot).
+> address space, where only the saved register, not the user stack, is reachable). Stage
+> 12d then adds `spawn` (`SYS_SPAWN`): a ring 3 process loads a kernel-known program into a
+> fresh address space and enqueues it as its child, returning the new pid — so the wait
+> demo's parent now creates its own child at runtime instead of the kernel pre-spawning it.
+> This needed a globally reachable kernel frame allocator (`memory.rs`), since the loader
+> runs inside the syscall trap handler, far from `kernel_main`'s locals.
 
 | Stage | What to build | OS concepts | Smallest verifiable step |
 |-------|---------------|-------------|--------------------------|

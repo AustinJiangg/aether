@@ -95,9 +95,13 @@ programs busy-spinning between writes interleave with no `yield` required (the
 `yield`/`exit` syscalls remain as voluntary switch points). Stage 12 also adds `wait`:
 a parent blocks until its child exits and collects the child's exit code (delivered in
 rax, since the kernel often wakes the parent from the child's exit in a *different*
-address space where the parent's user stack is unreachable). A later step is
-process-creation syscalls so a process can spawn another (today the kernel spawns them
-all at boot). `ROADMAP.md` carries the forward plan (stages 9-18): the
+address space where the parent's user stack is unreachable). **Stage 12d is also done**:
+process-creation syscalls — a ring 3 process calls `spawn` (`SYS_SPAWN`) to load a
+kernel-known program into a fresh address space and enqueue it as its child (returning the
+new pid), so the wait demo's parent now creates its own child at runtime instead of the
+kernel pre-spawning it. This needed a globally reachable kernel frame allocator
+(`memory.rs`), since the ELF load runs inside the syscall handler, far from `kernel_main`'s
+locals. `ROADMAP.md` carries the forward plan (stages 9-18): the
 user-space main line (system calls, per-process address spaces + ELF,
 multiprocessing), plus persistence, APIC/SMP, and networking tracks.
 
@@ -186,7 +190,10 @@ Exit QEMU: `Ctrl-A` then `X`.
   map and a helper that creates new page mappings. Stage 11a also adds an
   `AddressSpace` (a process's L4) that clones the kernel's present top-level
   entries into a fresh frame, hands out an `OffsetPageTable` over it (to map an
-  inactive space), and switches CR3 onto it and back.
+  inactive space), and switches CR3 onto it and back. Stage 12d adds a globally
+  reachable kernel frame allocator + physical-memory offset
+  (`install_kernel_allocator`/`with_kernel_frame_allocator`), so the `spawn` syscall can
+  load an ELF from inside the trap handler (which cannot borrow `kernel_main`'s locals).
 - `src/allocator.rs`: the kernel heap — maps a fixed virtual range to frames and
   registers a `#[global_allocator]` (a hand-written fixed-size block allocator
   over a linked-list fallback), so the `alloc` crate's `Box`/`Vec`/`Rc`/`String`
@@ -221,7 +228,9 @@ Exit QEMU: `Ctrl-A` then `X`.
   helpers are gone. (Stage 9a added the ring 3 GDT segments and the TSS `rsp0` stack in
   `gdt.rs`.)
 - `src/syscall.rs`: Stage 10 system calls over `int 0x80` (its IDT gate's DPL is 3 so
-  ring 3 may invoke it) with a stack-based argument ABI: `write`/`getpid`/`exit`/`yield`.
+  ring 3 may invoke it) with a stack-based argument ABI:
+  `write`/`getpid`/`exit`/`yield`/`wait`/`spawn` (Stage 12d's `spawn` creates a child
+  process from a kernel-known program and returns its pid).
   Since Stage 12c-2 the entry is a hand-written *naked* stub (`syscall_entry`) that
   builds a full `TrapFrame` and calls `syscall_dispatch`, mirroring the timer — so the
   general-purpose registers survive a context switch. Ring 3 `yield`/`exit` call
@@ -243,9 +252,12 @@ Exit QEMU: `Ctrl-A` then `X`.
   when none remain. Stage 12's `wait` (`on_user_wait`) blocks a parent (into a `blocked`
   list) until a child exits, when `on_user_exit` wakes it with the child's code in rax
   (or leaves a `Zombie` if the parent has not waited yet). `return_to_kernel_space`
-  switches CR3 back in the resume continuation. The boot demo runs two
-  `write`+busy-spin+`yield` workers interleaved under preemption, plus a parent that
-  `wait`s for a child.
+  switches CR3 back in the resume continuation. Stage 12d adds `spawn` (`on_user_spawn`):
+  a ring 3 process loads a kernel-known program (`program_elf`) into a fresh space and
+  enqueues it as its child, returning the new pid — loading against the kernel CR3 (not
+  the caller's populated space) and restoring the caller's CR3 before returning. The boot
+  demo runs two `write`+busy-spin+`yield` workers interleaved under preemption, plus a
+  parent that `spawn`s its own child via `SYS_SPAWN` and `wait`s for it.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run
