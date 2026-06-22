@@ -51,6 +51,10 @@ pub const SYS_YIELD: u64 = 3;
 /// Meaningful only from ring 3; unlike the others it returns its result in `rax` (see
 /// [`crate::process::on_user_wait`]).
 pub const SYS_WAIT: u64 = 4;
+/// `spawn(prog_id)` — create a new child process from a kernel-known program and return
+/// its pid (Stage 12d). Meaningful only from ring 3; returns the pid via the stack ABI
+/// (like `getpid`), and does not switch processes — the caller keeps running.
+pub const SYS_SPAWN: u64 = 5;
 
 /// Count of syscalls that arrived from ring 3 — proof (for the Stage 10b test)
 /// that the user program really crossed into the kernel through `int 0x80`.
@@ -162,6 +166,17 @@ extern "C" fn syscall_dispatch(tf_ptr: *mut TrapFrame) {
     if number == SYS_WAIT && from_ring3 {
         // `wait` blocks/returns its result in rax (set by on_user_wait), not the stack.
         crate::process::on_user_wait(tf);
+        return;
+    }
+    if number == SYS_SPAWN && from_ring3 {
+        // `spawn` creates a child and returns its pid via the stack ABI (like the
+        // value-returning calls below), but it must reach the scheduler for the caller's
+        // id, so it is handled here rather than in `dispatch`. It does *not* switch
+        // processes — the caller resumes right after, with the new pid.
+        let pid = crate::process::on_user_spawn(arg1);
+        // SAFETY: `args` is the caller's stack top (the number slot), shown writable
+        // above — the same slot the other value-returning syscalls write.
+        unsafe { args.write(pid) };
         return;
     }
 

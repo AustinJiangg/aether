@@ -255,3 +255,16 @@ fn parent_waited_for_child() {
     assert!(crate::process::processes_waited() >= 1);
     assert_eq!(crate::process::last_waited_code(), 42); // == CHILD_EXIT_CODE
 }
+
+/// Stage 12d: a user process created another process at runtime via the `spawn` syscall.
+/// The boot demo's parent runs in ring 3 and calls `spawn(PROG_CHILD)` to create its own
+/// child — the kernel no longer spawns the child directly — then `wait`s for it. So by
+/// the time this harness runs, at least one process must have been spawned from ring 3,
+/// and the parent must still have collected the runtime-created child's exit code (42),
+/// proving the spawned child is a real, waitable process.
+#[test_case]
+fn process_spawned_via_syscall() {
+    assert!(crate::process::processes_spawned() >= 1);
+    assert!(crate::process::processes_waited() >= 1);
+    assert_eq!(crate::process::last_waited_code(), 42);
+}

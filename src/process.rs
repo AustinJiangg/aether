@@ -62,8 +62,9 @@ const DEMO_CODE_LEN: usize = DEMO_ITERATIONS * DEMO_ROUND_LEN + 6;
 const CHILD_EXIT_CODE: u8 = 42;
 /// Length of the wait-demo child's code: a 17-byte `write` + a 6-byte `exit`.
 const CHILD_CODE_LEN: usize = 17 + 6;
-/// Length of the wait-demo parent's code: `write` + `wait` (4 B) + `write` + `exit`.
-const PARENT_CODE_LEN: usize = 17 + 4 + 17 + 6;
+/// Length of the wait-demo parent's code (Stage 12d): `write` + `spawn` (6 B) +
+/// `wait` (4 B) + `write` + `exit`. The parent now creates its own child via `spawn`.
+const PARENT_CODE_LEN: usize = 17 + 6 + 4 + 17 + 6;
 
 /// Top of the program's user stack (the initial user `rsp`). It sits in the same
 /// private L4 slot as the loaded image, well above the code page; the stack grows
@@ -278,6 +279,16 @@ fn emit_exit(code: &mut Vec<u8>, exit_code: u8) {
     code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
 }
 
+/// `spawn(prog_id)` — 6 bytes (Stage 12d): push the program id, push `SYS_SPAWN`, then
+/// `int 0x80`. The kernel loads that program into a fresh process and writes the new
+/// child's pid over the number slot; the demo parent ignores the pid (its `wait()` reaps
+/// whichever child exits). Like the other emitters it never pops.
+fn emit_spawn(code: &mut Vec<u8>, prog_id: u8) {
+    code.extend_from_slice(&[0x6A, prog_id]); // push prog_id
+    code.extend_from_slice(&[0x6A, crate::syscall::SYS_SPAWN as u8]); // push SYS_SPAWN
+    code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
+}
+
 /// A busy-spin of `count` iterations — `mov rcx, count; dec rcx; jnz` (12 bytes). A
 /// ring-3 delay long enough that a ~55 ms timer tick lands mid-spin and *preempts* the
 /// process (Stage 12c-3). `rcx` is live throughout, so a correct preemption must save
@@ -316,13 +327,16 @@ fn build_child(msg_ptr: u64, msg_len: u8) -> Vec<u8> {
     code
 }
 
-/// Hand-assemble the Stage 12 wait-demo *parent*: `write(msg); wait(); write(msg);
-/// exit(0)`. Writing the same message before and after `wait()` makes the two lines
-/// bracket the child's output — visibly proving the parent blocked, then resumed once
-/// the child exited. Produces exactly [`PARENT_CODE_LEN`] bytes.
+/// Hand-assemble the wait-demo *parent*, extended for Stage 12d: `write(msg);
+/// spawn(PROG_CHILD); wait(); write(msg); exit(0)`. The parent now creates its own child
+/// at runtime through the `spawn` syscall — the kernel only spawns the parent. Writing the
+/// same message before the spawn and after the wait makes the two lines bracket the
+/// child's output, visibly proving the parent ran, created and blocked on the child, then
+/// resumed once the child exited. Produces exactly [`PARENT_CODE_LEN`] bytes.
 fn build_parent(msg_ptr: u64, msg_len: u8) -> Vec<u8> {
     let mut code = Vec::new();
     emit_write(&mut code, msg_ptr, msg_len);
+    emit_spawn(&mut code, PROG_CHILD as u8);
     emit_syscall0(&mut code, crate::syscall::SYS_WAIT as u8);
     emit_write(&mut code, msg_ptr, msg_len);
     emit_exit(&mut code, 0);
@@ -407,28 +421,38 @@ fn parent_elf() -> Vec<u8> {
     build_elf(&code, msg)
 }
 
-/// Stage 12 boot demo for `wait`: load and spawn a parent that `wait`s for its child.
-/// The child `write`s then `exit`s with [`CHILD_EXIT_CODE`]; the parent blocks in
-/// `wait` until then and collects the code (recorded for the test). Returns the two
-/// process ids. Spawned alongside the Stage 12c interleaving workers, so all run
-/// together under the scheduler — the wait logic matches a parent to *its* child by id,
-/// regardless of the other unrelated processes.
+/// Programs the kernel can create on a `spawn` syscall (Stage 12d), addressed by the
+/// small integer a ring 3 caller passes in. Today there is just one: the wait-demo child,
+/// which writes a line and exits with [`CHILD_EXIT_CODE`] — the very program the kernel
+/// used to spawn directly, now created on demand by its parent.
+pub const PROG_CHILD: u64 = 0;
+
+/// Build the ELF bytes for a spawnable program id, or `None` if the id is unknown.
+fn program_elf(prog_id: u64) -> Option<Vec<u8>> {
+    match prog_id {
+        PROG_CHILD => Some(child_elf()),
+        _ => None,
+    }
+}
+
+/// Boot demo for `wait` + `spawn` (Stage 12/12d): load and spawn only the *parent*. The
+/// parent, running in ring 3, then creates its own child at runtime via the `spawn`
+/// syscall ([`on_user_spawn`]) and `wait`s for it; the child `write`s and `exit`s with
+/// [`CHILD_EXIT_CODE`], which the parent collects (recorded for the tests). Spawned
+/// alongside the Stage 12c interleaving workers, so everything runs together under the
+/// scheduler. Returns the parent's process id.
 pub fn spawn_wait_demo(
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
     physical_memory_offset: VirtAddr,
-) -> (u64, u64) {
+) -> u64 {
     let parent_img = load(&parent_elf(), frame_allocator, physical_memory_offset)
         .expect("failed to load the wait-demo parent");
-    let child_img = load(&child_elf(), frame_allocator, physical_memory_offset)
-        .expect("failed to load the wait-demo child");
     let parent_id = spawn(parent_img, None);
-    let child_id = spawn(child_img, Some(parent_id));
     serial_println!(
-        "[sched] wait-demo: spawned parent {} and its child {}",
-        parent_id,
-        child_id
+        "[sched] wait-demo: spawned parent {} (it will spawn its own child via syscall)",
+        parent_id
     );
-    (parent_id, child_id)
+    parent_id
 }
 
 /// Set once the boot demo has loaded the demo ELF into a fresh space and verified
@@ -528,6 +552,8 @@ static PROCESSES_PREEMPTED: AtomicU64 = AtomicU64::new(0);
 static PROCESSES_WAITED: AtomicU64 = AtomicU64::new(0);
 /// Exit code the most recent `wait` returned (`u64::MAX` = none yet) — Stage 12 test.
 static LAST_WAITED_CODE: AtomicU64 = AtomicU64::new(u64::MAX);
+/// How many child processes ring 3 created via the `spawn` syscall — Stage 12d test.
+static PROCESSES_SPAWNED: AtomicU64 = AtomicU64::new(0);
 
 /// A user process: a unique id, its loaded image (address space, entry, stack), its
 /// saved execution context (`context`), and its `parent`. As of Stage 12c-2 the context
@@ -811,6 +837,68 @@ pub fn on_user_wait(tf: &mut TrapFrame) {
     }
 }
 
+/// Called by the `spawn` syscall (ring 3, Stage 12d): create a new child process from the
+/// kernel-known program `prog_id`, enqueue it as a child of the caller, and return the
+/// child's process id (`u64::MAX` on error: unknown program, no current process, or a
+/// load failure). Unlike `yield`/`exit`/`wait`, `spawn` does not switch processes — the
+/// caller resumes right after with the new pid.
+///
+/// The subtle part is *which* address space the loader clones. [`load`] calls
+/// [`AddressSpace::new_cloning_kernel`], which clones whatever CR3 points at — but here
+/// that is the *caller's* space, whose user slot is already populated. Cloning it would
+/// make the child share (then clobber) the parent's user page tables, and remapping the
+/// same `USER_LOAD_BASE` would fail. So we switch to the pure kernel space (user slot
+/// empty, exactly as at boot) for the load, then switch back so the syscall's `iretq`
+/// returns into the caller.
+pub fn on_user_spawn(prog_id: u64) -> u64 {
+    // The caller (parent) is the current process. A syscall runs with interrupts off, so
+    // `current` cannot change under us between here and the `spawn` below.
+    let parent_id = {
+        let sched = SCHEDULER.lock();
+        match &sched.current {
+            Some(p) => p.id,
+            None => return u64::MAX,
+        }
+    };
+
+    let elf = match program_elf(prog_id) {
+        Some(bytes) => bytes,
+        None => {
+            serial_println!("[sched] spawn: unknown program id {}", prog_id);
+            return u64::MAX;
+        }
+    };
+
+    // Load into a fresh space against the *kernel* CR3 (see the doc comment), then restore
+    // the caller's CR3.
+    let parent_cr3 = Cr3::read();
+    return_to_kernel_space();
+    let offset = memory::physical_memory_offset();
+    let loaded = memory::with_kernel_frame_allocator(|fa| load(&elf, fa, offset));
+    // SAFETY: `parent_cr3` was active a moment ago and maps the running kernel (it is a
+    // kernel clone), so restoring it is sound; it must be active when the syscall returns
+    // to the caller in ring 3.
+    unsafe { memory::restore_address_space(parent_cr3) };
+
+    let image = match loaded {
+        Ok(img) => img,
+        Err(_) => {
+            serial_println!("[sched] spawn: failed to load program {}", prog_id);
+            return u64::MAX;
+        }
+    };
+
+    let child_id = spawn(image, Some(parent_id));
+    PROCESSES_SPAWNED.fetch_add(1, Ordering::SeqCst);
+    serial_println!(
+        "[sched] process {} spawned child {} (program {})",
+        parent_id,
+        child_id,
+        prog_id
+    );
+    child_id
+}
+
 /// Called from the timer interrupt when it fires while a *user* process runs in ring 3
 /// — Stage 12c-3 preemption. Saves the running process's full register context,
 /// round-robins it to the back of the ready queue, switches to the next ready process
@@ -903,4 +991,10 @@ pub fn processes_waited() -> u64 {
 /// Stage 12 test.
 pub fn last_waited_code() -> u64 {
     LAST_WAITED_CODE.load(Ordering::SeqCst)
+}
+
+/// How many child processes have been created via the `spawn` syscall. For the Stage 12d
+/// test.
+pub fn processes_spawned() -> u64 {
+    PROCESSES_SPAWNED.load(Ordering::SeqCst)
 }

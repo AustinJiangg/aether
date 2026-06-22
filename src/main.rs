@@ -332,13 +332,19 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // and they also `yield`, so their output interleaves (#1, #2, #1, #2, ...).
     let p1 = process::spawn(img1, None);
     let p2 = process::spawn(img2, None);
-    // Stage 12: also spawn a parent that blocks in `wait()` until its child exits. All
-    // four processes run together; the parent collects the child's exit code on wakeup.
-    let (parent, child) = process::spawn_wait_demo(&mut frame_allocator, phys_mem_offset);
+    // Stage 12/12d: also spawn a parent that blocks in `wait()`. Unlike before, the kernel
+    // spawns *only* the parent; the parent itself creates its child at runtime via the
+    // `spawn` syscall, then collects its exit code on wakeup. All run together.
+    let parent = process::spawn_wait_demo(&mut frame_allocator, phys_mem_offset);
     serial_println!(
-        "[sched] spawned workers {} and {}, wait-demo parent {} + child {}",
-        p1, p2, parent, child
+        "[sched] spawned workers {} and {}, wait-demo parent {} (spawns its own child)",
+        p1, p2, parent
     );
+    // Stage 12d: hand the frame allocator + physical-memory offset to the kernel globals
+    // so the `spawn` syscall can load an ELF at runtime from inside the trap handler
+    // (which cannot borrow these locals). This *moves* `frame_allocator`; nothing below
+    // uses it again. Must happen before any user process runs.
+    memory::install_kernel_allocator(frame_allocator, phys_mem_offset);
     // When the last process exits, the kernel resumes at `boot_continue` (which switches
     // CR3 back to the kernel space). `run` never returns here.
     process::run(boot_continue);
@@ -380,6 +386,10 @@ fn boot_continue() -> ! {
         "[sched] wait: {} parent(s) collected a child, last child exit code = {}",
         process::processes_waited(),
         process::last_waited_code(),
+    );
+    serial_println!(
+        "[sched] spawn: {} child process(es) created at runtime via the spawn syscall",
+        process::processes_spawned(),
     );
     println!("Back from running user processes; continuing boot.");
 

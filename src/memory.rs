@@ -24,9 +24,10 @@
 //! to translate addresses. Creating *new* mappings additionally needs a supply of
 //! free physical frames (a frame allocator), which is the next sub-stage (4b).
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bootloader::bootinfo::{MemoryMap, MemoryRegionType};
+use spin::Mutex;
 use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::structures::paging::{
     FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB,
@@ -142,6 +143,51 @@ unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
         self.next += 1;
         frame
     }
+}
+
+// ---------------------------------------------------------------------------
+// A globally reachable kernel frame allocator (Stage 12d).
+// ---------------------------------------------------------------------------
+//
+// Until now the frame allocator and the physical-memory offset were locals in
+// `kernel_main`, threaded by reference into the boot-time setup. That is fine while
+// only boot code allocates frames. The `spawn` syscall changes that: a *user* program
+// asks the kernel to load another program at runtime, so the ELF loader must allocate
+// frames from deep inside a trap handler — code that has no way to borrow `kernel_main`'s
+// locals. So we stash the frame allocator and the offset in globals, installed once at
+// the end of boot (after the boot-time allocations, before the first user process runs).
+// A syscall runs with interrupts disabled, so nothing can preempt it to contend this
+// lock; the lock just makes the global safe to express in Rust.
+
+/// The kernel's frame allocator, once [`install_kernel_allocator`] has moved it here.
+static KERNEL_FRAME_ALLOCATOR: Mutex<Option<BootInfoFrameAllocator>> = Mutex::new(None);
+
+/// The physical-memory-window base (`BootInfo::physical_memory_offset`), stored so trap
+/// handlers can reach it alongside the frame allocator. Zero until installed.
+static PHYSICAL_MEMORY_OFFSET: AtomicU64 = AtomicU64::new(0);
+
+/// Move the frame allocator and physical-memory offset into the globals above, so trap
+/// handlers (notably the `spawn` syscall's ELF load) can allocate frames. Call once,
+/// after the boot-time frame allocations and before entering the first user process.
+pub fn install_kernel_allocator(
+    frame_allocator: BootInfoFrameAllocator,
+    physical_memory_offset: VirtAddr,
+) {
+    *KERNEL_FRAME_ALLOCATOR.lock() = Some(frame_allocator);
+    PHYSICAL_MEMORY_OFFSET.store(physical_memory_offset.as_u64(), Ordering::SeqCst);
+}
+
+/// The physical-memory-window base recorded by [`install_kernel_allocator`].
+pub fn physical_memory_offset() -> VirtAddr {
+    VirtAddr::new(PHYSICAL_MEMORY_OFFSET.load(Ordering::SeqCst))
+}
+
+/// Run `f` with exclusive access to the kernel frame allocator installed by
+/// [`install_kernel_allocator`]. Panics if no allocator has been installed yet.
+pub fn with_kernel_frame_allocator<R>(f: impl FnOnce(&mut BootInfoFrameAllocator) -> R) -> R {
+    let mut guard = KERNEL_FRAME_ALLOCATOR.lock();
+    let allocator = guard.as_mut().expect("kernel frame allocator not installed");
+    f(allocator)
 }
 
 /// Map `page` onto the VGA text-buffer frame (physical `0xb8000`), creating any
