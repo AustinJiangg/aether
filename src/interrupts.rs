@@ -29,8 +29,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use pic8259::ChainedPics;
 use spin::{Lazy, Mutex};
 use x86_64::instructions::port::Port;
+use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::{
-    InterruptDescriptorTable, InterruptStackFrame, InterruptStackFrameValue,
+    InterruptDescriptorTable, InterruptStackFrame, InterruptStackFrameValue, PageFaultErrorCode,
 };
 use x86_64::{PrivilegeLevel, VirtAddr};
 
@@ -66,6 +67,14 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
         idt[InterruptIndex::Timer.as_usize()]
             .set_handler_addr(VirtAddr::from_ptr(timer_interrupt_entry as *const ()));
     }
+    // Page fault (#PF, vector 14) and general protection fault (#GP, vector 13). Without
+    // these, any stray memory access or protection violation has no handler to dispatch,
+    // so it escalates straight to a double fault — losing the one detail that explains it
+    // (the faulting address in CR2, or the #GP error code). Registering them turns a
+    // mysterious reboot/halt into a precise diagnostic.
+    idt.page_fault.set_handler_fn(page_fault_handler);
+    idt.general_protection_fault
+        .set_handler_fn(general_protection_fault_handler);
     idt[InterruptIndex::Keyboard.as_usize()].set_handler_fn(keyboard_interrupt_handler);
     // Stage 10: the syscall vector. Setting the gate's DPL to 3 is what lets ring 3
     // execute `int 0x80` (a gate's DPL is the highest-numbered ring allowed to
@@ -181,6 +190,44 @@ extern "x86-interrupt" fn double_fault_handler(
 ) -> ! {
     serial_println!("[EXCEPTION] DOUBLE FAULT\n{:#?}", stack_frame);
     println!("[EXCEPTION] DOUBLE FAULT - halting");
+    hlt_loop();
+}
+
+/// Handler for the page fault (#PF, vector 14).
+///
+/// The CPU pushes an error code describing the access, and stashes the faulting *linear
+/// address* in the CR2 register. We log both (plus the saved instruction pointer) and
+/// halt — enough to pin down a bad pointer or an unmapped access, which previously would
+/// have escalated to an unhelpful double fault.
+extern "x86-interrupt" fn page_fault_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: PageFaultErrorCode,
+) {
+    serial_println!("[EXCEPTION] PAGE FAULT");
+    // SAFETY: reading CR2 is a plain register read with no side effects; it holds the
+    // address whose access raised this fault.
+    serial_println!("  accessed address (CR2): {:?}", Cr2::read());
+    serial_println!("  error code: {:?}", error_code);
+    serial_println!("{:#?}", stack_frame);
+    println!("[EXCEPTION] PAGE FAULT - halting (see serial log)");
+    hlt_loop();
+}
+
+/// Handler for the general protection fault (#GP, vector 13).
+///
+/// Raised by a protection violation — a bad segment selector, a disallowed privileged
+/// instruction, a non-canonical address, and so on. The error code is the offending
+/// selector (or 0). We log it and halt rather than escalate to a double fault.
+extern "x86-interrupt" fn general_protection_fault_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: u64,
+) {
+    serial_println!(
+        "[EXCEPTION] GENERAL PROTECTION FAULT (error code {:#x})",
+        error_code
+    );
+    serial_println!("{:#?}", stack_frame);
+    println!("[EXCEPTION] GP FAULT - halting (see serial log)");
     hlt_loop();
 }
 
