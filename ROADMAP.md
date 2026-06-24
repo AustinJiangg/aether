@@ -88,6 +88,14 @@ unify later.
 
 ### Parallel tracks (any order, after the main line)
 
+> **Status:** Stage 13a is done — a polled **ATA PIO** driver (`ata.rs`) reads raw 512-byte
+> sectors from the primary IDE master, verified at boot and in a test against the boot
+> disk's MBR signature (`0x55 0xAA`). The drive runs with interrupts disabled (nIEN): the
+> kernel polls and registers no ATA IRQ handler, so an unhandled IRQ14 would otherwise
+> cascade (vector 46 → not-present gate → #NP → double fault). This work also added
+> page-fault and general-protection-fault handlers (`interrupts.rs`). Stage 13b — sector
+> *writes*, against a separate scratch disk so the boot image is never corrupted — is next.
+
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|
 | **13** | Persistence | Block device driver: ATA PIO read/write of raw sectors from a QEMU disk image | device I/O, polling |

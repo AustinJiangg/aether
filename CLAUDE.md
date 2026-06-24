@@ -101,8 +101,13 @@ kernel-known program into a fresh address space and enqueue it as its child (ret
 new pid), so the wait demo's parent now creates its own child at runtime instead of the
 kernel pre-spawning it. This needed a globally reachable kernel frame allocator
 (`memory.rs`), since the ELF load runs inside the syscall handler, far from `kernel_main`'s
-locals. `ROADMAP.md` carries the forward plan (stages 9-18): the
-user-space main line (system calls, per-process address spaces + ELF,
+locals. **Stage 13a (persistence track) is also done**: a polled ATA PIO disk driver
+(`ata.rs`) reads raw 512-byte sectors from the primary IDE master, verified at boot and in
+a test against the boot disk's MBR signature; it runs the drive with interrupts disabled
+(nIEN), since the kernel polls and registers no ATA IRQ handler (an unhandled IRQ14 would
+otherwise cascade into a double fault). That work also added page-fault and
+general-protection-fault handlers (`interrupts.rs`). `ROADMAP.md` carries the forward plan
+(stages 9-18): the user-space main line (system calls, per-process address spaces + ELF,
 multiprocessing), plus persistence, APIC/SMP, and networking tracks.
 
 ## Language and writing conventions
@@ -171,9 +176,10 @@ Exit QEMU: `Ctrl-A` then `X`.
   `println!` macros that write to the screen.
 - `src/gdt.rs`: the Global Descriptor Table and Task State Segment, providing a
   dedicated IST stack for the double fault handler (loaded before the IDT).
-- `src/interrupts.rs`: the IDT, the CPU exception handlers (breakpoint and
-  double fault), and the hardware interrupt handlers along with the 8259 PIC
-  setup. Since Stage 12c the timer (IRQ0) uses a hand-written *naked* entry
+- `src/interrupts.rs`: the IDT, the CPU exception handlers (breakpoint, double
+  fault, and — since Stage 13a — page-fault and general-protection-fault handlers
+  that log CR2 / the error code and halt, instead of escalating to a double fault),
+  and the hardware interrupt handlers along with the 8259 PIC setup. Since Stage 12c the timer (IRQ0) uses a hand-written *naked* entry
   (`timer_interrupt_entry`) that pushes the full register set into a `TrapFrame`
   and calls `timer_dispatch`, which counts the tick, sends the EOI, then — if the
   tick interrupted ring 3 — preempts the running user process via
@@ -258,6 +264,13 @@ Exit QEMU: `Ctrl-A` then `X`.
   the caller's populated space) and restoring the caller's CR3 before returning. The boot
   demo runs two `write`+busy-spin+`yield` workers interleaved under preemption, plus a
   parent that `spawn`s its own child via `SYS_SPAWN` and `wait`s for it.
+- `src/ata.rs`: Stage 13a block device driver — a minimal ATA (IDE) disk driver in
+  PIO mode. `read_sector` reads one raw 512-byte sector from the primary master by
+  the polled READ SECTORS (LBA28) protocol: write the LBA/count registers, issue the
+  command, poll the status register for BSY-clear + DRQ-set, then read 256 16-bit
+  words from the data port. It disables the drive's interrupt (nIEN) since the kernel
+  polls and has no ATA IRQ handler. Read-only and single-sector for now; writes (13b,
+  against a scratch disk) come later.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run
