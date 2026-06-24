@@ -72,6 +72,7 @@ mod gdt;
 mod interrupts;
 mod memory;
 mod allocator;
+mod ata;
 mod task;
 // The Stage 6 thread scheduler is dormant during Stage 7: the kernel runs the
 // async executor (the shell) instead, so the scheduler's spawn/run/yield sit
@@ -285,6 +286,35 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_println!("[heap] Rc strong_count after drop  = {}", Rc::strong_count(&rc_clone));
     serial_println!("[ OK ] heap works; Box / Vec / Rc are usable");
     println!("Heap is live; Box / Vec / Rc all work (details on the serial log).");
+
+    // Stage 13a: read a raw sector from disk via ATA PIO (polling, no DMA/IRQ). The
+    // bootimage is attached as the primary IDE master, so sector 0 is the boot sector —
+    // its last two bytes are the MBR signature 0x55 0xAA, a stable thing to verify without
+    // assuming any file-system layout. This is the first taste of real persistence.
+    {
+        // Heap buffer, not a stack array — see read_sector's note on the small boot stack.
+        let mut sector = alloc::vec![0u8; ata::SECTOR_SIZE];
+        match ata::read_sector(0, &mut sector) {
+            Ok(()) => {
+                let sig_ok = sector[510] == 0x55 && sector[511] == 0xAA;
+                serial_println!(
+                    "[ata] read sector 0 ({} bytes); MBR signature {:#04x} {:#04x} (valid = {})",
+                    ata::SECTOR_SIZE,
+                    sector[510],
+                    sector[511],
+                    sig_ok,
+                );
+                println!(
+                    "Disk read works (ATA PIO): sector 0 MBR signature valid = {}",
+                    sig_ok
+                );
+            }
+            Err(e) => {
+                serial_println!("[ata] read of sector 0 failed: {:?}", e);
+                println!("Disk read (ATA PIO) FAILED: {:?}", e);
+            }
+        }
+    }
 
     // Stage 11a: process address spaces. To the hardware, a process *is* its own
     // top-level page table — its own value in CR3. Before giving each user program

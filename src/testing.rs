@@ -268,3 +268,15 @@ fn process_spawned_via_syscall() {
     assert!(crate::process::processes_waited() >= 1);
     assert_eq!(crate::process::last_waited_code(), 42);
 }
+
+/// Stage 13a: the ATA PIO driver reads a raw sector from disk. The bootimage QEMU attaches
+/// the kernel image as the primary IDE master, so sector 0 is the boot sector, whose final
+/// two bytes are the MBR boot signature 0x55 0xAA — a stable value to assert without
+/// depending on any particular file-system layout.
+#[test_case]
+fn ata_reads_boot_sector_signature() {
+    let mut sector = alloc::vec![0u8; crate::ata::SECTOR_SIZE];
+    crate::ata::read_sector(0, &mut sector).expect("ATA PIO read of sector 0 failed");
+    assert_eq!(sector[510], 0x55);
+    assert_eq!(sector[511], 0xAA);
+}
