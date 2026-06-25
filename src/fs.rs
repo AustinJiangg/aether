@@ -7,10 +7,19 @@
 //! the tree from the root.
 //!
 //! This is deliberately simple — no permissions, no timestamps, no real on-disk
-//! layout (inodes, blocks, a superblock), and no VFS abstraction layer. It is the
-//! "file abstraction" in its most basic form: named, hierarchical, byte-content
-//! files you can create, read, write, list, and remove. A single global
-//! [`Mutex`]-guarded [`RamFs`] holds the whole tree; only the shell touches it.
+//! layout (inodes, blocks, a superblock). It is the "file abstraction" in its most
+//! basic form: named, hierarchical, byte-content files you can create, read, write,
+//! list, and remove. A single global [`Mutex`]-guarded [`RamFs`] holds the whole
+//! tree; only the shell touches it.
+//!
+//! ## Stage 14a: the VFS seam
+//!
+//! Stage 14 adds a real *on-disk* filesystem (FAT) alongside this in-memory one. So
+//! that the shell (and, later, system calls) need not care which kind of filesystem
+//! backs a path, the operations are factored into a [`FileSystem`] trait — the
+//! "virtual filesystem" (VFS) layer that real kernels put between user code and the
+//! concrete filesystem drivers. [`RamFs`] is the first implementor; the FAT driver
+//! (Stage 14b) will be the second, slotting in behind the same trait.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -53,6 +62,28 @@ impl FsError {
 /// all behave sensibly (e.g. `/docs//hello` -> ["docs", "hello"]).
 fn components(path: &str) -> impl Iterator<Item = &str> {
     path.split('/').filter(|c| !c.is_empty())
+}
+
+/// The virtual-filesystem interface: the set of operations every filesystem must
+/// provide, regardless of where its bytes actually live (the heap, a disk, …).
+///
+/// This is the seam that lets [`RamFs`] and the coming FAT driver coexist: callers
+/// (the shell, tests) work against `&dyn FileSystem`, and the concrete type behind
+/// it can be swapped without touching them. Paths are always `/`-separated and
+/// resolved from the filesystem's own root.
+pub trait FileSystem {
+    /// Create an empty directory at `path`.
+    fn mkdir(&mut self, path: &str) -> Result<(), FsError>;
+    /// Create or overwrite the file at `path` with `data`.
+    fn write(&mut self, path: &str, data: &[u8]) -> Result<(), FsError>;
+    /// Read the bytes of the file at `path`.
+    fn read(&self, path: &str) -> Result<Vec<u8>, FsError>;
+    /// List the directory at `path` as `(name, is_dir)` pairs.
+    fn list(&self, path: &str) -> Result<Vec<(String, bool)>, FsError>;
+    /// Remove the file or directory at `path`.
+    fn remove(&mut self, path: &str) -> Result<(), FsError>;
+    /// Whether `path` names an existing directory.
+    fn is_dir(&self, path: &str) -> bool;
 }
 
 /// The whole in-memory file system: just its root directory.
@@ -101,7 +132,9 @@ impl RamFs {
             Node::File(_) => None,
         }
     }
+}
 
+impl FileSystem for RamFs {
     /// Create an empty directory at `path`. The parent must exist; the name must
     /// be free.
     fn mkdir(&mut self, path: &str) -> Result<(), FsError> {

@@ -130,6 +130,24 @@ fn fs_write_read_roundtrip() {
     assert!(fs::read("/testtmp/a.txt").is_err());
 }
 
+/// Stage 14a: `RamFs` implements the `FileSystem` VFS trait, so it can be driven
+/// through a trait object — the seam the FAT driver will later slot into. Uses a
+/// fresh local `RamFs` (not the global one), so it is independent of other tests.
+#[test_case]
+fn ramfs_satisfies_vfs_trait() {
+    use crate::fs::{FileSystem, RamFs};
+    let mut ram = RamFs::new();
+    // Dynamic dispatch through the vtable, exactly as a mounted filesystem would be.
+    let fs: &mut dyn FileSystem = &mut ram;
+    fs.mkdir("/d").unwrap();
+    fs.write("/d/f", b"vfs").unwrap();
+    assert_eq!(fs.read("/d/f").unwrap(), b"vfs".to_vec());
+    assert!(fs.is_dir("/d"));
+    assert_eq!(fs.list("/d").unwrap().len(), 1);
+    fs.remove("/d/f").unwrap();
+    assert!(fs.read("/d/f").is_err());
+}
+
 /// Stage 9a: the user-mode segments installed in the GDT carry privilege level 3,
 /// so the descent to ring 3 (9b) will push the correct CS/SS.
 #[test_case]
