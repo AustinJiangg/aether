@@ -106,9 +106,17 @@ locals. **Stage 13a (persistence track) is also done**: a polled ATA PIO disk dr
 a test against the boot disk's MBR signature; it runs the drive with interrupts disabled
 (nIEN), since the kernel polls and registers no ATA IRQ handler (an unhandled IRQ14 would
 otherwise cascade into a double fault). That work also added page-fault and
-general-protection-fault handlers (`interrupts.rs`). `ROADMAP.md` carries the forward plan
-(stages 9-18): the user-space main line (system calls, per-process address spaces + ELF,
-multiprocessing), plus persistence, APIC/SMP, and networking tracks.
+general-protection-fault handlers (`interrupts.rs`). **Stage 13b is also done**: ATA PIO
+sector *writes* — `write_sector` issues WRITE SECTORS (0x30), pushes 256 little-endian words
+out the data port, waits for the drive to commit, then issues CACHE FLUSH (0xE7) for
+durability. To keep the boot image safe, a `Drive` enum names the target (primary master =
+boot disk vs. primary slave = scratch disk) at every call site, and writes go only to the
+scratch disk — a separate `scratch.img` attached as the primary slave (`Cargo.toml`
+`run-args`/`test-args`), which a host `build.rs` creates if missing (QEMU won't start without
+the backing file). A boot demo and a test write a sector and read it back to prove an exact
+round-trip. `ROADMAP.md` carries the forward plan (stages 9-18): the user-space main line
+(system calls, per-process address spaces + ELF, multiprocessing), plus persistence,
+APIC/SMP, and networking tracks.
 
 ## Language and writing conventions
 
@@ -264,13 +272,18 @@ Exit QEMU: `Ctrl-A` then `X`.
   the caller's populated space) and restoring the caller's CR3 before returning. The boot
   demo runs two `write`+busy-spin+`yield` workers interleaved under preemption, plus a
   parent that `spawn`s its own child via `SYS_SPAWN` and `wait`s for it.
-- `src/ata.rs`: Stage 13a block device driver — a minimal ATA (IDE) disk driver in
+- `src/ata.rs`: Stage 13a/13b block device driver — a minimal ATA (IDE) disk driver in
   PIO mode. `read_sector` reads one raw 512-byte sector from the primary master by
   the polled READ SECTORS (LBA28) protocol: write the LBA/count registers, issue the
   command, poll the status register for BSY-clear + DRQ-set, then read 256 16-bit
   words from the data port. It disables the drive's interrupt (nIEN) since the kernel
-  polls and has no ATA IRQ handler. Read-only and single-sector for now; writes (13b,
-  against a scratch disk) come later.
+  polls and has no ATA IRQ handler. Stage 13b adds `write_sector(drive, lba, buf)`: the
+  mirror WRITE SECTORS (0x30) protocol — poll for DRQ, push 256 words out, wait for the
+  commit, then CACHE FLUSH (0xE7) for durability. A shared `issue_command` prologue feeds
+  both paths, and a `Drive` enum (primary master = boot disk, primary slave = scratch disk)
+  names the target so a write never reaches the boot image; writes go to a git-ignored
+  `scratch.img` that a host `build.rs` creates and `Cargo.toml` attaches as the primary
+  slave. Single-sector, primary-bus only.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

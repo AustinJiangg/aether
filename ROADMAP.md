@@ -88,13 +88,18 @@ unify later.
 
 ### Parallel tracks (any order, after the main line)
 
-> **Status:** Stage 13a is done — a polled **ATA PIO** driver (`ata.rs`) reads raw 512-byte
-> sectors from the primary IDE master, verified at boot and in a test against the boot
-> disk's MBR signature (`0x55 0xAA`). The drive runs with interrupts disabled (nIEN): the
-> kernel polls and registers no ATA IRQ handler, so an unhandled IRQ14 would otherwise
-> cascade (vector 46 → not-present gate → #NP → double fault). This work also added
-> page-fault and general-protection-fault handlers (`interrupts.rs`). Stage 13b — sector
-> *writes*, against a separate scratch disk so the boot image is never corrupted — is next.
+> **Status:** Stage 13a and 13b are done. **13a** — a polled **ATA PIO** driver (`ata.rs`)
+> reads raw 512-byte sectors from the primary IDE master, verified at boot and in a test
+> against the boot disk's MBR signature (`0x55 0xAA`). The drive runs with interrupts
+> disabled (nIEN): the kernel polls and registers no ATA IRQ handler, so an unhandled IRQ14
+> would otherwise cascade (vector 46 → not-present gate → #NP → double fault). This work
+> also added page-fault and general-protection-fault handlers (`interrupts.rs`). **13b** —
+> sector *writes*: WRITE SECTORS (0x30) plus a CACHE FLUSH (0xE7) so the data is durable,
+> driven word-at-a-time over the data port. Writes target a *separate scratch disk* attached
+> as the primary slave (a `Drive` enum names master vs. slave at every call site, so the boot
+> image is never at risk; `build.rs` creates the `scratch.img` backing file QEMU needs).
+> Verified by a boot demo and a test that write a sector and read it back for an exact
+> round-trip. Next on this track: Stage 14 — an on-disk file system over the block driver.
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|
