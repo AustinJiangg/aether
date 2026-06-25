@@ -318,3 +318,25 @@ fn ata_write_then_read_roundtrips_on_scratch() {
     ata::read_sector_from(Drive::PrimarySlave, LBA, &mut back).expect("ATA PIO read-back failed");
     assert_eq!(out, back);
 }
+
+/// Stage 14b-1: parse the BPB of the host-formatted FAT16 disk (the secondary IDE master,
+/// `fat.img`). Asserts the exact geometry mkfs.fat produced for our 5 MiB, 1-sector-cluster
+/// image, which also exercises the secondary ATA bus and the region-layout arithmetic.
+#[test_case]
+fn fat_bpb_parses_known_geometry() {
+    use crate::ata::Drive;
+    use crate::fat;
+    let bpb = fat::read_bpb(Drive::SecondaryMaster).expect("reading/parsing the FAT BPB failed");
+    assert_eq!(bpb.bytes_per_sector, 512);
+    assert_eq!(bpb.sectors_per_cluster, 1);
+    assert_eq!(bpb.reserved_sectors, 1);
+    assert_eq!(bpb.num_fats, 2);
+    assert_eq!(bpb.root_entry_count, 512);
+    assert_eq!(bpb.fat_size_sectors, 40);
+    assert_eq!(bpb.total_sectors, 10240);
+    // Derived layout: FAT at LBA 1, root dir after both FATs (1 + 2*40 = 81), data after the
+    // 32-sector root directory (81 + 32 = 113).
+    assert_eq!(bpb.fat_start_sector(), 1);
+    assert_eq!(bpb.root_dir_start_sector(), 81);
+    assert_eq!(bpb.data_start_sector(), 113);
+}

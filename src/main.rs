@@ -73,6 +73,7 @@ mod interrupts;
 mod memory;
 mod allocator;
 mod ata;
+mod fat;
 mod task;
 // The Stage 6 thread scheduler is dormant during Stage 7: the kernel runs the
 // async executor (the shell) instead, so the scheduler's spawn/run/yield sit
@@ -357,6 +358,44 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             Err(e) => {
                 serial_println!("[ata] write to scratch sector failed: {:?}", e);
                 println!("Disk write (ATA PIO) FAILED: {:?}", e);
+            }
+        }
+    }
+
+    // Stage 14b-1: read and parse a real FAT16 filesystem's boot sector. The FAT disk is the
+    // secondary IDE master (`fat.img`, formatted by the host's mkfs.fat). Parsing its BPB
+    // proves the kernel can reach the second ATA bus and understand the on-disk geometry —
+    // the foundation the file reader (14b-2) builds on.
+    {
+        match fat::read_bpb(ata::Drive::SecondaryMaster) {
+            Ok(bpb) => {
+                serial_println!(
+                    "[fat] BPB ok: {} B/sector, {} sector(s)/cluster, {} reserved, {} FAT(s) \
+                     of {} sectors, {} root entries, {} total sectors, {} clusters",
+                    bpb.bytes_per_sector,
+                    bpb.sectors_per_cluster,
+                    bpb.reserved_sectors,
+                    bpb.num_fats,
+                    bpb.fat_size_sectors,
+                    bpb.root_entry_count,
+                    bpb.total_sectors,
+                    bpb.count_of_clusters(),
+                );
+                serial_println!(
+                    "[fat] layout: FAT@{}, root-dir@{}, data@{} (LBA)",
+                    bpb.fat_start_sector(),
+                    bpb.root_dir_start_sector(),
+                    bpb.data_start_sector(),
+                );
+                println!(
+                    "FAT16 disk mounted: {} clusters, data starts at LBA {}",
+                    bpb.count_of_clusters(),
+                    bpb.data_start_sector(),
+                );
+            }
+            Err(e) => {
+                serial_println!("[fat] failed to read/parse BPB: {:?}", e);
+                println!("FAT16 disk parse FAILED: {:?}", e);
             }
         }
     }

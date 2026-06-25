@@ -7,6 +7,9 @@
 # Scratch disk for the ATA write experiments (Stage 13b); created by build.rs
 scratch.img
 
+# FAT16 test disk for the on-disk filesystem (Stage 14b); created by build.rs via mkfs.fat
+fat.img
+
 # Editor / IDE
 .vscode/
 .idea/

@@ -25,7 +25,10 @@
 //!
 //! One bus carries up to two drives — a **master** and a **slave** — distinguished
 //! only by bit 4 of the drive-select byte (`0xE0` master, `0xF0` slave). They share
-//! every other register, so we select one before each operation. See [`Drive`].
+//! every other register, so we select one before each operation. A PC also has a
+//! **secondary** bus at `0x170` / `0x376` with the same register layout, so four drives
+//! in all; Stage 14b attaches a FAT disk there. The driver picks the `(io_base, ctrl_base)`
+//! pair from the [`Drive`].
 //!
 //! ## The read protocol (28-bit LBA, READ SECTORS = 0x20)
 //!
@@ -69,18 +72,23 @@ use x86_64::instructions::port::Port;
 /// A disk sector is 512 bytes.
 pub const SECTOR_SIZE: usize = 512;
 
-// Legacy primary ATA bus ports.
-const IO_BASE: u16 = 0x1F0;
-const CTRL_BASE: u16 = 0x3F6;
+// Legacy ATA I/O-port bases. A PC has two buses: the *primary* (0x1F0 command block,
+// 0x3F6 control) and the *secondary* (0x170 / 0x376). Each carries a master and a slave,
+// so four drives in all. The command-block registers sit at the same offsets on either
+// bus, so the driver works off `(io_base, ctrl_base)` chosen per [`Drive`].
+const PRIMARY_IO_BASE: u16 = 0x1F0;
+const PRIMARY_CTRL_BASE: u16 = 0x3F6;
+const SECONDARY_IO_BASE: u16 = 0x170;
+const SECONDARY_CTRL_BASE: u16 = 0x376;
 
-// Command-block register addresses (offsets from `IO_BASE`).
-const REG_DATA: u16 = IO_BASE; // +0: 16-bit data port (PIO transfer)
-const REG_SECTOR_COUNT: u16 = IO_BASE + 2;
-const REG_LBA_LOW: u16 = IO_BASE + 3;
-const REG_LBA_MID: u16 = IO_BASE + 4;
-const REG_LBA_HIGH: u16 = IO_BASE + 5;
-const REG_DRIVE: u16 = IO_BASE + 6;
-const REG_STATUS_CMD: u16 = IO_BASE + 7; // status (read) / command (write)
+// Command-block register offsets from a bus's I/O base.
+const OFF_DATA: u16 = 0; // 16-bit data port (PIO transfer)
+const OFF_SECTOR_COUNT: u16 = 2;
+const OFF_LBA_LOW: u16 = 3;
+const OFF_LBA_MID: u16 = 4;
+const OFF_LBA_HIGH: u16 = 5;
+const OFF_DRIVE: u16 = 6;
+const OFF_STATUS_CMD: u16 = 7; // status (read) / command (write)
 
 // Status register bits.
 const ST_ERR: u8 = 1 << 0; // an error occurred
@@ -106,23 +114,43 @@ const DEV_CTRL_NIEN: u8 = 1 << 1;
 const DRIVE_LBA_MASTER: u8 = 0xE0;
 const DRIVE_LBA_SLAVE: u8 = 0xF0;
 
-/// Which drive on the primary bus an operation targets.
+/// Which physical drive an operation targets: a (bus, master/slave) pair.
 ///
-/// The boot image is the master; the scratch disk (safe to write) is the slave. Naming
-/// the drive at each call site is what keeps a write from ever reaching the boot image.
+/// The boot image is the primary master; the scratch disk (safe to write) is the primary
+/// slave; the FAT test disk (Stage 14b) is the secondary master. Naming the drive at each
+/// call site is what keeps a write from ever reaching the boot image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Drive {
     /// The primary master — the boot disk here. Read-only in practice.
     PrimaryMaster,
     /// The primary slave — the scratch disk used for write experiments.
     PrimarySlave,
+    /// The secondary master — the FAT-formatted disk read by the Stage 14b driver.
+    SecondaryMaster,
 }
 
 impl Drive {
-    /// The drive-select base byte (before the top LBA nibble is OR'd in).
+    /// This drive's bus command-block I/O base (0x1F0 primary, 0x170 secondary).
+    fn io_base(self) -> u16 {
+        match self {
+            Drive::PrimaryMaster | Drive::PrimarySlave => PRIMARY_IO_BASE,
+            Drive::SecondaryMaster => SECONDARY_IO_BASE,
+        }
+    }
+
+    /// This drive's bus control/alternate-status port (0x3F6 primary, 0x376 secondary).
+    fn ctrl_base(self) -> u16 {
+        match self {
+            Drive::PrimaryMaster | Drive::PrimarySlave => PRIMARY_CTRL_BASE,
+            Drive::SecondaryMaster => SECONDARY_CTRL_BASE,
+        }
+    }
+
+    /// The drive-select base byte (before the top LBA nibble is OR'd in): the master vs.
+    /// slave bit (bit 4) within the bus.
     fn select_base(self) -> u8 {
         match self {
-            Drive::PrimaryMaster => DRIVE_LBA_MASTER,
+            Drive::PrimaryMaster | Drive::SecondaryMaster => DRIVE_LBA_MASTER,
             Drive::PrimarySlave => DRIVE_LBA_SLAVE,
         }
     }
@@ -141,24 +169,24 @@ pub enum AtaError {
     DriveError,
 }
 
-/// Read the alternate-status register four times to burn ~400 ns. After a drive select or
-/// a command the status bits need a moment to settle; reading `0x3F6` samples the status
-/// with no side effects, the canonical way to wait.
-unsafe fn delay_400ns() {
-    let mut alt_status: Port<u8> = Port::new(CTRL_BASE);
+/// Read the alternate-status register (at `ctrl_base`) four times to burn ~400 ns. After a
+/// drive select or a command the status bits need a moment to settle; reading the control
+/// port samples the status with no side effects, the canonical way to wait.
+unsafe fn delay_400ns(ctrl_base: u16) {
+    let mut alt_status: Port<u8> = Port::new(ctrl_base);
     for _ in 0..4 {
-        // SAFETY: 0x3F6 is the fixed alternate-status port; a read only returns the
-        // status byte and has no side effects.
+        // SAFETY: `ctrl_base` is a fixed alternate-status port (0x3F6/0x376); a read only
+        // returns the status byte and has no side effects.
         let _ = alt_status.read();
     }
 }
 
 /// Spin until the drive clears BSY, or time out. Used before issuing a command, when ERR
 /// is not yet meaningful; [`wait_ready`] is the variant that also checks ERR.
-unsafe fn wait_while_busy() -> Result<(), AtaError> {
-    let mut status: Port<u8> = Port::new(REG_STATUS_CMD);
+unsafe fn wait_while_busy(io_base: u16) -> Result<(), AtaError> {
+    let mut status: Port<u8> = Port::new(io_base + OFF_STATUS_CMD);
     for _ in 0..POLL_LIMIT {
-        // SAFETY: 0x1F7 read returns the status byte with no side effects.
+        // SAFETY: the status port read returns the status byte with no side effects.
         if status.read() & ST_BSY == 0 {
             return Ok(());
         }
@@ -169,10 +197,10 @@ unsafe fn wait_while_busy() -> Result<(), AtaError> {
 /// Spin until the drive is idle (BSY clear) after a command, surfacing a drive-reported
 /// failure as `DriveError`. Used to wait out a write and a cache flush, where the drive
 /// can report an error but does not raise DRQ.
-unsafe fn wait_ready() -> Result<(), AtaError> {
-    let mut status: Port<u8> = Port::new(REG_STATUS_CMD);
+unsafe fn wait_ready(io_base: u16) -> Result<(), AtaError> {
+    let mut status: Port<u8> = Port::new(io_base + OFF_STATUS_CMD);
     for _ in 0..POLL_LIMIT {
-        // SAFETY: 0x1F7 read returns the status byte with no side effects.
+        // SAFETY: the status port read returns the status byte with no side effects.
         let s = status.read();
         if s & ST_BSY == 0 {
             if s & ST_ERR != 0 {
@@ -188,10 +216,10 @@ unsafe fn wait_ready() -> Result<(), AtaError> {
 /// `DriveError` if the drive raises ERR meanwhile, `Timeout` if neither happens in time.
 /// On a read this means "the sector is ready to pull"; on a write, "the drive is ready to
 /// accept the sector".
-unsafe fn wait_for_data() -> Result<(), AtaError> {
-    let mut status: Port<u8> = Port::new(REG_STATUS_CMD);
+unsafe fn wait_for_data(io_base: u16) -> Result<(), AtaError> {
+    let mut status: Port<u8> = Port::new(io_base + OFF_STATUS_CMD);
     for _ in 0..POLL_LIMIT {
-        // SAFETY: 0x1F7 read returns the status byte with no side effects.
+        // SAFETY: the status port read returns the status byte with no side effects.
         let s = status.read();
         if s & ST_ERR != 0 {
             return Err(AtaError::DriveError);
@@ -209,28 +237,31 @@ unsafe fn wait_for_data() -> Result<(), AtaError> {
 /// response. `cmd` must be one of the LBA28 PIO commands above.
 ///
 /// # Safety
-/// Performs raw port I/O to the fixed legacy primary-ATA registers. Sound to call from the
-/// kernel because nothing else touches these ports concurrently (the kernel is the sole,
-/// single-threaded driver here) and the sequence is the architectural command setup.
+/// Performs raw port I/O to the fixed legacy ATA registers of `drive`'s bus. Sound to call
+/// from the kernel because nothing else touches these ports concurrently (the kernel is the
+/// sole, single-threaded driver here) and the sequence is the architectural command setup.
 unsafe fn issue_command(drive: Drive, lba: u32, cmd: u8) -> Result<(), AtaError> {
-    let mut sector_count: Port<u8> = Port::new(REG_SECTOR_COUNT);
-    let mut lba_low: Port<u8> = Port::new(REG_LBA_LOW);
-    let mut lba_mid: Port<u8> = Port::new(REG_LBA_MID);
-    let mut lba_high: Port<u8> = Port::new(REG_LBA_HIGH);
-    let mut drive_reg: Port<u8> = Port::new(REG_DRIVE);
-    let mut command: Port<u8> = Port::new(REG_STATUS_CMD);
-    let mut control: Port<u8> = Port::new(CTRL_BASE);
+    let io_base = drive.io_base();
+    let ctrl_base = drive.ctrl_base();
 
-    wait_while_busy()?;
+    let mut sector_count: Port<u8> = Port::new(io_base + OFF_SECTOR_COUNT);
+    let mut lba_low: Port<u8> = Port::new(io_base + OFF_LBA_LOW);
+    let mut lba_mid: Port<u8> = Port::new(io_base + OFF_LBA_MID);
+    let mut lba_high: Port<u8> = Port::new(io_base + OFF_LBA_HIGH);
+    let mut drive_reg: Port<u8> = Port::new(io_base + OFF_DRIVE);
+    let mut command: Port<u8> = Port::new(io_base + OFF_STATUS_CMD);
+    let mut control: Port<u8> = Port::new(ctrl_base);
+
+    wait_while_busy(io_base)?;
 
     // Polled driver: disable the drive's interrupt (nIEN) so completing the command does
-    // not assert IRQ14. We have no IRQ14 handler, and an unhandled ATA interrupt would
-    // cascade (vector 46 -> not-present gate -> #NP -> double fault).
+    // not assert its IRQ (IRQ14 primary / IRQ15 secondary). We have no ATA IRQ handler, and
+    // an unhandled ATA interrupt would cascade (not-present gate -> #NP -> double fault).
     control.write(DEV_CTRL_NIEN);
 
     // Select the drive in LBA mode; LBA bits 24..28 go in the low nibble.
     drive_reg.write(drive.select_base() | (((lba >> 24) & 0x0F) as u8));
-    delay_400ns(); // let the drive selection settle
+    delay_400ns(ctrl_base); // let the drive selection settle
 
     sector_count.write(1); // a single sector
     lba_low.write((lba & 0xFF) as u8);
@@ -238,7 +269,7 @@ unsafe fn issue_command(drive: Drive, lba: u32, cmd: u8) -> Result<(), AtaError>
     lba_high.write(((lba >> 16) & 0xFF) as u8);
 
     command.write(cmd);
-    delay_400ns(); // let BSY assert before the caller starts polling
+    delay_400ns(ctrl_base); // let BSY assert before the caller starts polling
     Ok(())
 }
 
@@ -259,10 +290,10 @@ pub fn read_sector_from(drive: Drive, lba: u32, buf: &mut [u8]) -> Result<(), At
         "read_sector_from: buffer must hold at least one 512-byte sector"
     );
 
-    let mut data: Port<u16> = Port::new(REG_DATA);
+    let mut data: Port<u16> = Port::new(drive.io_base() + OFF_DATA);
 
-    // SAFETY: every port accessed is a fixed, standard legacy-ATA primary-bus register, and
-    // the sequence is the architectural READ SECTORS (LBA28) protocol; the reads only
+    // SAFETY: every port accessed is a fixed, standard legacy-ATA register on `drive`'s bus,
+    // and the sequence is the architectural READ SECTORS (LBA28) protocol; the reads only
     // sample status or pull sector data. Nothing here aliases memory or disturbs another
     // device, and every poll is bounded, so a missing/faulty drive times out rather than
     // hanging. We read exactly 256 words = 512 bytes into `buf`, whose length was checked
@@ -271,7 +302,7 @@ pub fn read_sector_from(drive: Drive, lba: u32, buf: &mut [u8]) -> Result<(), At
         issue_command(drive, lba, CMD_READ_SECTORS)?;
 
         // Wait for the drive to load the sector into its buffer and raise DRQ.
-        wait_for_data()?;
+        wait_for_data(drive.io_base())?;
 
         // Transfer 256 little-endian 16-bit words into the byte buffer.
         for i in 0..(SECTOR_SIZE / 2) {
@@ -310,11 +341,12 @@ pub fn write_sector(drive: Drive, lba: u32, buf: &[u8]) -> Result<(), AtaError> 
         "write_sector: buffer must hold at least one 512-byte sector"
     );
 
-    let mut data: Port<u16> = Port::new(REG_DATA);
-    let mut command: Port<u8> = Port::new(REG_STATUS_CMD);
+    let io_base = drive.io_base();
+    let mut data: Port<u16> = Port::new(io_base + OFF_DATA);
+    let mut command: Port<u8> = Port::new(io_base + OFF_STATUS_CMD);
 
-    // SAFETY: every port accessed is a fixed, standard legacy-ATA primary-bus register, and
-    // the sequence is the architectural WRITE SECTORS (LBA28) protocol followed by CACHE
+    // SAFETY: every port accessed is a fixed, standard legacy-ATA register on `drive`'s bus,
+    // and the sequence is the architectural WRITE SECTORS (LBA28) protocol followed by CACHE
     // FLUSH; the writes only program registers and push sector data, the reads only sample
     // status. Nothing here aliases memory, and every poll is bounded, so a missing/faulty
     // drive times out rather than hanging. We write exactly 256 words = 512 bytes from
@@ -324,7 +356,7 @@ pub fn write_sector(drive: Drive, lba: u32, buf: &[u8]) -> Result<(), AtaError> 
         issue_command(drive, lba, CMD_WRITE_SECTORS)?;
 
         // Wait until the drive is ready to receive the sector (BSY clear, DRQ set).
-        wait_for_data()?;
+        wait_for_data(io_base)?;
 
         // Transfer 256 little-endian 16-bit words out of the byte buffer. Deliberately a
         // plain word-at-a-time loop, not a `rep outsw` burst: ATA wants a brief gap between
@@ -335,13 +367,13 @@ pub fn write_sector(drive: Drive, lba: u32, buf: &[u8]) -> Result<(), AtaError> 
         }
 
         // The drive now writes the sector out of its buffer; wait for it to finish.
-        wait_ready()?;
+        wait_ready(io_base)?;
 
         // Flush the write cache to the media so the data survives a power loss, then wait
         // for the flush to complete.
         command.write(CMD_CACHE_FLUSH);
-        delay_400ns();
-        wait_ready()?;
+        delay_400ns(drive.ctrl_base());
+        wait_ready(io_base)?;
     }
 
     Ok(())

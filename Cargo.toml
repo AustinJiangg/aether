@@ -71,6 +71,9 @@ run-args = [
     # image is the auto-assigned master, index 0). The ATA driver writes here so the
     # boot image is never at risk. build.rs creates the backing file if it is missing.
     "-drive", "format=raw,file=scratch.img,if=ide,index=1,media=disk",
+    # Stage 14b: attach the FAT16 test disk as the secondary IDE *master* (index 2). The
+    # FAT reader parses this real, host-formatted filesystem. build.rs creates it via mkfs.fat.
+    "-drive", "format=raw,file=fat.img,if=ide,index=2,media=disk",
 ]
 
 # `cargo test` runs each test binary through these args instead of `run-args`.
@@ -86,6 +89,9 @@ test-args = [
     # Stage 13b: the same scratch disk as run-args, so the write round-trip test has a
     # drive to write to (the primary slave; the boot image stays the untouched master).
     "-drive", "format=raw,file=scratch.img,if=ide,index=1,media=disk",
+    # Stage 14b: the same FAT16 test disk as run-args, so the BPB-parse test has a real
+    # filesystem to read (the secondary master).
+    "-drive", "format=raw,file=fat.img,if=ide,index=2,media=disk",
 ]
 # When the tests pass, the kernel calls exit_qemu(Success), so QEMU exits with
 # (0x10 << 1) | 1 = 33. Tell bootimage to treat exit code 33 as a passing run
