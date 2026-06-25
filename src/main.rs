@@ -316,6 +316,51 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         }
     }
 
+    // Stage 13b: write a sector to disk, then read it back and confirm it matches. The
+    // write goes to a *scratch* disk (the primary IDE slave) so the boot image is never
+    // touched; QEMU gets it via `-drive ...,if=ide,index=1` and build.rs creates the file.
+    // A successful round-trip proves the WRITE SECTORS + CACHE FLUSH path works end to end.
+    {
+        const SCRATCH_LBA: u32 = 0;
+        // Build a recognizable sector: an ASCII tag up front (visible in a hexdump of
+        // scratch.img after the run) followed by a 0,1,2,...,255,0,... ramp, so a wrong
+        // byte anywhere in the sector — not just the first few — fails the comparison.
+        let mut out = alloc::vec![0u8; ata::SECTOR_SIZE];
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
+        }
+        out[..8].copy_from_slice(b"AETHER13");
+
+        match ata::write_sector(ata::Drive::PrimarySlave, SCRATCH_LBA, &out) {
+            Ok(()) => {
+                let mut back = alloc::vec![0u8; ata::SECTOR_SIZE];
+                match ata::read_sector_from(ata::Drive::PrimarySlave, SCRATCH_LBA, &mut back) {
+                    Ok(()) => {
+                        let matches = back == out;
+                        serial_println!(
+                            "[ata] wrote sector {} to the scratch disk and read it back; \
+                             round-trip match = {}",
+                            SCRATCH_LBA,
+                            matches,
+                        );
+                        println!(
+                            "Disk write works (ATA PIO): scratch-disk round-trip match = {}",
+                            matches
+                        );
+                    }
+                    Err(e) => {
+                        serial_println!("[ata] read-back of scratch sector failed: {:?}", e);
+                        println!("Disk write (ATA PIO) read-back FAILED: {:?}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                serial_println!("[ata] write to scratch sector failed: {:?}", e);
+                println!("Disk write (ATA PIO) FAILED: {:?}", e);
+            }
+        }
+    }
+
     // Stage 11a: process address spaces. To the hardware, a process *is* its own
     // top-level page table — its own value in CR3. Before giving each user program
     // a private space, we prove the core move in isolation: build a second address

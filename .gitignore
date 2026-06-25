@@ -4,6 +4,9 @@
 # Bootable images produced by bootimage (large; regenerated on demand)
 *.bin
 
+# Scratch disk for the ATA write experiments (Stage 13b); created by build.rs
+scratch.img
+
 # Editor / IDE
 .vscode/
 .idea/

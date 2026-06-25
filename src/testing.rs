@@ -280,3 +280,23 @@ fn ata_reads_boot_sector_signature() {
     assert_eq!(sector[510], 0x55);
     assert_eq!(sector[511], 0xAA);
 }
+
+/// Stage 13b: the ATA PIO driver writes a sector and reads back exactly what it wrote. The
+/// write targets the *scratch* disk (the primary IDE slave attached in `test-args`), never
+/// the boot image. We use a different LBA than the boot demo's so the two are independent,
+/// and a full-sector pattern so a wrong byte anywhere fails the comparison.
+#[test_case]
+fn ata_write_then_read_roundtrips_on_scratch() {
+    use crate::ata::{self, Drive};
+    const LBA: u32 = 1;
+    let mut out = alloc::vec![0u8; ata::SECTOR_SIZE];
+    for (i, b) in out.iter_mut().enumerate() {
+        // A non-trivial pattern (not just the index) so a stuck or shifted byte shows up.
+        *b = ((i * 31 + 7) & 0xFF) as u8;
+    }
+    ata::write_sector(Drive::PrimarySlave, LBA, &out).expect("ATA PIO write failed");
+
+    let mut back = alloc::vec![0u8; ata::SECTOR_SIZE];
+    ata::read_sector_from(Drive::PrimarySlave, LBA, &mut back).expect("ATA PIO read-back failed");
+    assert_eq!(out, back);
+}
