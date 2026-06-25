@@ -106,8 +106,17 @@ unify later.
 > put between user code and the concrete filesystem drivers; `RamFs` is the first
 > implementor. Pure refactor (no behavior change): the shell still calls the same global
 > `fs::*` functions, and a new test drives a `RamFs` through a `&mut dyn FileSystem` trait
-> object to prove the abstraction dispatches dynamically. Next: Stage 14b — a FAT *read*
-> driver (`FatFs`) as the second implementor, reading files off a FAT-formatted disk.
+> object to prove the abstraction dispatches dynamically.
+>
+> **Stage 14b-1 is also done** — the FAT volume's boot sector. `fat.rs` reads sector 0 of a
+> real FAT16 disk and parses its **BPB** (BIOS Parameter Block) into geometry — sector/cluster
+> sizes, FAT count and size, root-entry count, total sectors — and derives the region layout
+> (FAT, root-directory, and data start LBAs). The disk (`fat.img`) is formatted by the host's
+> `mkfs.fat` in `build.rs` (a known `HELLO.TXT` copied in via `mcopy`) and attached as the
+> *secondary* IDE master, which extended the ATA driver to address the second bus
+> (`SecondaryMaster`, ports 0x170/0x376). Verified by a boot demo and a test asserting the
+> exact geometry. Next: Stage 14b-2 — walk the FAT and root directory to read a file, and
+> implement the `FileSystem` trait for the FAT volume.
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

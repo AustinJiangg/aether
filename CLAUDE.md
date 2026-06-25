@@ -118,8 +118,13 @@ round-trip. **Stage 14a is also done**: the VFS seam — `fs.rs`'s six file oper
 factored into a `FileSystem` trait (the virtual-filesystem layer that lets different
 filesystems coexist behind one interface), with `RamFs` as the first implementor. A pure
 refactor: the shell still calls the same global `fs::*` functions, and a new test drives a
-`RamFs` through a `&mut dyn FileSystem` trait object. `ROADMAP.md` carries the forward plan
-(stages 9-18): the user-space main line (system calls, per-process address spaces + ELF,
+`RamFs` through a `&mut dyn FileSystem` trait object. **Stage 14b-1 is also done**: the FAT
+boot sector. `fat.rs` reads sector 0 of a real FAT16 disk and parses its BPB (BIOS Parameter
+Block) into geometry, then derives the FAT/root-directory/data region LBAs. The disk
+(`fat.img`) is formatted by the host's `mkfs.fat` in `build.rs` (with a known `HELLO.TXT`)
+and attached as the secondary IDE master, which extended the ATA driver to a second bus
+(`Drive::SecondaryMaster`, ports 0x170/0x376). `ROADMAP.md` carries the forward plan (stages
+9-18): the user-space main line (system calls, per-process address spaces + ELF,
 multiprocessing), plus persistence, APIC/SMP, and networking tracks.
 
 ## Language and writing conventions
@@ -289,7 +294,15 @@ Exit QEMU: `Ctrl-A` then `X`.
   both paths, and a `Drive` enum (primary master = boot disk, primary slave = scratch disk)
   names the target so a write never reaches the boot image; writes go to a git-ignored
   `scratch.img` that a host `build.rs` creates and `Cargo.toml` attaches as the primary
-  slave. Single-sector, primary-bus only.
+  slave. Single-sector. Stage 14b adds the secondary bus: `Drive::SecondaryMaster` (ports
+  0x170/0x376) addresses the FAT disk, with the bus `(io_base, ctrl_base)` chosen per drive.
+- `src/fat.rs`: Stage 14b read-only FAT16 driver over the ATA block driver. `Bpb::parse`
+  reads a boot sector's BIOS Parameter Block — sector/cluster size, FAT count and size,
+  root-entry count, total sectors — validates the `0x55AA` signature and FAT16 cluster
+  range, and derives the FAT/root-directory/data region start LBAs; `read_bpb(drive)` does
+  the sector-0 read then parses. The disk is the secondary master (`fat.img`), formatted by
+  the host's `mkfs.fat` in `build.rs`. File reading (FAT walk, directory) and the
+  `FileSystem` impl come in 14b-2.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run
