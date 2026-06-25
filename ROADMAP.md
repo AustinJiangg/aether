@@ -99,7 +99,15 @@ unify later.
 > as the primary slave (a `Drive` enum names master vs. slave at every call site, so the boot
 > image is never at risk; `build.rs` creates the `scratch.img` backing file QEMU needs).
 > Verified by a boot demo and a test that write a sector and read it back for an exact
-> round-trip. Next on this track: Stage 14 — an on-disk file system over the block driver.
+> round-trip.
+>
+> **Stage 14a is also done** — the VFS seam. The in-memory file system's operations are
+> factored into a `FileSystem` trait (`fs.rs`), the virtual-filesystem layer real kernels
+> put between user code and the concrete filesystem drivers; `RamFs` is the first
+> implementor. Pure refactor (no behavior change): the shell still calls the same global
+> `fs::*` functions, and a new test drives a `RamFs` through a `&mut dyn FileSystem` trait
+> object to prove the abstraction dispatches dynamically. Next: Stage 14b — a FAT *read*
+> driver (`FatFs`) as the second implementor, reading files off a FAT-formatted disk.
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

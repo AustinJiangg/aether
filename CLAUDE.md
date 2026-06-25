@@ -114,9 +114,13 @@ boot disk vs. primary slave = scratch disk) at every call site, and writes go on
 scratch disk — a separate `scratch.img` attached as the primary slave (`Cargo.toml`
 `run-args`/`test-args`), which a host `build.rs` creates if missing (QEMU won't start without
 the backing file). A boot demo and a test write a sector and read it back to prove an exact
-round-trip. `ROADMAP.md` carries the forward plan (stages 9-18): the user-space main line
-(system calls, per-process address spaces + ELF, multiprocessing), plus persistence,
-APIC/SMP, and networking tracks.
+round-trip. **Stage 14a is also done**: the VFS seam — `fs.rs`'s six file operations are
+factored into a `FileSystem` trait (the virtual-filesystem layer that lets different
+filesystems coexist behind one interface), with `RamFs` as the first implementor. A pure
+refactor: the shell still calls the same global `fs::*` functions, and a new test drives a
+`RamFs` through a `&mut dyn FileSystem` trait object. `ROADMAP.md` carries the forward plan
+(stages 9-18): the user-space main line (system calls, per-process address spaces + ELF,
+multiprocessing), plus persistence, APIC/SMP, and networking tracks.
 
 ## Language and writing conventions
 
@@ -232,7 +236,9 @@ Exit QEMU: `Ctrl-A` then `X`.
 - `src/fs.rs`: Stage 8 in-memory file system — a heap-backed tree of `File`/`Dir`
   nodes addressed by `/`-separated paths, exposed as a global `RamFs` behind a
   mutex with `mkdir`/`write`/`read`/`list`/`remove`/`is_dir`. No disk, no
-  persistence, no VFS layer.
+  persistence. Stage 14a factors those six operations into a `FileSystem` trait (the
+  VFS seam) that `RamFs` implements, so the coming FAT driver can coexist behind the
+  same interface; the global `fs::*` functions are unchanged.
 - `src/usermode.rs`: the ring 3 entry/return mechanism — `enter` forges an
   interrupt-return frame (`initial_user_frame`: entry point + user stack; since Stage
   12c-3 IF is *set* so the process is preemptible) and `iretq`s into ring 3;
