@@ -127,7 +127,11 @@ and attached as the secondary IDE master, which extended the ATA driver to a sec
 off the FAT volume — a mounted `Fat` handle (`Fat::mount` parses the BPB) with
 `read_file(name)` that scans the root directory for the 8.3 entry (case-insensitive) and
 follows the FAT16 cluster chain, truncating to the directory's size; a boot demo and a test
-read the known `HELLO.TXT`. `ROADMAP.md` carries the forward plan (stages
+read the known `HELLO.TXT`. **Stage 14b-2b is also done**: `Fat` implements the Stage 14a
+`FileSystem` trait, so the FAT volume is usable through a `&dyn FileSystem` object like `RamFs`
+(`read`/`list`/`is_dir` over the root; the read-only driver returns `Unsupported` for the
+mutating `mkdir`/`write`/`remove`), with `FsError` gaining `Unsupported`/`Io` variants and a
+`From<FatError>` mapping. `ROADMAP.md` carries the forward plan (stages
 9-18): the user-space main line (system calls, per-process address spaces + ELF,
 multiprocessing), plus persistence, APIC/SMP, and networking tracks.
 
@@ -246,8 +250,9 @@ Exit QEMU: `Ctrl-A` then `X`.
   nodes addressed by `/`-separated paths, exposed as a global `RamFs` behind a
   mutex with `mkdir`/`write`/`read`/`list`/`remove`/`is_dir`. No disk, no
   persistence. Stage 14a factors those six operations into a `FileSystem` trait (the
-  VFS seam) that `RamFs` implements, so the coming FAT driver can coexist behind the
-  same interface; the global `fs::*` functions are unchanged.
+  VFS seam) that `RamFs` implements; Stage 14b-2b adds the FAT driver as a second
+  implementor behind the same interface (and `FsError` grows `Unsupported`/`Io` variants for
+  read-only and device errors). The global `fs::*` functions are unchanged.
 - `src/usermode.rs`: the ring 3 entry/return mechanism — `enter` forges an
   interrupt-return frame (`initial_user_frame`: entry point + user stack; since Stage
   12c-3 IF is *set* so the process is preemptible) and `iretq`s into ring 3;
@@ -309,8 +314,9 @@ Exit QEMU: `Ctrl-A` then `X`.
   parses the BPB, and `read_file(name)` scans the root directory for the 8.3 entry
   (case-insensitive; skipping deleted, long-name, and volume-label entries) then follows the
   file's FAT16 cluster chain, reading each cluster's sectors and truncating to the directory's
-  size (`BadChain` guards a corrupt or non-terminating chain). The `FileSystem` impl comes in
-  14b-2b.
+  size (`BadChain` guards a corrupt or non-terminating chain). Stage 14b-2b implements the
+  `FileSystem` VFS trait for `Fat` (read-only: `read`/`list`/`is_dir` over the root directory,
+  mutating ops return `Unsupported`), with a `From<FatError>` mapping onto the shared `FsError`.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

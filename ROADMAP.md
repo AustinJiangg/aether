@@ -125,8 +125,18 @@ unify later.
 > cluster's sectors and truncating to the directory's size field. A corrupt or non-terminating
 > chain is bounded and rejected (`BadChain`). Verified by a boot demo that prints the known
 > `HELLO.TXT` and a test asserting its exact bytes, the case-insensitive match, and the
-> `NotFound` path. Next: Stage 14b-2b — implement the `FileSystem` trait for the FAT volume so
-> a disk file system coexists with `RamFs` behind the VFS seam.
+> `NotFound` path.
+>
+> **Stage 14b-2b is also done** — the FAT volume behind the VFS trait. `Fat` now implements
+> the `FileSystem` trait from Stage 14a, so it is usable through a `&dyn FileSystem` object
+> exactly like `RamFs`: `read`, `list`, and `is_dir` operate on the root directory and its
+> entries, while the mutating operations (`mkdir`/`write`/`remove`) return `Unsupported`, since
+> this driver is read-only. `FsError` gains `Unsupported` and `Io` variants, and a
+> `From<FatError>` maps the driver's errors onto the shared VFS error type; `fs::components` is
+> shared so FAT and `RamFs` split paths identically. Verified by a boot demo that lists the
+> root through `&dyn FileSystem` and a test driving the volume through `&mut dyn FileSystem`.
+> Next: mount the FAT volume so the shell's `ls`/`cat` can reach disk paths, then tackle FAT
+> writes (the write half of Stage 14).
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|
