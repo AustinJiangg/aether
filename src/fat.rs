@@ -16,8 +16,8 @@
 //!
 //! - **Reserved**: starts with the *boot sector*, whose **BPB** (BIOS Parameter Block) holds
 //!   the geometry — sector size, cluster size, how many FATs, how big they are, and so on.
-//!   Everything else is computed from those numbers. This module (Stage 14b-1) parses the
-//!   BPB; the FAT walk and directory reading come next (14b-2).
+//!   Everything else is computed from those numbers. Stage 14b-1 parsed the BPB; Stage
+//!   14b-2 adds the FAT walk and directory reading on top, so a file can be read by name.
 //! - **FAT**: an array of cluster entries forming linked lists — each entry says "the next
 //!   cluster of this file" or "end of chain". On FAT16 each entry is a little-endian `u16`.
 //! - **Root directory**: a fixed-size array of 32-byte directory entries (8.3 names).
@@ -32,7 +32,9 @@
 
 use crate::ata::{self, AtaError, Drive};
 
+use alloc::string::String;
 use alloc::vec;
+use alloc::vec::Vec;
 
 /// A FAT volume's boot signature lives in the last two bytes of the boot sector.
 const BOOT_SIGNATURE: [u8; 2] = [0x55, 0xAA];
@@ -52,6 +54,13 @@ pub enum FatError {
     /// The geometry works out to a cluster count outside the FAT16 range; this minimal
     /// driver only handles FAT16.
     NotFat16,
+    /// No directory entry matched the requested name.
+    NotFound,
+    /// The name resolves to a subdirectory, not a file.
+    IsDirectory,
+    /// The cluster chain is malformed: a free/bad cluster appears mid-file, or the chain
+    /// never reaches an end-of-chain marker (so it would loop forever).
+    BadChain,
 }
 
 impl From<AtaError> for FatError {
@@ -178,4 +187,208 @@ pub fn read_bpb(drive: Drive) -> Result<Bpb, FatError> {
     let mut sector = vec![0u8; SECTOR_SIZE];
     ata::read_sector_from(drive, 0, &mut sector)?;
     Bpb::parse(&sector)
+}
+
+// ---------------------------------------------------------------------------
+// Stage 14b-2: reading a file — the root-directory scan and the FAT cluster walk.
+// ---------------------------------------------------------------------------
+
+/// A FAT directory entry is exactly 32 bytes; a 512-byte sector holds 16 of them.
+const DIR_ENTRY_SIZE: usize = 32;
+
+// Byte offsets within a 32-byte directory entry.
+const ENTRY_ATTR_OFFSET: usize = 0x0B; // attribute byte
+const ENTRY_FIRST_CLUSTER_LO_OFFSET: usize = 0x1A; // low 16 bits of the start cluster
+const ENTRY_SIZE_OFFSET: usize = 0x1C; // file size in bytes (u32)
+
+// Sentinel values for the first name byte of a directory entry.
+const NAME_END: u8 = 0x00; // entry free AND no entry after it is used: end of the directory
+const NAME_DELETED: u8 = 0xE5; // entry free (a deleted file): skip it, keep scanning
+
+// Directory-entry attribute bits we test.
+const ATTR_VOLUME_ID: u8 = 0x08; // the volume-label entry, not a real file
+const ATTR_DIRECTORY: u8 = 0x10; // a subdirectory rather than a file
+const ATTR_LONG_NAME: u8 = 0x0F; // a long-file-name fragment (RO|HIDDEN|SYSTEM|VOLUME): skip
+
+/// FAT16 cluster values `2..=0xFFEF` address real data clusters. `0` means free, `1` is
+/// reserved, `0xFFF0..=0xFFF6` are reserved, `0xFFF7` is a bad cluster, and `0xFFF8..=0xFFFF`
+/// mark the end of a chain. So a value is "another data cluster to follow" iff it is in range.
+fn is_data_cluster(cluster: u16) -> bool {
+    (2..=0xFFEF).contains(&cluster)
+}
+
+/// Drop the trailing space padding from one fixed-width name field (the 8-byte base or the
+/// 3-byte extension of an 8.3 name).
+fn trim_trailing_spaces(field: &[u8]) -> &[u8] {
+    match field.iter().rposition(|&b| b != b' ') {
+        Some(last) => &field[..=last],
+        None => &[], // all spaces (e.g. a no-extension file): an empty field
+    }
+}
+
+/// Turn the 11-byte, space-padded 8.3 name from a directory entry into a normal string, e.g.
+/// `b"HELLO   TXT"` -> `"HELLO.TXT"` and `b"README     "` -> `"README"`. Only ASCII names are
+/// handled (each byte mapped straight to a `char`), which is all our host tools produce.
+fn short_name_to_string(raw: &[u8]) -> String {
+    let base = trim_trailing_spaces(&raw[0..8]);
+    let ext = trim_trailing_spaces(&raw[8..11]);
+
+    let mut name = String::new();
+    for &b in base {
+        name.push(b as char);
+    }
+    if !ext.is_empty() {
+        name.push('.');
+        for &b in ext {
+            name.push(b as char);
+        }
+    }
+    name
+}
+
+/// The fields of a located directory entry that the reader cares about.
+struct RootEntry {
+    /// First cluster of the file's data (its head in the FAT chain).
+    first_cluster: u16,
+    /// File length in bytes, from the directory entry.
+    size: u32,
+    /// Whether this entry is a subdirectory rather than a regular file.
+    is_dir: bool,
+}
+
+/// A mounted, read-only FAT16 volume: the drive it lives on plus its parsed geometry
+/// ([`Bpb`]). Construct one with [`Fat::mount`], then read files with [`Fat::read_file`].
+pub struct Fat {
+    drive: Drive,
+    bpb: Bpb,
+}
+
+impl Fat {
+    /// Mount the FAT volume on `drive` by reading and parsing its boot sector (the BPB).
+    pub fn mount(drive: Drive) -> Result<Fat, FatError> {
+        let bpb = read_bpb(drive)?;
+        Ok(Fat { drive, bpb })
+    }
+
+    /// The volume's parsed geometry (sector/cluster sizes and the region start LBAs).
+    pub fn bpb(&self) -> &Bpb {
+        &self.bpb
+    }
+
+    /// The LBA of the first sector of data cluster `cluster` (which must be >= 2). Cluster
+    /// numbering starts at 2, so cluster 2 maps to the very start of the data region.
+    fn cluster_lba(&self, cluster: u16) -> u32 {
+        self.bpb.data_start_sector() + (cluster as u32 - 2) * self.bpb.sectors_per_cluster as u32
+    }
+
+    /// Look up the FAT entry for `cluster`: the next cluster in the chain, or an
+    /// end-of-chain marker (>= 0xFFF8). On FAT16 each entry is a little-endian `u16`, so the
+    /// entry for cluster N lives at byte offset `N * 2` into the FAT region. 512 is even and
+    /// entries are 2 bytes wide, so an entry never straddles a sector boundary.
+    ///
+    /// This reads a fresh FAT sector on every call — simple, and fine for the tiny files
+    /// here; a real driver would cache the FAT.
+    fn next_cluster(&self, cluster: u16) -> Result<u16, FatError> {
+        let fat_offset = cluster as u32 * 2; // 2 bytes per FAT16 entry
+        let sector = self.bpb.fat_start_sector() + fat_offset / SECTOR_SIZE as u32;
+        let offset = (fat_offset % SECTOR_SIZE as u32) as usize;
+
+        let mut buf = vec![0u8; SECTOR_SIZE];
+        ata::read_sector_from(self.drive, sector, &mut buf)?;
+        Ok(read_u16(&buf, offset))
+    }
+
+    /// Scan the fixed-size root directory for the entry named `name` (8.3, ASCII, matched
+    /// case-insensitively). Returns its start cluster, size, and kind, or `None` if no entry
+    /// matches. Long-file-name fragments and the volume-label entry are skipped.
+    fn find_root_entry(&self, name: &str) -> Result<Option<RootEntry>, FatError> {
+        let start = self.bpb.root_dir_start_sector();
+        let sectors = self.bpb.root_dir_sectors();
+        let mut buf = vec![0u8; SECTOR_SIZE];
+
+        for s in 0..sectors {
+            ata::read_sector_from(self.drive, start + s, &mut buf)?;
+
+            for e in 0..(SECTOR_SIZE / DIR_ENTRY_SIZE) {
+                let entry = &buf[e * DIR_ENTRY_SIZE..(e + 1) * DIR_ENTRY_SIZE];
+
+                match entry[0] {
+                    // A 0x00 first byte means this entry is free and so is every entry after
+                    // it: the directory ends here, so the name is not present.
+                    NAME_END => return Ok(None),
+                    // A deleted (free) entry — skip it and keep scanning.
+                    NAME_DELETED => continue,
+                    _ => {}
+                }
+
+                let attr = entry[ENTRY_ATTR_OFFSET];
+                if attr == ATTR_LONG_NAME || attr & ATTR_VOLUME_ID != 0 {
+                    continue; // skip LFN fragments and the volume label
+                }
+
+                if short_name_to_string(&entry[0..11]).eq_ignore_ascii_case(name) {
+                    return Ok(Some(RootEntry {
+                        first_cluster: read_u16(entry, ENTRY_FIRST_CLUSTER_LO_OFFSET),
+                        size: read_u32(entry, ENTRY_SIZE_OFFSET),
+                        is_dir: attr & ATTR_DIRECTORY != 0,
+                    }));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Follow the FAT cluster chain from `first_cluster`, reading cluster contents until
+    /// `size` bytes are gathered (or the chain ends), then truncate to `size` — the final
+    /// cluster is usually only partly used. A `size` of 0 (an empty file, whose start cluster
+    /// is 0) yields an empty vector.
+    fn read_chain(&self, first_cluster: u16, size: usize) -> Result<Vec<u8>, FatError> {
+        let mut data = Vec::with_capacity(size);
+        let mut buf = vec![0u8; SECTOR_SIZE];
+
+        // A file cannot span more clusters than the volume has; following more than that
+        // means the chain is circular or otherwise corrupt, so we bail instead of hanging.
+        let max_steps = self.bpb.count_of_clusters() as usize + 2;
+        let mut cluster = first_cluster;
+        let mut steps = 0usize;
+
+        while is_data_cluster(cluster) {
+            steps += 1;
+            if steps > max_steps {
+                return Err(FatError::BadChain);
+            }
+
+            // Read every sector of this cluster into the output buffer.
+            let lba = self.cluster_lba(cluster);
+            for s in 0..self.bpb.sectors_per_cluster as u32 {
+                ata::read_sector_from(self.drive, lba + s, &mut buf)?;
+                data.extend_from_slice(&buf);
+            }
+
+            // Once we have the whole file there is no need to read further clusters.
+            if data.len() >= size {
+                break;
+            }
+            cluster = self.next_cluster(cluster)?;
+        }
+
+        if data.len() < size {
+            // The chain ended (a free/bad/end-of-chain cluster) before the file's declared
+            // size was reached — the directory and FAT disagree, so the volume is corrupt.
+            return Err(FatError::BadChain);
+        }
+        data.truncate(size);
+        Ok(data)
+    }
+
+    /// Read the file named `name` (8.3, case-insensitive) from the root directory and return
+    /// its bytes. Fails with [`FatError::NotFound`] if there is no such entry, or
+    /// [`FatError::IsDirectory`] if the name is a subdirectory rather than a file.
+    pub fn read_file(&self, name: &str) -> Result<Vec<u8>, FatError> {
+        match self.find_root_entry(name)? {
+            None => Err(FatError::NotFound),
+            Some(entry) if entry.is_dir => Err(FatError::IsDirectory),
+            Some(entry) => self.read_chain(entry.first_cluster, entry.size as usize),
+        }
+    }
 }

@@ -340,3 +340,28 @@ fn fat_bpb_parses_known_geometry() {
     assert_eq!(bpb.root_dir_start_sector(), 81);
     assert_eq!(bpb.data_start_sector(), 113);
 }
+
+/// Stage 14b-2: read a real file off the FAT16 disk end to end. The host's `build.rs` copies a
+/// known HELLO.TXT into the image, so mounting the volume, scanning the root directory for the
+/// 8.3 entry, and following its FAT cluster chain must return exactly those bytes — this
+/// exercises the directory scan, the case-insensitive name match, and the chain walk together.
+#[test_case]
+fn fat_reads_known_file() {
+    use crate::ata::Drive;
+    use crate::fat::{Fat, FatError};
+    // Must match FAT_FILE_CONTENT in build.rs.
+    const EXPECTED: &[u8] = b"Hello from a real FAT16 disk, read by Aether.\n";
+
+    let volume = Fat::mount(Drive::SecondaryMaster).expect("mounting the FAT volume failed");
+
+    // The known file reads back byte-for-byte.
+    let bytes = volume.read_file("HELLO.TXT").expect("reading HELLO.TXT failed");
+    assert_eq!(bytes, EXPECTED);
+
+    // 8.3 names match case-insensitively, so a lowercase request finds the same file.
+    let lower = volume.read_file("hello.txt").expect("case-insensitive read failed");
+    assert_eq!(lower, EXPECTED);
+
+    // A name with no matching entry is reported as NotFound (not a panic or wrong bytes).
+    assert_eq!(volume.read_file("NOPE.TXT"), Err(FatError::NotFound));
+}

@@ -362,40 +362,43 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         }
     }
 
-    // Stage 14b-1: read and parse a real FAT16 filesystem's boot sector. The FAT disk is the
-    // secondary IDE master (`fat.img`, formatted by the host's mkfs.fat). Parsing its BPB
-    // proves the kernel can reach the second ATA bus and understand the on-disk geometry —
-    // the foundation the file reader (14b-2) builds on.
+    // Stage 14b-2: mount a real FAT16 filesystem and read a file off it. The FAT disk is the
+    // secondary IDE master (`fat.img`, formatted by the host's mkfs.fat with a known
+    // HELLO.TXT). `Fat::mount` parses the boot sector's BPB (Stage 14b-1); `read_file` then
+    // scans the root directory for the 8.3 name, follows its FAT cluster chain, and returns
+    // the bytes — the kernel reading a file off a genuine on-disk filesystem.
     {
-        match fat::read_bpb(ata::Drive::SecondaryMaster) {
-            Ok(bpb) => {
+        match fat::Fat::mount(ata::Drive::SecondaryMaster) {
+            Ok(volume) => {
+                let bpb = volume.bpb();
                 serial_println!(
-                    "[fat] BPB ok: {} B/sector, {} sector(s)/cluster, {} reserved, {} FAT(s) \
-                     of {} sectors, {} root entries, {} total sectors, {} clusters",
-                    bpb.bytes_per_sector,
-                    bpb.sectors_per_cluster,
-                    bpb.reserved_sectors,
-                    bpb.num_fats,
-                    bpb.fat_size_sectors,
-                    bpb.root_entry_count,
-                    bpb.total_sectors,
+                    "[fat] mounted: {} clusters; FAT@{}, root-dir@{}, data@{} (LBA)",
                     bpb.count_of_clusters(),
-                );
-                serial_println!(
-                    "[fat] layout: FAT@{}, root-dir@{}, data@{} (LBA)",
                     bpb.fat_start_sector(),
                     bpb.root_dir_start_sector(),
                     bpb.data_start_sector(),
                 );
-                println!(
-                    "FAT16 disk mounted: {} clusters, data starts at LBA {}",
-                    bpb.count_of_clusters(),
-                    bpb.data_start_sector(),
-                );
+                match volume.read_file("HELLO.TXT") {
+                    Ok(bytes) => {
+                        serial_println!("[fat] read HELLO.TXT ({} bytes):", bytes.len());
+                        // The file is known ASCII text; echo it to the serial log.
+                        if let Ok(text) = core::str::from_utf8(&bytes) {
+                            serial_print!("{}", text);
+                        }
+                        println!(
+                            "FAT16 file read: HELLO.TXT ({} bytes) off a real disk",
+                            bytes.len()
+                        );
+                    }
+                    Err(e) => {
+                        serial_println!("[fat] reading HELLO.TXT failed: {:?}", e);
+                        println!("FAT16 file read FAILED: {:?}", e);
+                    }
+                }
             }
             Err(e) => {
-                serial_println!("[fat] failed to read/parse BPB: {:?}", e);
-                println!("FAT16 disk parse FAILED: {:?}", e);
+                serial_println!("[fat] mount failed: {:?}", e);
+                println!("FAT16 mount FAILED: {:?}", e);
             }
         }
     }
