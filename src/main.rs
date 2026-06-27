@@ -415,6 +415,13 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     }
                     Err(e) => serial_println!("[fat] VFS list of root failed: {:?}", e),
                 }
+
+                // Stage 14b-3: mount the FAT volume into the VFS at /mnt, so the interactive
+                // shell's `ls`/`cat` reach disk files through the same `fs::*` API as the
+                // in-memory tree. From here `/mnt/HELLO.TXT` reads this disk live.
+                fs::mount(Box::new(volume));
+                serial_println!("[fat] mounted the FAT volume at /mnt");
+                println!("FAT volume mounted at /mnt (try: ls /mnt, cat /mnt/HELLO.TXT)");
             }
             Err(e) => {
                 serial_println!("[fat] mount failed: {:?}", e);

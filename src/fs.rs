@@ -21,6 +21,7 @@
 //! concrete filesystem drivers. [`RamFs`] is the first implementor; the FAT driver
 //! (Stage 14b) will be the second, slotting in behind the same trait.
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -205,40 +206,86 @@ impl FileSystem for RamFs {
     }
 }
 
-/// The kernel's single in-memory file system. Guarded by a spinlock; only the
-/// shell (task context) touches it, so a plain `Mutex` is enough.
+/// The kernel's root in-memory file system. Guarded by a spinlock; only the shell
+/// (task context) and boot touch it, so a plain `Mutex` is enough.
 static FS: Mutex<RamFs> = Mutex::new(RamFs::new());
 
-// Thin locking wrappers — the API the shell calls. Each takes the lock, runs one
-// operation, and releases it (results are owned, so nothing borrows the tree
-// across the lock).
+/// A single optional mounted filesystem (Stage 14b-3): a real on-disk volume (the FAT driver)
+/// layered onto the root tree at [`MOUNT_POINT`]. `None` until [`mount`] installs one. This is
+/// a deliberately minimal "mount table" — one entry — but it is the real VFS idea: a path under
+/// the mount point is served by a *different* filesystem, transparently to the caller.
+static MOUNT: Mutex<Option<Box<dyn FileSystem + Send>>> = Mutex::new(None);
+
+/// Where the mounted volume appears in the path namespace: `/mnt/HELLO.TXT` reads the disk's
+/// `HELLO.TXT`, while everything outside `/mnt` stays in the in-memory tree.
+const MOUNT_POINT: &str = "/mnt";
+
+/// Install `filesystem` at [`MOUNT_POINT`] so paths under it are served by that filesystem.
+/// Also creates the mount-point directory in the root tree (ignoring "already exists") so it
+/// lists and `cd`s like any other directory. Replaces any previously mounted volume.
+pub fn mount(filesystem: Box<dyn FileSystem + Send>) {
+    let _ = FS.lock().mkdir(MOUNT_POINT); // ensure the mount point exists; ignore if it does
+    *MOUNT.lock() = Some(filesystem);
+}
+
+/// If `path` lies at or under [`MOUNT_POINT`], return the path *within* the mounted volume (the
+/// prefix stripped; the mount point itself becomes `/`). `None` means "use the root FS". The
+/// boundary check (the next char is `/`, or the string ends) stops `/mntfoo` matching `/mnt`.
+fn mount_subpath(path: &str) -> Option<String> {
+    let rest = path.strip_prefix(MOUNT_POINT)?;
+    if rest.is_empty() {
+        Some(String::from("/")) // exactly the mount point -> the volume's root
+    } else if rest.starts_with('/') {
+        Some(String::from(rest)) // under the mount point
+    } else {
+        None // a different name that merely shares the prefix (e.g. "/mnt2")
+    }
+}
+
+/// Route one filesystem operation to whichever filesystem backs `path`: the mounted volume if
+/// `path` is under [`MOUNT_POINT`] and something is mounted there (with the prefix stripped),
+/// otherwise the root in-memory tree. `op` receives `&mut dyn FileSystem`, which also serves
+/// the read-only (`&self`) operations.
+fn dispatch<R>(path: &str, op: impl FnOnce(&mut dyn FileSystem, &str) -> R) -> R {
+    if let Some(sub) = mount_subpath(path) {
+        let mut mount = MOUNT.lock();
+        if let Some(fs) = mount.as_mut() {
+            return op(fs.as_mut(), &sub);
+        }
+        // Nothing mounted there: fall through and let the root tree handle the literal path.
+    }
+    op(&mut *FS.lock(), path)
+}
+
+// Thin wrappers — the API the shell calls. Each routes through `dispatch`, so the shell need
+// not know whether a path lands in the in-memory tree or on the FAT disk.
 
 /// Create an empty directory at `path`.
 pub fn mkdir(path: &str) -> Result<(), FsError> {
-    FS.lock().mkdir(path)
+    dispatch(path, |fs, p| fs.mkdir(p))
 }
 
 /// Create or overwrite the file at `path` with `data`.
 pub fn write(path: &str, data: &[u8]) -> Result<(), FsError> {
-    FS.lock().write(path, data)
+    dispatch(path, |fs, p| fs.write(p, data))
 }
 
 /// Read the bytes of the file at `path`.
 pub fn read(path: &str) -> Result<Vec<u8>, FsError> {
-    FS.lock().read(path)
+    dispatch(path, |fs, p| fs.read(p))
 }
 
 /// List the directory at `path` as `(name, is_dir)` pairs.
 pub fn list(path: &str) -> Result<Vec<(String, bool)>, FsError> {
-    FS.lock().list(path)
+    dispatch(path, |fs, p| fs.list(p))
 }
 
 /// Remove the file or directory at `path`.
 pub fn remove(path: &str) -> Result<(), FsError> {
-    FS.lock().remove(path)
+    dispatch(path, |fs, p| fs.remove(p))
 }
 
 /// Whether `path` is an existing directory.
 pub fn is_dir(path: &str) -> bool {
-    FS.lock().is_dir(path)
+    dispatch(path, |fs, p| fs.is_dir(p))
 }

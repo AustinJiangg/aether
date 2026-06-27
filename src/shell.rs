@@ -294,6 +294,15 @@ pub fn selftest() {
         dispatch(&mut cwd, command);
     }
 
+    // Stage 14b-3: the FAT disk is mounted at /mnt, so the same `ls`/`cat` commands reach real
+    // on-disk files through the VFS — no special "disk" command needed. (If no disk is mounted,
+    // these degrade to "no such file" instead of failing the boot.)
+    sh_println!("[shell selftest] reading the mounted FAT disk at /mnt:");
+    for command in ["ls /", "ls /mnt", "cat /mnt/HELLO.TXT", "cd /mnt", "pwd", "cd /"] {
+        sh_println!("aether:{}> {}", cwd, command);
+        dispatch(&mut cwd, command);
+    }
+
     // Exercise the interactive key path (echo, Backspace, Enter) by feeding
     // decoded keys through the same `handle_key` the live loop uses. We "type"
     // `echX`, Backspace (erasing the X), then `o hi` and Enter, so the buffer

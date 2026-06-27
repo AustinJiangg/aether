@@ -404,3 +404,31 @@ fn fat_satisfies_vfs_trait() {
     assert_eq!(fs.write("/x", b"y"), Err(FsError::Unsupported));
     assert_eq!(fs.remove("/HELLO.TXT"), Err(FsError::Unsupported));
 }
+
+/// Stage 14b-3: the FAT volume is mounted into the global VFS at /mnt during boot, so the
+/// shell's `fs::*` API reaches disk files transparently. `kernel_main` mounts it before this
+/// harness runs (the very path the interactive shell uses), so reading `/mnt/HELLO.TXT` through
+/// the global `fs::read` returns the disk file, while paths outside `/mnt` stay in the
+/// in-memory tree.
+#[test_case]
+fn fat_mounts_into_vfs() {
+    use crate::fs;
+    // Must match FAT_FILE_CONTENT in build.rs.
+    const EXPECTED: &[u8] = b"Hello from a real FAT16 disk, read by Aether.\n";
+
+    // The mount point is a directory, and the disk file reads through the global API.
+    assert!(fs::is_dir("/mnt"));
+    assert_eq!(fs::read("/mnt/HELLO.TXT").unwrap(), EXPECTED);
+
+    // The file shows up listing the mount point, and `/mnt` itself shows up listing the root.
+    let mnt = fs::list("/mnt").unwrap();
+    assert!(mnt.iter().any(|(name, is_dir)| name.as_str() == "HELLO.TXT" && !*is_dir));
+    let root = fs::list("/").unwrap();
+    assert!(root.iter().any(|(name, is_dir)| name.as_str() == "mnt" && *is_dir));
+
+    // A path outside the mount still routes to the in-memory tree (no disk involved).
+    fs::mkdir("/vfs_probe").unwrap();
+    fs::write("/vfs_probe/f", b"ram").unwrap();
+    assert_eq!(fs::read("/vfs_probe/f").unwrap(), b"ram".to_vec());
+    fs::remove("/vfs_probe").unwrap();
+}
