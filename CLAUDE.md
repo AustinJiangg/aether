@@ -123,7 +123,11 @@ boot sector. `fat.rs` reads sector 0 of a real FAT16 disk and parses its BPB (BI
 Block) into geometry, then derives the FAT/root-directory/data region LBAs. The disk
 (`fat.img`) is formatted by the host's `mkfs.fat` in `build.rs` (with a known `HELLO.TXT`)
 and attached as the secondary IDE master, which extended the ATA driver to a second bus
-(`Drive::SecondaryMaster`, ports 0x170/0x376). `ROADMAP.md` carries the forward plan (stages
+(`Drive::SecondaryMaster`, ports 0x170/0x376). **Stage 14b-2a is also done**: reading a file
+off the FAT volume — a mounted `Fat` handle (`Fat::mount` parses the BPB) with
+`read_file(name)` that scans the root directory for the 8.3 entry (case-insensitive) and
+follows the FAT16 cluster chain, truncating to the directory's size; a boot demo and a test
+read the known `HELLO.TXT`. `ROADMAP.md` carries the forward plan (stages
 9-18): the user-space main line (system calls, per-process address spaces + ELF,
 multiprocessing), plus persistence, APIC/SMP, and networking tracks.
 
@@ -301,8 +305,12 @@ Exit QEMU: `Ctrl-A` then `X`.
   root-entry count, total sectors — validates the `0x55AA` signature and FAT16 cluster
   range, and derives the FAT/root-directory/data region start LBAs; `read_bpb(drive)` does
   the sector-0 read then parses. The disk is the secondary master (`fat.img`), formatted by
-  the host's `mkfs.fat` in `build.rs`. File reading (FAT walk, directory) and the
-  `FileSystem` impl come in 14b-2.
+  the host's `mkfs.fat` in `build.rs`. Stage 14b-2 adds a mounted `Fat` handle: `Fat::mount`
+  parses the BPB, and `read_file(name)` scans the root directory for the 8.3 entry
+  (case-insensitive; skipping deleted, long-name, and volume-label entries) then follows the
+  file's FAT16 cluster chain, reading each cluster's sectors and truncating to the directory's
+  size (`BadChain` guards a corrupt or non-terminating chain). The `FileSystem` impl comes in
+  14b-2b.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

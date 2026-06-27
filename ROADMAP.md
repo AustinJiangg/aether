@@ -115,8 +115,18 @@ unify later.
 > `mkfs.fat` in `build.rs` (a known `HELLO.TXT` copied in via `mcopy`) and attached as the
 > *secondary* IDE master, which extended the ATA driver to address the second bus
 > (`SecondaryMaster`, ports 0x170/0x376). Verified by a boot demo and a test asserting the
-> exact geometry. Next: Stage 14b-2 — walk the FAT and root directory to read a file, and
-> implement the `FileSystem` trait for the FAT volume.
+> exact geometry.
+>
+> **Stage 14b-2a is also done** — reading a file off the FAT volume. `fat.rs` gains a mounted
+> `Fat` handle (`Fat::mount` parses the BPB) and `read_file(name)`: it scans the fixed-size
+> root directory for the 8.3 entry (case-insensitive, skipping deleted, long-name, and
+> volume-label entries), then walks the file's **FAT cluster chain** — each FAT16 entry a
+> little-endian `u16` pointing at the next cluster, until an end-of-chain marker — reading each
+> cluster's sectors and truncating to the directory's size field. A corrupt or non-terminating
+> chain is bounded and rejected (`BadChain`). Verified by a boot demo that prints the known
+> `HELLO.TXT` and a test asserting its exact bytes, the case-insensitive match, and the
+> `NotFound` path. Next: Stage 14b-2b — implement the `FileSystem` trait for the FAT volume so
+> a disk file system coexists with `RamFs` behind the VFS seam.
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|
