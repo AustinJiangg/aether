@@ -142,9 +142,18 @@ unify later.
 > `RamFs`; the six `fs::*` wrappers funnel through one `dispatch` helper, so the shell does not
 > know which filesystem backs a path. Boot mounts the read-only FAT volume at `/mnt`, so the
 > shell's `ls /mnt`, `cat /mnt/HELLO.TXT`, and `cd /mnt` read real disk files. Verified by the
-> shell selftest and a test reading `/mnt/HELLO.TXT` through the global `fs::read`. Next: FAT
-> writes (the write half of Stage 14) — allocate clusters, update the FAT and the directory
-> entry, manage free space.
+> shell selftest and a test reading `/mnt/HELLO.TXT` through the global `fs::read`.
+>
+> **Stage 14c-1 is also done** — writing a file to the FAT volume. `fat.rs` gains the write
+> path: `alloc_cluster` scans the FAT for a free cluster and marks it end-of-chain;
+> `write_chain` reserves a chain, writes the data (zero-padding the final sector), and links the
+> clusters; `write_file` finds or creates the root-directory entry, frees the old chain on an
+> overwrite, and stores the name, first cluster, and size. Every FAT copy is updated so the
+> mirrors stay identical, and the bytes reach the disk through the Stage 13b `ata::write_sector`
+> (cache flush included). It is wired into `FileSystem::write`, so the shell's `write /mnt/foo`
+> lands on disk and survives a reboot. Verified by a multi-cluster write/overwrite/read-back
+> test and the shell selftest. Next: Stage 14c-2 — file removal (`rm /mnt/foo`): free the
+> cluster chain and mark the directory entry deleted.
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

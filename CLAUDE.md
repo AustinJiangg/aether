@@ -134,7 +134,11 @@ mutating `mkdir`/`write`/`remove`), with `FsError` gaining `Unsupported`/`Io` va
 `From<FatError>` mapping. **Stage 14b-3 is also done**: the FAT volume is mounted into the VFS
 at `/mnt` via a minimal one-entry mount table in `fs.rs` (the six `fs::*` wrappers route a
 `/mnt`-prefixed path to the mounted `Box<dyn FileSystem>`, everything else to `RamFs`), so the
-shell's `ls`/`cat`/`cd` reach real disk files. `ROADMAP.md` carries the forward plan (stages
+shell's `ls`/`cat`/`cd` reach real disk files. **Stage 14c-1 is also done**: FAT *writes* —
+`Fat::write_file` allocates a cluster chain (`alloc_cluster`/`write_chain`), writes the data
+through `ata::write_sector`, and creates/overwrites the root-directory entry (updating every FAT
+copy), wired into `FileSystem::write` so the shell's `write /mnt/foo` lands on disk and survives
+a reboot. `ROADMAP.md` carries the forward plan (stages
 9-18): the user-space main line (system calls, per-process address spaces + ELF,
 multiprocessing), plus persistence, APIC/SMP, and networking tracks.
 
@@ -311,7 +315,8 @@ Exit QEMU: `Ctrl-A` then `X`.
   `scratch.img` that a host `build.rs` creates and `Cargo.toml` attaches as the primary
   slave. Single-sector. Stage 14b adds the secondary bus: `Drive::SecondaryMaster` (ports
   0x170/0x376) addresses the FAT disk, with the bus `(io_base, ctrl_base)` chosen per drive.
-- `src/fat.rs`: Stage 14b read-only FAT16 driver over the ATA block driver. `Bpb::parse`
+- `src/fat.rs`: Stage 14b/14c FAT16 driver over the ATA block driver (read, plus write since
+  14c-1). `Bpb::parse`
   reads a boot sector's BIOS Parameter Block — sector/cluster size, FAT count and size,
   root-entry count, total sectors — validates the `0x55AA` signature and FAT16 cluster
   range, and derives the FAT/root-directory/data region start LBAs; `read_bpb(drive)` does
@@ -321,8 +326,11 @@ Exit QEMU: `Ctrl-A` then `X`.
   (case-insensitive; skipping deleted, long-name, and volume-label entries) then follows the
   file's FAT16 cluster chain, reading each cluster's sectors and truncating to the directory's
   size (`BadChain` guards a corrupt or non-terminating chain). Stage 14b-2b implements the
-  `FileSystem` VFS trait for `Fat` (read-only: `read`/`list`/`is_dir` over the root directory,
-  mutating ops return `Unsupported`), with a `From<FatError>` mapping onto the shared `FsError`.
+  `FileSystem` VFS trait for `Fat` (`read`/`list`/`is_dir` over the root directory), with a
+  `From<FatError>` mapping onto the shared `FsError`. Stage 14c-1 adds the write path —
+  `alloc_cluster`/`write_chain`/`write_file` create or overwrite a root-level file (updating
+  every FAT copy via `ata::write_sector`), wired into `FileSystem::write`; `mkdir`/`remove`
+  stay `Unsupported` for now.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run
