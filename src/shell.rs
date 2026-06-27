@@ -294,15 +294,17 @@ pub fn selftest() {
         dispatch(&mut cwd, command);
     }
 
-    // Stage 14b-3 / 14c-1: the FAT disk is mounted at /mnt, so the same `ls`/`cat`/`write`
-    // commands reach real on-disk files through the VFS — no special "disk" command needed. The
-    // NOTE.TXT written here persists on the disk image across reboots (the point of persistence).
-    sh_println!("[shell selftest] reading and writing the mounted FAT disk at /mnt:");
+    // Stage 14b-3 / 14c: the FAT disk is mounted at /mnt, so the same ls/cat/write/rm commands
+    // reach real on-disk files through the VFS — no special "disk" command needed. Here we write
+    // a file, read it back, then remove it: the full lifecycle. (WRITTEN.DAT, written by the
+    // test suite, persists on the disk image across reboots — the point of persistence.)
+    sh_println!("[shell selftest] read/write/remove on the mounted FAT disk at /mnt:");
     for command in [
         "ls /mnt",
         "cat /mnt/HELLO.TXT",
         "write /mnt/NOTE.TXT shell wrote this to disk",
         "cat /mnt/NOTE.TXT",
+        "rm /mnt/NOTE.TXT",
         "ls /mnt",
     ] {
         sh_println!("aether:{}> {}", cwd, command);

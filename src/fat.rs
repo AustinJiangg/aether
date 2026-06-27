@@ -462,8 +462,9 @@ impl From<FatError> for FsError {
 /// which shapes the implementation:
 /// - `read`/`list`/`is_dir` operate on the root and its entries;
 /// - `write` creates or overwrites a root-level file (Stage 14c-1);
-/// - `mkdir` and `remove` are not supported yet, and a path that descends into a subdirectory
-///   yields [`FsError::Unsupported`].
+/// - `remove` deletes a root-level file (Stage 14c-2);
+/// - `mkdir` is not supported, and a path that descends into a subdirectory yields
+///   [`FsError::Unsupported`].
 impl FileSystem for Fat {
     fn mkdir(&mut self, _path: &str) -> Result<(), FsError> {
         Err(FsError::Unsupported) // creating subdirectories is not supported
@@ -478,8 +479,13 @@ impl FileSystem for Fat {
         }
     }
 
-    fn remove(&mut self, _path: &str) -> Result<(), FsError> {
-        Err(FsError::Unsupported) // file removal comes in Stage 14c-2
+    fn remove(&mut self, path: &str) -> Result<(), FsError> {
+        let mut comps = crate::fs::components(path);
+        match (comps.next(), comps.next()) {
+            (None, _) => Err(FsError::IsDir),                // cannot remove the root itself
+            (Some(name), None) => Ok(self.remove_file(name)?),
+            (Some(_), Some(_)) => Err(FsError::Unsupported), // no subdirectory traversal yet
+        }
     }
 
     /// Read a root-level file. The root itself (`/`) is a directory, not a file; a path with
@@ -698,14 +704,14 @@ impl Fat {
         Ok(clusters[0])
     }
 
-    /// Locate the root-directory slot for `short`: the existing entry of that name (to
-    /// overwrite), or the first free slot (to create). Errors with `DirFull` if the directory
-    /// is full and the name is not already present.
-    fn find_dir_slot(&self, short: &[u8; 11]) -> Result<DirSlot, FatError> {
+    /// Search the root directory for an in-use entry named `short`, returning its [`DirSlot`]
+    /// (with `existing` populated) or `None` if there is none. Skips free, deleted, long-name,
+    /// and volume-label entries, and stops at the end-of-directory marker. The shared search
+    /// behind [`find_dir_slot`] (write) and [`remove_file`] (delete).
+    fn find_entry(&self, short: &[u8; 11]) -> Result<Option<DirSlot>, FatError> {
         let start = self.bpb.root_dir_start_sector();
         let sectors = self.bpb.root_dir_sectors();
         let mut buf = vec![0u8; SECTOR_SIZE];
-        let mut free_slot: Option<(u32, usize)> = None;
 
         for s in 0..sectors {
             let lba = start + s;
@@ -713,31 +719,50 @@ impl Fat {
             for i in 0..(SECTOR_SIZE / DIR_ENTRY_SIZE) {
                 let off = i * DIR_ENTRY_SIZE;
                 let first_byte = buf[off];
+                if first_byte == NAME_END {
+                    return Ok(None); // directory ends here: the name is not present
+                }
+                if first_byte == NAME_DELETED {
+                    continue;
+                }
                 let attr = buf[off + ENTRY_ATTR_OFFSET];
-
-                let in_use = first_byte != NAME_END && first_byte != NAME_DELETED;
-                let real = attr != ATTR_LONG_NAME && attr & ATTR_VOLUME_ID == 0;
-                if in_use && real && &buf[off..off + 11] == &short[..] {
+                if attr == ATTR_LONG_NAME || attr & ATTR_VOLUME_ID != 0 {
+                    continue; // skip LFN fragments and the volume label
+                }
+                if &buf[off..off + 11] == &short[..] {
                     let first = read_u16(&buf, off + ENTRY_FIRST_CLUSTER_LO_OFFSET);
                     let is_dir = attr & ATTR_DIRECTORY != 0;
-                    return Ok(DirSlot { lba, offset: off, existing: Some((first, is_dir)) });
+                    return Ok(Some(DirSlot { lba, offset: off, existing: Some((first, is_dir)) }));
                 }
+            }
+        }
+        Ok(None)
+    }
 
-                if free_slot.is_none() && !in_use {
-                    free_slot = Some((lba, off)); // remember the first reusable slot
-                }
-                if first_byte == NAME_END {
-                    // Nothing in use beyond here, so create in the first free slot seen (at
-                    // worst this NAME_END slot itself).
-                    let (lba, off) = free_slot.expect("the NAME_END slot is itself free");
+    /// Locate the root-directory slot for `short`: the existing entry of that name (to
+    /// overwrite), or the first free slot (to create in). Errors with `DirFull` if the name is
+    /// absent and the directory has no free slot.
+    fn find_dir_slot(&self, short: &[u8; 11]) -> Result<DirSlot, FatError> {
+        if let Some(slot) = self.find_entry(short)? {
+            return Ok(slot); // overwrite an existing entry of the same name
+        }
+
+        // Not present: reuse the first free slot (a deleted 0xE5 entry, or the 0x00 end marker).
+        let start = self.bpb.root_dir_start_sector();
+        let sectors = self.bpb.root_dir_sectors();
+        let mut buf = vec![0u8; SECTOR_SIZE];
+        for s in 0..sectors {
+            let lba = start + s;
+            ata::read_sector_from(self.drive, lba, &mut buf)?;
+            for i in 0..(SECTOR_SIZE / DIR_ENTRY_SIZE) {
+                let off = i * DIR_ENTRY_SIZE;
+                let first_byte = buf[off];
+                if first_byte == NAME_END || first_byte == NAME_DELETED {
                     return Ok(DirSlot { lba, offset: off, existing: None });
                 }
             }
         }
-        match free_slot {
-            Some((lba, off)) => Ok(DirSlot { lba, offset: off, existing: None }),
-            None => Err(FatError::DirFull),
-        }
+        Err(FatError::DirFull)
     }
 
     /// Create or overwrite the root-level file `name` with `data`. Overwriting frees the old
@@ -774,6 +799,31 @@ impl Fat {
             .copy_from_slice(&(data.len() as u32).to_le_bytes());
         ata::write_sector(self.drive, slot.lba, &buf)?;
 
+        Ok(())
+    }
+
+    /// Remove the root-level file `name`: free its cluster chain, then mark its directory entry
+    /// deleted. Fails with `NotFound` if there is no such entry, or `IsDirectory` if `name`
+    /// names a subdirectory (this driver removes only files).
+    pub fn remove_file(&self, name: &str) -> Result<(), FatError> {
+        let short = string_to_short_name(name).ok_or(FatError::InvalidName)?;
+        let slot = match self.find_entry(&short)? {
+            Some(slot) => slot,
+            None => return Err(FatError::NotFound),
+        };
+        let (first, is_dir) = slot.existing.expect("find_entry always sets `existing`");
+        if is_dir {
+            return Err(FatError::IsDirectory);
+        }
+
+        if first >= 2 {
+            self.free_chain(first)?; // release the data clusters back to the free pool
+        }
+        // Mark the directory entry free by writing 0xE5 over the first byte of its name.
+        let mut buf = vec![0u8; SECTOR_SIZE];
+        ata::read_sector_from(self.drive, slot.lba, &mut buf)?;
+        buf[slot.offset] = NAME_DELETED;
+        ata::write_sector(self.drive, slot.lba, &buf)?;
         Ok(())
     }
 }

@@ -429,6 +429,27 @@ fn fat_writes_a_file() {
     assert!(entries.iter().any(|(name, is_dir)| name.as_str() == "WRITTEN.DAT" && !*is_dir));
 }
 
+/// Stage 14c-2: the FAT driver removes a root-level file — frees its cluster chain and marks the
+/// directory entry deleted. Write a file through the VFS, confirm it reads back, remove it, then
+/// confirm it is gone (reading and re-removing both report `NotFound`, and it is off the
+/// listing). Self-cleaning, so it leaves the disk image as it found it.
+#[test_case]
+fn fat_removes_a_file() {
+    use crate::fs;
+    use crate::fs::FsError;
+    let data = b"a file that will be deleted".to_vec();
+    fs::write("/mnt/DELME.TXT", &data).expect("writing the file to remove failed");
+    assert_eq!(fs::read("/mnt/DELME.TXT").unwrap(), data);
+
+    fs::remove("/mnt/DELME.TXT").expect("removing the file failed");
+
+    // Gone: reading and re-removing both report NotFound, and it is absent from the listing.
+    assert_eq!(fs::read("/mnt/DELME.TXT"), Err(FsError::NotFound));
+    assert_eq!(fs::remove("/mnt/DELME.TXT"), Err(FsError::NotFound));
+    let entries = fs::list("/mnt").unwrap();
+    assert!(!entries.iter().any(|(name, _)| name.as_str() == "DELME.TXT"));
+}
+
 /// Stage 14b-3: the FAT volume is mounted into the global VFS at /mnt during boot, so the
 /// shell's `fs::*` API reaches disk files transparently. `kernel_main` mounts it before this
 /// harness runs (the very path the interactive shell uses), so reading `/mnt/HELLO.TXT` through
