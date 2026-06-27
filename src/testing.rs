@@ -365,3 +365,42 @@ fn fat_reads_known_file() {
     // A name with no matching entry is reported as NotFound (not a panic or wrong bytes).
     assert_eq!(volume.read_file("NOPE.TXT"), Err(FatError::NotFound));
 }
+
+/// Stage 14b-2b: the FAT volume implements the `FileSystem` VFS trait, so it can be driven
+/// through a trait object — the same seam `RamFs` slots into (see `ramfs_satisfies_vfs_trait`).
+/// Exercises read/list/is_dir over the root, the FatError -> FsError mapping, and that this
+/// read-only driver rejects every mutating operation as `Unsupported`.
+#[test_case]
+fn fat_satisfies_vfs_trait() {
+    use crate::ata::Drive;
+    use crate::fat::Fat;
+    use crate::fs::{FileSystem, FsError};
+    use alloc::string::String;
+    // Must match FAT_FILE_CONTENT in build.rs.
+    const EXPECTED: &[u8] = b"Hello from a real FAT16 disk, read by Aether.\n";
+
+    let mut volume = Fat::mount(Drive::SecondaryMaster).expect("mounting the FAT volume failed");
+    // Dynamic dispatch through the vtable, exactly as a mounted filesystem would be used.
+    let fs: &mut dyn FileSystem = &mut volume;
+
+    // Read a root-level file through the trait object.
+    assert_eq!(fs.read("/HELLO.TXT").unwrap(), EXPECTED);
+
+    // The root is a directory; a regular file is not.
+    assert!(fs.is_dir("/"));
+    assert!(!fs.is_dir("/HELLO.TXT"));
+
+    // Listing the root shows exactly the one user file (the volume label is skipped).
+    let entries = fs.list("/").unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0], (String::from("HELLO.TXT"), false));
+
+    // Error mapping: reading the root is IsDir, a missing name is NotFound.
+    assert_eq!(fs.read("/"), Err(FsError::IsDir));
+    assert_eq!(fs.read("/NOPE.TXT"), Err(FsError::NotFound));
+
+    // Read-only volume: every mutating operation is rejected as Unsupported.
+    assert_eq!(fs.mkdir("/x"), Err(FsError::Unsupported));
+    assert_eq!(fs.write("/x", b"y"), Err(FsError::Unsupported));
+    assert_eq!(fs.remove("/HELLO.TXT"), Err(FsError::Unsupported));
+}

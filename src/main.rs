@@ -395,6 +395,26 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                         println!("FAT16 file read FAILED: {:?}", e);
                     }
                 }
+
+                // Stage 14b-2b: the FAT volume also implements the VFS `FileSystem` trait, so
+                // it can be driven through a trait object — the very interface `RamFs` uses.
+                // List the root directory through `&dyn FileSystem` to show the dispatch.
+                use fs::FileSystem;
+                let vfs: &dyn FileSystem = &volume;
+                match vfs.list("/") {
+                    Ok(entries) => {
+                        serial_println!("[fat] root directory via the VFS trait:");
+                        for (name, is_dir) in &entries {
+                            serial_println!("        {}{}", name, if *is_dir { "/" } else { "" });
+                        }
+                        println!(
+                            "FAT16 volume mounted behind the VFS trait ({} root entr{})",
+                            entries.len(),
+                            if entries.len() == 1 { "y" } else { "ies" },
+                        );
+                    }
+                    Err(e) => serial_println!("[fat] VFS list of root failed: {:?}", e),
+                }
             }
             Err(e) => {
                 serial_println!("[fat] mount failed: {:?}", e);

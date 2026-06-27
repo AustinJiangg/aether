@@ -44,6 +44,12 @@ pub enum FsError {
     IsDir,
     /// Expected a directory but found a file.
     NotDir,
+    /// The filesystem does not support this operation: a write to a read-only on-disk
+    /// volume, or descending into a subdirectory a minimal driver cannot yet walk.
+    Unsupported,
+    /// An underlying block-device or on-disk-format error (an ATA read failed, a FAT
+    /// cluster chain is corrupt, ...). The VFS surfaces it without further interpretation.
+    Io,
 }
 
 impl FsError {
@@ -54,13 +60,17 @@ impl FsError {
             FsError::Exists => "already exists",
             FsError::IsDir => "is a directory",
             FsError::NotDir => "not a directory",
+            FsError::Unsupported => "operation not supported",
+            FsError::Io => "input/output error",
         }
     }
 }
 
 /// Split a path into its non-empty components, so `/`, `/a`, `/a/`, and `//a`
 /// all behave sensibly (e.g. `/docs//hello` -> ["docs", "hello"]).
-fn components(path: &str) -> impl Iterator<Item = &str> {
+///
+/// `pub(crate)` so the FAT driver shares the exact same path semantics as `RamFs`.
+pub(crate) fn components(path: &str) -> impl Iterator<Item = &str> {
     path.split('/').filter(|c| !c.is_empty())
 }
 
