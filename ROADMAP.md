@@ -135,8 +135,16 @@ unify later.
 > `From<FatError>` maps the driver's errors onto the shared VFS error type; `fs::components` is
 > shared so FAT and `RamFs` split paths identically. Verified by a boot demo that lists the
 > root through `&dyn FileSystem` and a test driving the volume through `&mut dyn FileSystem`.
-> Next: mount the FAT volume so the shell's `ls`/`cat` can reach disk paths, then tackle FAT
-> writes (the write half of Stage 14).
+>
+> **Stage 14b-3 is also done** — the FAT volume is mounted into the VFS. `fs.rs` gains a
+> minimal one-entry mount table: a path under `/mnt` is routed to a mounted
+> `Box<dyn FileSystem>` (prefix stripped), while everything else stays in the in-memory
+> `RamFs`; the six `fs::*` wrappers funnel through one `dispatch` helper, so the shell does not
+> know which filesystem backs a path. Boot mounts the read-only FAT volume at `/mnt`, so the
+> shell's `ls /mnt`, `cat /mnt/HELLO.TXT`, and `cd /mnt` read real disk files. Verified by the
+> shell selftest and a test reading `/mnt/HELLO.TXT` through the global `fs::read`. Next: FAT
+> writes (the write half of Stage 14) — allocate clusters, update the FAT and the directory
+> entry, manage free space.
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

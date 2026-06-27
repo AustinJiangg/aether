@@ -131,7 +131,10 @@ read the known `HELLO.TXT`. **Stage 14b-2b is also done**: `Fat` implements the 
 `FileSystem` trait, so the FAT volume is usable through a `&dyn FileSystem` object like `RamFs`
 (`read`/`list`/`is_dir` over the root; the read-only driver returns `Unsupported` for the
 mutating `mkdir`/`write`/`remove`), with `FsError` gaining `Unsupported`/`Io` variants and a
-`From<FatError>` mapping. `ROADMAP.md` carries the forward plan (stages
+`From<FatError>` mapping. **Stage 14b-3 is also done**: the FAT volume is mounted into the VFS
+at `/mnt` via a minimal one-entry mount table in `fs.rs` (the six `fs::*` wrappers route a
+`/mnt`-prefixed path to the mounted `Box<dyn FileSystem>`, everything else to `RamFs`), so the
+shell's `ls`/`cat`/`cd` reach real disk files. `ROADMAP.md` carries the forward plan (stages
 9-18): the user-space main line (system calls, per-process address spaces + ELF,
 multiprocessing), plus persistence, APIC/SMP, and networking tracks.
 
@@ -244,15 +247,18 @@ Exit QEMU: `Ctrl-A` then `X`.
 - `src/shell.rs`: Stage 7-8 interactive shell — an async task that reads decoded
   keystrokes from the keyboard `ScancodeStream`, buffers a line (with Backspace)
   against a current working directory, and on Enter routes it through a `dispatch`
-  table of built-in commands (including the Stage 8 file commands). Includes a
-  boot `selftest` so the shell and file system are verifiable without a keyboard.
+  table of built-in commands (including the Stage 8 file commands, which since Stage
+  14b-3 also reach the FAT disk mounted at `/mnt`). Includes a boot `selftest` so the
+  shell and file system are verifiable without a keyboard.
 - `src/fs.rs`: Stage 8 in-memory file system — a heap-backed tree of `File`/`Dir`
   nodes addressed by `/`-separated paths, exposed as a global `RamFs` behind a
   mutex with `mkdir`/`write`/`read`/`list`/`remove`/`is_dir`. No disk, no
   persistence. Stage 14a factors those six operations into a `FileSystem` trait (the
   VFS seam) that `RamFs` implements; Stage 14b-2b adds the FAT driver as a second
   implementor behind the same interface (and `FsError` grows `Unsupported`/`Io` variants for
-  read-only and device errors). The global `fs::*` functions are unchanged.
+  read-only and device errors). Stage 14b-3 makes the global `fs::*` functions route through a
+  minimal one-entry mount table (`mount`/`MOUNT_POINT` = `/mnt`): a path under the mount point
+  goes to a mounted `Box<dyn FileSystem>` (the FAT volume), everything else to the root `RamFs`.
 - `src/usermode.rs`: the ring 3 entry/return mechanism — `enter` forges an
   interrupt-return frame (`initial_user_frame`: entry point + user stack; since Stage
   12c-3 IF is *set* so the process is preemptible) and `iretq`s into ring 3;
