@@ -62,6 +62,13 @@ pub enum FatError {
     /// The cluster chain is malformed: a free/bad cluster appears mid-file, or the chain
     /// never reaches an end-of-chain marker (so it would loop forever).
     BadChain,
+    /// The volume has no free cluster left to allocate (the disk is full).
+    NoSpace,
+    /// The root directory has no free entry left for a new file.
+    DirFull,
+    /// The requested name does not fit FAT's 8.3 short-name form (empty, an over-long base or
+    /// extension, more than one `.`, or a disallowed character).
+    InvalidName,
 }
 
 impl From<AtaError> for FatError {
@@ -436,11 +443,14 @@ impl From<FatError> for FsError {
         match e {
             FatError::NotFound => FsError::NotFound,
             FatError::IsDirectory => FsError::IsDir,
+            FatError::InvalidName => FsError::Unsupported,
             FatError::Io(_)
             | FatError::BadSignature
             | FatError::UnsupportedSectorSize(_)
             | FatError::NotFat16
-            | FatError::BadChain => FsError::Io,
+            | FatError::BadChain
+            | FatError::NoSpace
+            | FatError::DirFull => FsError::Io,
         }
     }
 }
@@ -448,22 +458,28 @@ impl From<FatError> for FsError {
 /// [`Fat`] behind the VFS [`FileSystem`] trait, so it slots in beside [`RamFs`] and the shell
 /// (or, later, system calls) can read a disk path without knowing which filesystem backs it.
 ///
-/// This driver is **read-only** and currently understands only the **root directory** (no
-/// subdirectory traversal yet), which shapes the implementation:
+/// This driver currently understands only the **root directory** (no subdirectory traversal),
+/// which shapes the implementation:
 /// - `read`/`list`/`is_dir` operate on the root and its entries;
-/// - a path that descends into a subdirectory yields [`FsError::Unsupported`];
-/// - every mutating operation (`mkdir`/`write`/`remove`) yields [`FsError::Unsupported`].
+/// - `write` creates or overwrites a root-level file (Stage 14c-1);
+/// - `mkdir` and `remove` are not supported yet, and a path that descends into a subdirectory
+///   yields [`FsError::Unsupported`].
 impl FileSystem for Fat {
     fn mkdir(&mut self, _path: &str) -> Result<(), FsError> {
-        Err(FsError::Unsupported) // read-only volume
+        Err(FsError::Unsupported) // creating subdirectories is not supported
     }
 
-    fn write(&mut self, _path: &str, _data: &[u8]) -> Result<(), FsError> {
-        Err(FsError::Unsupported) // read-only volume
+    fn write(&mut self, path: &str, data: &[u8]) -> Result<(), FsError> {
+        let mut comps = crate::fs::components(path);
+        match (comps.next(), comps.next()) {
+            (None, _) => Err(FsError::IsDir),                // cannot write the root itself
+            (Some(name), None) => Ok(self.write_file(name, data)?),
+            (Some(_), Some(_)) => Err(FsError::Unsupported), // no subdirectory traversal yet
+        }
     }
 
     fn remove(&mut self, _path: &str) -> Result<(), FsError> {
-        Err(FsError::Unsupported) // read-only volume
+        Err(FsError::Unsupported) // file removal comes in Stage 14c-2
     }
 
     /// Read a root-level file. The root itself (`/`) is a directory, not a file; a path with
@@ -497,5 +513,267 @@ impl FileSystem for Fat {
             (Some(name), None) => matches!(self.find_root_entry(name), Ok(Some(e)) if e.is_dir),
             (Some(_), Some(_)) => false,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 14c-1: writing a file — free-cluster allocation, the FAT chain, and the
+// directory entry. Writes reach the FAT disk via the Stage 13b `ata::write_sector`.
+// ---------------------------------------------------------------------------
+
+/// FAT16 entry value for a free cluster.
+const FAT_ENTRY_FREE: u16 = 0x0000;
+/// FAT16 entry value we write to mark the end of a cluster chain.
+const FAT_ENTRY_EOC: u16 = 0xFFFF;
+/// Directory-entry attribute for a regular file (the "archive" bit).
+const ATTR_ARCHIVE: u8 = 0x20;
+
+/// Validate and upper-case one byte of a short name. Allows ASCII letters (upper-cased),
+/// digits, and a few safe punctuation characters; rejects everything else (spaces, `.`, `/`,
+/// control bytes), so a malformed name cannot corrupt the fixed 8.3 layout of a directory entry.
+fn short_name_byte(b: u8) -> Option<u8> {
+    match b {
+        b'a'..=b'z' => Some(b - (b'a' - b'A')), // upper-case
+        b'A'..=b'Z' | b'0'..=b'9' => Some(b),
+        b'_' | b'-' | b'~' | b'!' | b'#' | b'$' | b'%' | b'&' | b'(' | b')' => Some(b),
+        _ => None,
+    }
+}
+
+/// Convert a filename like `"hello.txt"` into the 11-byte, space-padded, upper-case 8.3 form a
+/// directory entry stores (`b"HELLO   TXT"`), or `None` if it does not fit 8.3: an empty or
+/// over-long base (> 8), an over-long extension (> 3), or a disallowed byte. The split is on the
+/// *last* `.`, and a `.` left in the base (e.g. `"a.b.c"`) is rejected.
+fn string_to_short_name(name: &str) -> Option<[u8; 11]> {
+    let (base, ext) = match name.rsplit_once('.') {
+        Some((b, e)) => (b, e),
+        None => (name, ""),
+    };
+    if base.is_empty() || base.len() > 8 || ext.len() > 3 || base.contains('.') {
+        return None;
+    }
+
+    let mut short = [b' '; 11];
+    for (i, b) in base.bytes().enumerate() {
+        short[i] = short_name_byte(b)?;
+    }
+    for (i, b) in ext.bytes().enumerate() {
+        short[8 + i] = short_name_byte(b)?;
+    }
+    Some(short)
+}
+
+/// A located root-directory slot: where a file's 32-byte entry lives, or where a new one goes.
+struct DirSlot {
+    /// LBA of the directory sector holding the slot.
+    lba: u32,
+    /// Byte offset of the 32-byte entry within that sector.
+    offset: usize,
+    /// For an existing entry: its current first cluster and whether it is a subdirectory.
+    /// `None` means this is a *free* slot (the name was not found).
+    existing: Option<(u16, bool)>,
+}
+
+impl Fat {
+    /// Bytes in one cluster (`sectors_per_cluster * bytes_per_sector`).
+    fn cluster_size(&self) -> usize {
+        self.bpb.sectors_per_cluster as usize * self.bpb.bytes_per_sector as usize
+    }
+
+    /// Write `value` into the FAT entry for `cluster`, in *every* FAT copy, so the redundant
+    /// FATs stay identical. Read-modify-write per copy: read the entry's sector, patch the two
+    /// bytes in place, write it back — preserving the other entries in that sector.
+    fn write_fat_entry(&self, cluster: u16, value: u16) -> Result<(), FatError> {
+        let fat_offset = cluster as u32 * 2; // 2 bytes per FAT16 entry
+        let sector_in_fat = fat_offset / SECTOR_SIZE as u32;
+        let offset = (fat_offset % SECTOR_SIZE as u32) as usize;
+        let mut buf = vec![0u8; SECTOR_SIZE];
+
+        for copy in 0..self.bpb.num_fats as u32 {
+            let sector =
+                self.bpb.fat_start_sector() + copy * self.bpb.fat_size_sectors + sector_in_fat;
+            ata::read_sector_from(self.drive, sector, &mut buf)?;
+            buf[offset] = (value & 0xFF) as u8;
+            buf[offset + 1] = (value >> 8) as u8;
+            ata::write_sector(self.drive, sector, &buf)?;
+        }
+        Ok(())
+    }
+
+    /// Find a free cluster, claim it by marking it end-of-chain, and return its number, or
+    /// `Ok(None)` if the volume is full. Scans the FAT a sector at a time for a `0x0000` (free)
+    /// entry. Marking it EOC before returning means a follow-up `alloc_cluster` will not hand
+    /// the same cluster out again, so a chain can be built one cluster at a time.
+    fn alloc_cluster(&self) -> Result<Option<u16>, FatError> {
+        let max_cluster = self.bpb.count_of_clusters() + 1; // highest valid data cluster number
+        let entries_per_sector = SECTOR_SIZE / 2;
+        let mut buf = vec![0u8; SECTOR_SIZE];
+
+        for s in 0..self.bpb.fat_size_sectors {
+            ata::read_sector_from(self.drive, self.bpb.fat_start_sector() + s, &mut buf)?;
+            let base = s * entries_per_sector as u32; // first cluster number in this sector
+            for i in 0..entries_per_sector {
+                let cluster = base + i as u32;
+                if cluster < 2 {
+                    continue; // clusters 0 and 1 are reserved, never allocatable
+                }
+                if cluster > max_cluster {
+                    return Ok(None); // ran past the last real cluster: the volume is full
+                }
+                if read_u16(&buf, i * 2) == FAT_ENTRY_FREE {
+                    self.write_fat_entry(cluster as u16, FAT_ENTRY_EOC)?;
+                    return Ok(Some(cluster as u16));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Free every cluster in the chain starting at `first_cluster` (set each FAT entry back to
+    /// free), reading each entry's successor *before* clearing it. Bounded against a corrupt
+    /// chain, like [`Fat::read_chain`].
+    fn free_chain(&self, first_cluster: u16) -> Result<(), FatError> {
+        let max_steps = self.bpb.count_of_clusters() as usize + 2;
+        let mut cluster = first_cluster;
+        let mut steps = 0usize;
+        while is_data_cluster(cluster) {
+            steps += 1;
+            if steps > max_steps {
+                return Err(FatError::BadChain);
+            }
+            let next = self.next_cluster(cluster)?; // read the link before clearing it
+            self.write_fat_entry(cluster, FAT_ENTRY_FREE)?;
+            cluster = next;
+        }
+        Ok(())
+    }
+
+    /// Allocate a fresh cluster chain holding `data`, write the bytes into it, and return its
+    /// first cluster (`0` for empty `data`, which needs no clusters). The final cluster's last
+    /// sector is zero-padded. A full disk rolls back the partial allocation and returns
+    /// `NoSpace`.
+    fn write_chain(&self, data: &[u8]) -> Result<u16, FatError> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let cluster_size = self.cluster_size();
+        let count = (data.len() + cluster_size - 1) / cluster_size;
+
+        // Reserve all the clusters first (each alloc marks the cluster EOC, so it is not handed
+        // out twice). If the disk fills up partway, release what we took and report the failure.
+        let mut clusters = Vec::with_capacity(count);
+        for _ in 0..count {
+            match self.alloc_cluster()? {
+                Some(c) => clusters.push(c),
+                None => {
+                    for &c in &clusters {
+                        let _ = self.write_fat_entry(c, FAT_ENTRY_FREE);
+                    }
+                    return Err(FatError::NoSpace);
+                }
+            }
+        }
+
+        // Link the chain: each cluster points to the next; the last keeps its EOC mark.
+        for i in 0..count - 1 {
+            self.write_fat_entry(clusters[i], clusters[i + 1])?;
+        }
+
+        // Write the data, zero-padding the final cluster's last sector.
+        let mut buf = vec![0u8; SECTOR_SIZE];
+        for (i, &cluster) in clusters.iter().enumerate() {
+            let lba = self.cluster_lba(cluster);
+            for s in 0..self.bpb.sectors_per_cluster as u32 {
+                let off = i * cluster_size + s as usize * SECTOR_SIZE;
+                for b in buf.iter_mut() {
+                    *b = 0;
+                }
+                if off < data.len() {
+                    let n = core::cmp::min(SECTOR_SIZE, data.len() - off);
+                    buf[..n].copy_from_slice(&data[off..off + n]);
+                }
+                ata::write_sector(self.drive, lba + s, &buf)?;
+            }
+        }
+        Ok(clusters[0])
+    }
+
+    /// Locate the root-directory slot for `short`: the existing entry of that name (to
+    /// overwrite), or the first free slot (to create). Errors with `DirFull` if the directory
+    /// is full and the name is not already present.
+    fn find_dir_slot(&self, short: &[u8; 11]) -> Result<DirSlot, FatError> {
+        let start = self.bpb.root_dir_start_sector();
+        let sectors = self.bpb.root_dir_sectors();
+        let mut buf = vec![0u8; SECTOR_SIZE];
+        let mut free_slot: Option<(u32, usize)> = None;
+
+        for s in 0..sectors {
+            let lba = start + s;
+            ata::read_sector_from(self.drive, lba, &mut buf)?;
+            for i in 0..(SECTOR_SIZE / DIR_ENTRY_SIZE) {
+                let off = i * DIR_ENTRY_SIZE;
+                let first_byte = buf[off];
+                let attr = buf[off + ENTRY_ATTR_OFFSET];
+
+                let in_use = first_byte != NAME_END && first_byte != NAME_DELETED;
+                let real = attr != ATTR_LONG_NAME && attr & ATTR_VOLUME_ID == 0;
+                if in_use && real && &buf[off..off + 11] == &short[..] {
+                    let first = read_u16(&buf, off + ENTRY_FIRST_CLUSTER_LO_OFFSET);
+                    let is_dir = attr & ATTR_DIRECTORY != 0;
+                    return Ok(DirSlot { lba, offset: off, existing: Some((first, is_dir)) });
+                }
+
+                if free_slot.is_none() && !in_use {
+                    free_slot = Some((lba, off)); // remember the first reusable slot
+                }
+                if first_byte == NAME_END {
+                    // Nothing in use beyond here, so create in the first free slot seen (at
+                    // worst this NAME_END slot itself).
+                    let (lba, off) = free_slot.expect("the NAME_END slot is itself free");
+                    return Ok(DirSlot { lba, offset: off, existing: None });
+                }
+            }
+        }
+        match free_slot {
+            Some((lba, off)) => Ok(DirSlot { lba, offset: off, existing: None }),
+            None => Err(FatError::DirFull),
+        }
+    }
+
+    /// Create or overwrite the root-level file `name` with `data`. Overwriting frees the old
+    /// cluster chain first. Fails with `InvalidName` if `name` is not a valid 8.3 name, or
+    /// `IsDirectory` if `name` already names a subdirectory.
+    pub fn write_file(&self, name: &str, data: &[u8]) -> Result<(), FatError> {
+        let short = string_to_short_name(name).ok_or(FatError::InvalidName)?;
+
+        let slot = self.find_dir_slot(&short)?;
+        if let Some((old_first, is_dir)) = slot.existing {
+            if is_dir {
+                return Err(FatError::IsDirectory);
+            }
+            if old_first >= 2 {
+                self.free_chain(old_first)?; // overwrite: release the previous contents
+            }
+        }
+
+        // Write the data as a fresh cluster chain (first cluster 0 for an empty file).
+        let first = self.write_chain(data)?;
+
+        // Build the 32-byte directory entry from scratch and write its sector back.
+        let mut buf = vec![0u8; SECTOR_SIZE];
+        ata::read_sector_from(self.drive, slot.lba, &mut buf)?;
+        let e = slot.offset;
+        for b in &mut buf[e..e + DIR_ENTRY_SIZE] {
+            *b = 0; // clear the slot: name, dates, attributes, the cluster-high word, etc.
+        }
+        buf[e..e + 11].copy_from_slice(&short);
+        buf[e + ENTRY_ATTR_OFFSET] = ATTR_ARCHIVE;
+        buf[e + ENTRY_FIRST_CLUSTER_LO_OFFSET] = (first & 0xFF) as u8;
+        buf[e + ENTRY_FIRST_CLUSTER_LO_OFFSET + 1] = (first >> 8) as u8;
+        buf[e + ENTRY_SIZE_OFFSET..e + ENTRY_SIZE_OFFSET + 4]
+            .copy_from_slice(&(data.len() as u32).to_le_bytes());
+        ata::write_sector(self.drive, slot.lba, &buf)?;
+
+        Ok(())
     }
 }

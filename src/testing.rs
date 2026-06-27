@@ -368,14 +368,13 @@ fn fat_reads_known_file() {
 
 /// Stage 14b-2b: the FAT volume implements the `FileSystem` VFS trait, so it can be driven
 /// through a trait object — the same seam `RamFs` slots into (see `ramfs_satisfies_vfs_trait`).
-/// Exercises read/list/is_dir over the root, the FatError -> FsError mapping, and that this
-/// read-only driver rejects every mutating operation as `Unsupported`.
+/// Exercises read/list/is_dir over the root, the FatError -> FsError mapping, and that creating
+/// a subdirectory is unsupported (writing files is covered by `fat_writes_a_file`).
 #[test_case]
 fn fat_satisfies_vfs_trait() {
     use crate::ata::Drive;
     use crate::fat::Fat;
     use crate::fs::{FileSystem, FsError};
-    use alloc::string::String;
     // Must match FAT_FILE_CONTENT in build.rs.
     const EXPECTED: &[u8] = b"Hello from a real FAT16 disk, read by Aether.\n";
 
@@ -390,19 +389,44 @@ fn fat_satisfies_vfs_trait() {
     assert!(fs.is_dir("/"));
     assert!(!fs.is_dir("/HELLO.TXT"));
 
-    // Listing the root shows exactly the one user file (the volume label is skipped).
+    // The known file shows up in the root listing (other files may exist from write tests).
     let entries = fs.list("/").unwrap();
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0], (String::from("HELLO.TXT"), false));
+    assert!(entries.iter().any(|(name, is_dir)| name.as_str() == "HELLO.TXT" && !*is_dir));
 
     // Error mapping: reading the root is IsDir, a missing name is NotFound.
     assert_eq!(fs.read("/"), Err(FsError::IsDir));
     assert_eq!(fs.read("/NOPE.TXT"), Err(FsError::NotFound));
 
-    // Read-only volume: every mutating operation is rejected as Unsupported.
+    // Creating a subdirectory is unsupported (this driver writes only root-level files).
     assert_eq!(fs.mkdir("/x"), Err(FsError::Unsupported));
-    assert_eq!(fs.write("/x", b"y"), Err(FsError::Unsupported));
-    assert_eq!(fs.remove("/HELLO.TXT"), Err(FsError::Unsupported));
+}
+
+/// Stage 14c-1: the FAT driver creates and overwrites a root-level file. Write a payload
+/// spanning several clusters through the global VFS (`/mnt/...`), read it back, and confirm the
+/// bytes round-trip — exercising free-cluster allocation, the cluster chain, and the directory
+/// entry, then re-reading them through the independent read path. Overwrites a fixed name, so
+/// re-running `cargo test` reuses the entry (the file persists on the disk image — real
+/// persistence) without the root directory growing.
+#[test_case]
+fn fat_writes_a_file() {
+    use crate::fs;
+    // A multi-cluster payload (cluster = 512 B here): a position-dependent pattern, so a
+    // misplaced or dropped byte anywhere fails the comparison.
+    let mut data = alloc::vec::Vec::new();
+    for i in 0..1500u32 {
+        data.push((i.wrapping_mul(7).wrapping_add(3)) as u8);
+    }
+    fs::write("/mnt/WRITTEN.DAT", &data).expect("writing a FAT file failed");
+    assert_eq!(fs::read("/mnt/WRITTEN.DAT").unwrap(), data);
+
+    // Overwriting with a shorter payload updates the size and frees the tail clusters.
+    let small = b"second, shorter contents".to_vec();
+    fs::write("/mnt/WRITTEN.DAT", &small).expect("overwriting a FAT file failed");
+    assert_eq!(fs::read("/mnt/WRITTEN.DAT").unwrap(), small);
+
+    // The new file shows up in the mounted directory listing as a regular file.
+    let entries = fs::list("/mnt").unwrap();
+    assert!(entries.iter().any(|(name, is_dir)| name.as_str() == "WRITTEN.DAT" && !*is_dir));
 }
 
 /// Stage 14b-3: the FAT volume is mounted into the global VFS at /mnt during boot, so the

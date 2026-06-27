@@ -294,11 +294,17 @@ pub fn selftest() {
         dispatch(&mut cwd, command);
     }
 
-    // Stage 14b-3: the FAT disk is mounted at /mnt, so the same `ls`/`cat` commands reach real
-    // on-disk files through the VFS — no special "disk" command needed. (If no disk is mounted,
-    // these degrade to "no such file" instead of failing the boot.)
-    sh_println!("[shell selftest] reading the mounted FAT disk at /mnt:");
-    for command in ["ls /", "ls /mnt", "cat /mnt/HELLO.TXT", "cd /mnt", "pwd", "cd /"] {
+    // Stage 14b-3 / 14c-1: the FAT disk is mounted at /mnt, so the same `ls`/`cat`/`write`
+    // commands reach real on-disk files through the VFS — no special "disk" command needed. The
+    // NOTE.TXT written here persists on the disk image across reboots (the point of persistence).
+    sh_println!("[shell selftest] reading and writing the mounted FAT disk at /mnt:");
+    for command in [
+        "ls /mnt",
+        "cat /mnt/HELLO.TXT",
+        "write /mnt/NOTE.TXT shell wrote this to disk",
+        "cat /mnt/NOTE.TXT",
+        "ls /mnt",
+    ] {
         sh_println!("aether:{}> {}", cwd, command);
         dispatch(&mut cwd, command);
     }
