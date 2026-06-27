@@ -152,8 +152,16 @@ unify later.
 > mirrors stay identical, and the bytes reach the disk through the Stage 13b `ata::write_sector`
 > (cache flush included). It is wired into `FileSystem::write`, so the shell's `write /mnt/foo`
 > lands on disk and survives a reboot. Verified by a multi-cluster write/overwrite/read-back
-> test and the shell selftest. Next: Stage 14c-2 — file removal (`rm /mnt/foo`): free the
-> cluster chain and mark the directory entry deleted.
+> test and the shell selftest.
+>
+> **Stage 14c-2 is also done** — removing a file. `remove_file` frees the file's cluster chain
+> and marks its directory entry deleted (`0xE5`); a shared `find_entry` helper backs both the
+> write and delete lookups. Wired into `FileSystem::remove`, so the shell's `rm /mnt/foo`
+> deletes a root-level file. Verified by a write/read/remove test and the shell selftest's full
+> lifecycle. **This completes Stage 14**: an on-disk FAT16 filesystem with read *and* write,
+> coexisting with `RamFs` behind the VFS. (`mkdir` and subdirectory traversal stay unsupported —
+> optional later polish.) Next: the hardware track — Stage 15, replacing the 8259 PIC with the
+> Local APIC + IO-APIC (the prerequisite for SMP).
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

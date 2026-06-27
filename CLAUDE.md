@@ -138,7 +138,11 @@ shell's `ls`/`cat`/`cd` reach real disk files. **Stage 14c-1 is also done**: FAT
 `Fat::write_file` allocates a cluster chain (`alloc_cluster`/`write_chain`), writes the data
 through `ata::write_sector`, and creates/overwrites the root-directory entry (updating every FAT
 copy), wired into `FileSystem::write` so the shell's `write /mnt/foo` lands on disk and survives
-a reboot. `ROADMAP.md` carries the forward plan (stages
+a reboot. **Stage 14c-2 is also done**: `Fat::remove_file` frees a file's cluster chain and
+marks its directory entry deleted, wired into `FileSystem::remove` (so `rm /mnt/foo` works).
+**This completes Stage 14** — an on-disk FAT16 filesystem with read *and* write, coexisting with
+`RamFs` behind the VFS (`mkdir`/subdirectory traversal remain unsupported). `ROADMAP.md` carries
+the forward plan (stages
 9-18): the user-space main line (system calls, per-process address spaces + ELF,
 multiprocessing), plus persistence, APIC/SMP, and networking tracks.
 
@@ -329,8 +333,9 @@ Exit QEMU: `Ctrl-A` then `X`.
   `FileSystem` VFS trait for `Fat` (`read`/`list`/`is_dir` over the root directory), with a
   `From<FatError>` mapping onto the shared `FsError`. Stage 14c-1 adds the write path —
   `alloc_cluster`/`write_chain`/`write_file` create or overwrite a root-level file (updating
-  every FAT copy via `ata::write_sector`), wired into `FileSystem::write`; `mkdir`/`remove`
-  stay `Unsupported` for now.
+  every FAT copy via `ata::write_sector`), wired into `FileSystem::write`. Stage 14c-2 adds
+  `remove_file` (free the chain, mark the entry `0xE5`), wired into `FileSystem::remove`; a
+  shared `find_entry` backs both lookups. `mkdir` and subdirectory traversal stay `Unsupported`.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run
