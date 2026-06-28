@@ -46,6 +46,12 @@ const AP_TRAMPOLINE_VECTOR: u8 = (AP_TRAMPOLINE_PHYS >> 12) as u8;
 /// Offset within the page of the parameter slot the BSP fills before the SIPI: the
 /// kernel's CR3 (an `u64`), which the trampoline loads to share the kernel's mappings.
 const AP_CR3_OFFSET: u64 = 0xF00;
+/// Offset of the per-AP stack-top pointer the BSP fills (an `u64`); the trampoline
+/// loads it into RSP before entering Rust (Stage 16b-3).
+const AP_STACK_OFFSET: u64 = 0xF08;
+/// Offset of the Rust entry-point address the BSP fills (an `u64`); the trampoline
+/// jumps to it once in long mode on a valid stack (Stage 16b-3).
+const AP_ENTRY_OFFSET: u64 = 0xF10;
 /// Offset within the page of the 4-byte progress marker the AP writes and the BSP polls.
 const AP_MARKER_OFFSET: u64 = 0xFF0;
 
@@ -56,6 +62,16 @@ const AP_MARKER_LONG: u32 = 3; // reached 64-bit long mode
 
 /// The highest stage an AP reached at boot (0 = never ran). Read by the tests.
 static AP_STAGE: AtomicU32 = AtomicU32::new(0);
+
+/// Number of application processors that have entered Rust (`ap_entry`) and reported
+/// in. Each woken AP bumps this; the BSP polls it. Read by the Stage 16b-3 test.
+static AP_ONLINE: AtomicU32 = AtomicU32::new(0);
+
+/// Size of the stack handed to a woken AP. It is allocated from the kernel heap, which
+/// is explicitly mapped (Stage 4c) and shared via the kernel CR3 the AP loads — a large
+/// `static` array would not work: the 0.9 bootloader does not map the `.bss` pages past
+/// the kernel file image, so the AP faults (not-present) on its first stack push.
+const AP_STACK_SIZE: usize = 8 * 1024;
 
 // The AP trampoline blob, assembled in place and copied to the low page at runtime.
 //
@@ -94,8 +110,11 @@ core::arch::global_asm!(
     "    mov cr3, eax",
     "    mov ecx, 0xC0000080",              // IA32_EFER
     "    rdmsr",
-    "    or eax, 0x100",                    // EFER.LME: enable long mode
-    "    wrmsr",
+    "    or eax, 0x900",                    // EFER.LME (0x100, long mode) + EFER.NXE
+    "    wrmsr",                            // (0x800): the kernel's page tables set the NX
+                                            // bit, which is a *reserved* bit unless NXE is
+                                            // on — the BSP runs with NXE, so the AP must too
+                                            // or any walk of an NX page reserved-bit-faults
     "    mov eax, cr0",
     "    or eax, 0x80000000",               // CR0.PG: enable paging -> long mode active
     "    mov cr0, eax",
@@ -112,8 +131,15 @@ core::arch::global_asm!(
     "    mov ss, ax",
     "    mov rdi, {marker}",
     "    mov dword ptr [rdi], {mark_long}", // marker = 3: long mode reached!
-    "2:  hlt",                              // park (Stage 16b-3 will enter Rust here)
-    "    jmp 2b",
+    // Enter Rust: load this AP's stack, then jump to ap_entry. Its absolute address was
+    // published by the BSP into a parameter slot, so no relocation is needed here (a
+    // relative/RIP jump would mis-compute, since this code runs at 0x8000, not its link
+    // address).
+    "    mov rax, {stackp}",
+    "    mov rsp, [rax]",                   // RSP = this AP's stack top
+    "    mov rax, {entryp}",
+    "    mov rax, [rax]",                   // RAX = &ap_entry
+    "    jmp rax",                          // enter Rust (never returns)
 
     // Data: the GDT the trampoline installs, and its pseudo-descriptor for lgdt.
     ".balign 8",
@@ -143,6 +169,8 @@ core::arch::global_asm!(
     mark_real = const AP_MARKER_REAL,
     mark_prot = const AP_MARKER_PROT,
     mark_long = const AP_MARKER_LONG,
+    stackp = const AP_TRAMPOLINE_PHYS + AP_STACK_OFFSET,
+    entryp = const AP_TRAMPOLINE_PHYS + AP_ENTRY_OFFSET,
 );
 
 extern "C" {
@@ -177,19 +205,31 @@ pub fn boot_one_ap(
     memory::ensure_identity_mapped(AP_TRAMPOLINE_PHYS, mapper, frame_allocator);
 
     let kernel_cr3 = Cr3::read().0.start_address().as_u64();
-    let marker_ptr = (phys_offset.as_u64() + AP_TRAMPOLINE_PHYS + AP_MARKER_OFFSET) as *mut u32;
+    // Allocate this AP's stack on the heap (mapped and shared via the kernel CR3) and
+    // leak it — the AP owns it for its lifetime. See AP_STACK_SIZE for why not a static.
+    let stack = alloc::vec![0u8; AP_STACK_SIZE];
+    let stack_base = stack.as_ptr() as usize as u64;
+    core::mem::forget(stack);
+    // Top of the stack, 16-aligned then biased by 8 so `ap_entry` sees the SysV ABI's
+    // "rsp+8 is 16-aligned at entry" — we jump into it rather than `call`, so no return
+    // address is pushed.
+    let stack_top = ((stack_base + AP_STACK_SIZE as u64) & !0xF) - 8;
+    let entry = ap_entry as *const () as usize as u64;
+    let win = phys_offset.as_u64() + AP_TRAMPOLINE_PHYS;
+    let marker_ptr = (win + AP_MARKER_OFFSET) as *mut u32;
     // SAFETY: `ap_trampoline_start/end` bound the assembled blob in readable .text.
     // `AP_TRAMPOLINE_PHYS` is a free low conventional-RAM page, so the window address
-    // for the whole page is valid to write. We copy the blob, publish the kernel CR3
-    // for the trampoline to load, and zero the marker — all before any SIPI.
+    // for the whole page is valid to write. We copy the blob and publish the kernel CR3,
+    // this AP's stack top, and the `ap_entry` address into their parameter slots, then
+    // zero the marker — all before any SIPI.
     unsafe {
         let start = core::ptr::addr_of!(ap_trampoline_start);
         let end = core::ptr::addr_of!(ap_trampoline_end);
         let len = end as usize - start as usize;
-        let dst = (phys_offset.as_u64() + AP_TRAMPOLINE_PHYS) as *mut u8;
-        core::ptr::copy_nonoverlapping(start, dst, len);
-        let cr3_ptr = (phys_offset.as_u64() + AP_TRAMPOLINE_PHYS + AP_CR3_OFFSET) as *mut u64;
-        cr3_ptr.write_volatile(kernel_cr3);
+        core::ptr::copy_nonoverlapping(start, win as *mut u8, len);
+        ((win + AP_CR3_OFFSET) as *mut u64).write_volatile(kernel_cr3);
+        ((win + AP_STACK_OFFSET) as *mut u64).write_volatile(stack_top);
+        ((win + AP_ENTRY_OFFSET) as *mut u64).write_volatile(entry);
         marker_ptr.write_volatile(0);
     }
 
@@ -207,29 +247,31 @@ pub fn boot_one_ap(
     apic::pit_sleep_us(200);
     apic::send_startup_ipi(target, AP_TRAMPOLINE_VECTOR);
 
-    // Poll (bounded, ~100 ms) for the AP to climb the mode ladder. Track the highest
-    // marker seen so a stall is pinned to the rung it died on.
-    let mut stage = 0u32;
+    // Poll (bounded, ~100 ms) for the AP to enter Rust and report online. The marker
+    // (read afterwards) still records how far up the mode ladder it climbed, so a stall
+    // is pinned to the rung it died on.
+    let mut online = false;
     for _ in 0..100 {
-        // SAFETY: `marker_ptr` is the low-page marker we cleared; the volatile read
-        // observes the AP's cross-core writes.
-        stage = unsafe { marker_ptr.read_volatile() };
-        if stage == AP_MARKER_LONG {
+        if AP_ONLINE.load(Ordering::SeqCst) >= 1 {
+            online = true;
             break;
         }
         apic::pit_sleep_us(1_000);
     }
+    // SAFETY: `marker_ptr` is the low-page marker we cleared; the volatile read observes
+    // the AP's cross-core write.
+    let stage = unsafe { marker_ptr.read_volatile() };
     AP_STAGE.store(stage, Ordering::SeqCst);
 
-    if stage == AP_MARKER_LONG {
+    if online {
         serial_println!(
-            "[smp] AP apic id {} reached 64-bit long mode (stage {}/3)",
+            "[smp] AP apic id {} is online (running ap_entry on its own stack); stage {}/3",
             target,
             stage
         );
     } else {
         serial_println!(
-            "[smp] AP apic id {} stalled at stage {}/3 (1=real 2=protected 3=long)",
+            "[smp] AP apic id {} did not come online; stalled at stage {}/3 (1=real 2=prot 3=long)",
             target,
             stage
         );
@@ -240,4 +282,21 @@ pub fn boot_one_ap(
 /// 2 = protected mode, 3 = long mode. Recorded by [`boot_one_ap`]; read by the tests.
 pub fn ap_stage() -> u32 {
     AP_STAGE.load(Ordering::SeqCst)
+}
+
+/// Number of application processors that have entered Rust (`ap_entry`) and reported
+/// in. Recorded by the APs themselves; read by the Stage 16b-3 test.
+pub fn aps_online() -> u32 {
+    AP_ONLINE.load(Ordering::SeqCst)
+}
+
+/// Entry point for a freshly-woken AP: 64-bit long mode, on the kernel's address space
+/// (it loaded the kernel CR3) and its own stack. Reached by the trampoline's final
+/// `jmp`. Stage 16b-3 just records that this core is online, then parks it; later stages
+/// give the AP its own IDT, Local APIC, and a share of the scheduler.
+extern "C" fn ap_entry() -> ! {
+    AP_ONLINE.fetch_add(1, Ordering::SeqCst);
+    // Interrupts are still disabled on this core (it has no IDT yet), so `hlt` parks it
+    // cleanly — waiting for an NMI rather than busy-spinning a core.
+    crate::hlt_loop();
 }

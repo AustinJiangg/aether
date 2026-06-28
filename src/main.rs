@@ -336,19 +336,20 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     );
     println!("SMP: self-IPI test (Local APIC can send and receive an IPI) = {}", ipi_ok);
 
-    // Stage 16b-2: wake one application processor and climb it to 64-bit long mode.
-    // Copy the trampoline into low memory, send the AP INIT-SIPI-SIPI, and watch the
-    // progress marker it writes at each rung (real -> protected -> long). The AP shares
-    // the kernel's CR3 and the trampoline page is identity-mapped, so it survives
-    // enabling paging; it then halts in long mode (Stage 16b-3 will enter Rust).
+    // Stage 16b: wake one application processor and bring it all the way into the kernel
+    // in Rust. The trampoline climbs the AP from 16-bit real mode through protected mode
+    // to 64-bit long mode (sharing the kernel's CR3), then jumps to `ap_entry`, which
+    // runs on the AP's own stack and reports the core online. The AP then parks (16c
+    // wakes the rest; 16d puts them to work).
     smp::boot_one_ap(&mut mapper, &mut frame_allocator, phys_mem_offset);
     serial_println!(
-        "[ OK ] AP brought up via INIT-SIPI-SIPI: reached stage {}/3 (3 = long mode)",
+        "[ OK ] SMP bring-up: {} application processor(s) online (trampoline reached stage {}/3)",
+        smp::aps_online(),
         smp::ap_stage()
     );
     println!(
-        "SMP: brought up one AP through real->protected->long mode (stage {}/3)",
-        smp::ap_stage()
+        "SMP: brought one AP into the kernel in Rust ({} core(s) now online)",
+        smp::aps_online()
     );
 
     // Stage 13a: read a raw sector from disk via ATA PIO (polling, no DMA/IRQ). The

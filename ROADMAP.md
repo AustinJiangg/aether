@@ -227,9 +227,20 @@ unify later.
 > to 0x8000), and `boot_one_ap` publishes the kernel CR3 into a parameter slot the trampoline loads
 > (so the AP shares the kernel's address space). All absolute addresses are `0x8000 + (label - start)`
 > constants — no runtime relocation. Boot logs "AP apic id 1 reached 64-bit long mode (stage 3/3)".
-> Verified by 31 tests (the new `ap_reaches_long_mode`). Next: **Stage 16b-3** — hand the AP a per-CPU
-> stack and far-jump into a Rust `ap_entry`, which bumps an atomic so the BSP confirms "AP online"
-> (the soft-float `x86_64-unknown-none` target means no SSE setup is needed before Rust runs).
+> Verified by 31 tests (the new `ap_reaches_long_mode`).
+>
+> **Stage 16b-3 is also done** — the woken AP now enters Rust. The trampoline's long-mode tail loads a
+> per-AP stack and jumps to `ap_entry` (a Rust `extern "C"` fn whose absolute address the BSP publishes
+> into a parameter slot, so no relocation is needed), which bumps an `AP_ONLINE` atomic the BSP polls,
+> then parks (`hlt`). Boot logs "AP apic id 1 is online (running ap_entry on its own stack)" and
+> continues to the shell. Two bugs surfaced and were fixed using a `-no-reboot -d int` exception trace:
+> (1) the AP's stack must come from the **heap**, not a large `static` — the 0.9 bootloader does not map
+> the `.bss` pages past the kernel file image, so a static stack page-faulted (not-present) on the first
+> push; (2) the trampoline must set **`EFER.NXE`** as well as `EFER.LME` — the kernel's page tables set
+> the NX bit, which is a *reserved* bit unless NXE is enabled, so the AP reserved-bit-faulted the moment
+> it read an NX page (the `.rodata` jump table inside `atomic_add`). Verified by 32 tests (the new
+> `ap_comes_online`). Next: **Stage 16c** — wake *all* the APs (loop over the discovered list, a stack
+> and entry per core) and give each a slice of per-CPU data, all parking until 16d puts them to work.
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

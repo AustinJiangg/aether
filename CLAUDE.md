@@ -171,7 +171,12 @@ core executes our code. **Stage 16b-2b is now also done**: the trampoline grows 
 `.code16`->`.code32`->`.code64` climb (temporary GDT, CR0.PE, CR4.PAE, kernel CR3, EFER.LME, CR0.PG,
 raw-byte far jumps), writing a progress marker at each rung; `memory::ensure_identity_mapped` maps the
 trampoline page to itself so the AP survives enabling paging, and `boot_one_ap` passes it the kernel
-CR3 — boot logs "AP apic id 1 reached 64-bit long mode (stage 3/3)". `ROADMAP.md` carries the forward
+CR3. **Stage 16b-3 is now also done**: the trampoline loads a per-AP (heap-allocated) stack and jumps
+to a Rust `ap_entry`, which bumps an `AP_ONLINE` atomic the BSP polls, then parks — a second core now
+runs real kernel Rust ("AP apic id 1 is online"), and boot continues to the shell. (Two subtleties
+fixed: the AP stack must be heap, not a large `static`, since the 0.9 bootloader leaves `.bss` past the
+file image unmapped; and the trampoline must set `EFER.NXE` as well as `LME`, or the AP reserved-bit-
+faults reading any NX page.) `ROADMAP.md` carries the forward
 plan (stages 9-18): the user-space main line (system calls, per-process address spaces +
 ELF, multiprocessing), plus persistence, APIC/SMP, and networking tracks.
 
@@ -285,8 +290,11 @@ Exit QEMU: `Ctrl-A` then `X`.
   `boot_one_ap` copies the blob to physical 0x8000 (the SIPI vector is its page number), publishes the
   kernel CR3 into a parameter slot, identity-maps the page (`memory::ensure_identity_mapped`, so the AP
   survives enabling paging), sends INIT-SIPI-SIPI (via the `apic` helpers), then polls the marker.
-  `ap_stage()` exposes the highest rung reached for the tests. The AP halts in long mode; 16b-3 will
-  hand it a stack and enter Rust.
+  `ap_stage()` exposes the highest rung reached. Stage 16b-3: the long-mode tail loads a per-AP
+  heap-allocated stack and jumps to the Rust `ap_entry` (its address published in a parameter slot),
+  which bumps an `AP_ONLINE` atomic (`aps_online()`) and parks — a second core running real kernel
+  Rust. The trampoline sets `EFER.NXE` (not just `LME`) so walking the kernel's NX page-table entries
+  does not reserved-bit-fault. The AP then halts; 16c wakes the rest, 16d puts them to work.
 - `src/acpi.rs`: Stage 16a SMP discovery — parses just enough ACPI to enumerate the machine's CPU
   cores. `discover` scans low memory for the RSDP signature, follows it to the RSDT/XSDT (a table of
   table pointers), finds the MADT (signature "APIC"), and reads its Processor Local APIC entries into a

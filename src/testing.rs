@@ -539,3 +539,12 @@ fn woke_an_application_processor() {
 fn ap_reaches_long_mode() {
     assert_eq!(crate::smp::ap_stage(), 3);
 }
+
+/// Stage 16b-3: the woken AP far-jumped into Rust on its own stack and reported in.
+/// The trampoline loads a per-AP stack and jumps to `ap_entry`, which bumps an online
+/// counter the BSP polls. Reaching it means a second core is executing real kernel Rust
+/// — not merely sitting in the hand-written trampoline.
+#[test_case]
+fn ap_comes_online() {
+    assert_eq!(crate::smp::aps_online(), 1);
+}
