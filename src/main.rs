@@ -71,6 +71,7 @@ mod vga_buffer;
 mod gdt;
 mod interrupts;
 mod apic;
+mod acpi;
 mod memory;
 mod allocator;
 mod ata;
@@ -301,6 +302,27 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_println!("[heap] Rc strong_count after drop  = {}", Rc::strong_count(&rc_clone));
     serial_println!("[ OK ] heap works; Box / Vec / Rc are usable");
     println!("Heap is live; Box / Vec / Rc all work (details on the serial log).");
+
+    // Stage 16a: discover the machine's CPUs via ACPI. So far only the BSP (this
+    // core) is running; the others (APs) are halted, waiting for the INIT-SIPI-SIPI
+    // wake-up Stage 16b will send. To wake them we need their Local APIC ids, which
+    // the firmware lists in the ACPI MADT table — so parse it now and report what we
+    // found. Pure memory reads (no hardware is touched beyond reading our own LAPIC
+    // id); placed here because it allocates while parsing, so the heap must be up.
+    acpi::discover(phys_mem_offset);
+    let aps = acpi::application_processors();
+    serial_println!(
+        "[ OK ] ACPI/SMP: {} CPU core(s); BSP apic id {}, {} AP(s) to wake: {:?}",
+        acpi::cpu_count(),
+        acpi::bsp_apic_id(),
+        aps.len(),
+        aps.iter().map(|c| c.apic_id).collect::<Vec<_>>(),
+    );
+    println!(
+        "SMP: found {} CPU core(s) via ACPI ({} AP(s) still asleep; only the BSP runs).",
+        acpi::cpu_count(),
+        aps.len(),
+    );
 
     // Stage 13a: read a raw sector from disk via ATA PIO (polling, no DMA/IRQ). The
     // bootimage is attached as the primary IDE master, so sector 0 is the boot sector —

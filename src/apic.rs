@@ -285,6 +285,18 @@ pub fn end_of_interrupt() {
     unsafe { write(REG_EOI, 0) };
 }
 
+/// The Local APIC id of the CPU this runs on — the BSP at boot.
+///
+/// Read from the LAPIC ID register, whose id sits in bits 24..32. Each core sees its
+/// *own* APIC id here, which is how Stage 16's SMP code tells the cores apart (and
+/// how ACPI discovery flags which MADT entry is the BSP). Valid only after
+/// [`init`] has mapped and enabled the Local APIC.
+pub fn lapic_id() -> u8 {
+    // SAFETY: `init` mapped the LAPIC MMIO page and software-enabled the APIC before
+    // any caller; reading the ID register has no side effects.
+    (unsafe { read(REG_ID) } >> 24) as u8
+}
+
 /// Read a 32-bit Local APIC register at `offset`.
 ///
 /// # Safety

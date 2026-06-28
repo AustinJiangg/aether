@@ -491,3 +491,22 @@ fn fat_mounts_into_vfs() {
     assert_eq!(fs::read("/vfs_probe/f").unwrap(), b"ram".to_vec());
     fs::remove("/vfs_probe").unwrap();
 }
+
+/// Stage 16a: ACPI discovery enumerated every CPU core. QEMU is launched with
+/// `-smp 4` (see Cargo.toml `test-args`), so the firmware's MADT must list four
+/// Processor Local APIC entries; `kernel_main` parses it (via `acpi::discover`)
+/// before this harness runs. Exactly one core is flagged the BSP, and its apic id
+/// must match what this running core's Local APIC reports — proving we both found
+/// the APs and correctly identified ourselves among them.
+#[test_case]
+fn acpi_discovers_all_cpus() {
+    use crate::{acpi, apic};
+    // We asked QEMU for 4 CPUs; the MADT must enumerate all of them.
+    assert_eq!(acpi::cpu_count(), 4);
+    // The recorded BSP is this running core.
+    assert_eq!(acpi::bsp_apic_id(), apic::lapic_id());
+    // The other three are application processors, none of them flagged as the BSP.
+    let aps = acpi::application_processors();
+    assert_eq!(aps.len(), 3);
+    assert!(aps.iter().all(|c| !c.is_bsp));
+}

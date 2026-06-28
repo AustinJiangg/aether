@@ -153,9 +153,15 @@ Timer ticks and preemption now run on the APIC. **Stage 15b** then brought up th
 accessed *indirectly* through IOREGSEL/IOWIN — and routed the keyboard's IRQ1 to vector 33 through
 it (its EOI also moving to the LAPIC), so the keyboard works again. **This completes Stage 15**: the
 8259 PIC is fully retired (masked), and both the timer and the keyboard arrive through the APIC,
-clearing the last prerequisite for SMP (Stage 16). `ROADMAP.md` carries the forward plan (stages
-9-18): the user-space main line (system calls, per-process address spaces + ELF,
-multiprocessing), plus persistence, APIC/SMP, and networking tracks.
+clearing the last prerequisite for SMP (Stage 16). **Stage 16a (SMP track) is now also done**:
+`acpi.rs` parses the ACPI tables (RSDP -> RSDT/XSDT -> MADT) to enumerate the machine's CPU cores,
+each a `CpuCore` with its Local APIC id and a BSP flag, reading every table through the
+physical-memory window (pure byte parsing, length/checksum bounds-checked, degrading to "BSP only"
+on failure). `apic.rs` gains `lapic_id()` so the running core flags its own MADT entry as the BSP;
+the rest are APs, halted until 16b wakes them with INIT-SIPI-SIPI. QEMU now boots with `-smp 4`, and
+boot reports the four discovered cores (BSP apic id 0, APs [1, 2, 3]). `ROADMAP.md` carries the
+forward plan (stages 9-18): the user-space main line (system calls, per-process address spaces +
+ELF, multiprocessing), plus persistence, APIC/SMP, and networking tracks.
 
 ## Language and writing conventions
 
@@ -249,7 +255,15 @@ Exit QEMU: `Ctrl-A` then `X`.
   shell's `uptime` reads it). Stage 15b adds the IO-APIC (accessed
   indirectly via IOREGSEL/IOWIN): `init` maps it uncacheable and programs the keyboard's
   redirection entry to route IRQ1 to vector 33 (`ioapic_redirection` reads an entry back
-  for the test). The 8259 PIC is now masked; all hardware interrupts come via the APIC.
+  for the test). The 8259 PIC is now masked; all hardware interrupts come via the APIC. Stage 16a adds
+  `lapic_id()`, which reads this core's own Local APIC ID register (used to identify the BSP).
+- `src/acpi.rs`: Stage 16a SMP discovery — parses just enough ACPI to enumerate the machine's CPU
+  cores. `discover` scans low memory for the RSDP signature, follows it to the RSDT/XSDT (a table of
+  table pointers), finds the MADT (signature "APIC"), and reads its Processor Local APIC entries into a
+  list of `CpuCore`s (Local APIC id + a BSP flag set by matching `apic::lapic_id()`). All reads go
+  through the physical-memory window; it is pure byte parsing like `elf.rs`/the FAT BPB, bounds-checked
+  so a malformed table degrades to a single BSP-only entry. `cpu_count`/`bsp_apic_id`/
+  `application_processors` expose the result; the APs it lists are halted until Stage 16b wakes them.
 - `src/memory.rs`: virtual-memory helpers — reads CR3 and builds an
   `OffsetPageTable` over the active page tables (via the bootloader's complete
   physical-memory mapping) for translating virtual addresses, plus a

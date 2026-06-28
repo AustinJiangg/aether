@@ -182,8 +182,20 @@ unify later.
 > is fully retired (masked), and both the timer and the keyboard arrive through the APIC — clearing
 > the last prerequisite for SMP (Stage 16). Verified by 27 tests (including `ioapic_routes_keyboard`,
 > which reads the redirection entry back) and an end-to-end check that injects keystrokes via the
-> QEMU monitor and sees the shell echo and run a typed command. Next: the hardware track continues
-> with **Stage 16** (SMP — bring up the other cores via INIT-SIPI-SIPI), now unblocked.
+> QEMU monitor and sees the shell echo and run a typed command.
+>
+> **Stage 16a is also done** — discovering the CPUs (the SMP track begins). A new `acpi.rs` parses
+> just enough ACPI to enumerate the machine's cores: it scans low memory for the **RSDP**, follows
+> it to the **RSDT/XSDT** (a table of pointers), finds the **MADT** (signature "APIC"), and reads
+> its Processor Local APIC entries into a list of `CpuCore`s (apic id + a BSP flag) — reading every
+> table through the physical-memory window, pure byte parsing like `elf.rs` and the FAT BPB, with
+> length/checksum bounds checks so a malformed table degrades to "BSP only". `apic.rs` gains
+> `lapic_id()` (read from the LAPIC ID register) so the running core flags its own MADT entry as the
+> **BSP**; the rest are **APs**, halted until Stage 16b's INIT-SIPI-SIPI. QEMU now boots with
+> `-smp 4` (Cargo.toml run/test args), so boot reports "4 CPU core(s): BSP apic id 0, 3 application
+> processor(s) [1, 2, 3]". Verified by 28 tests — the new `acpi_discovers_all_cpus` asserts all four
+> are found, the BSP id matches `lapic_id()`, and the other three are APs. Next: **Stage 16b** —
+> write the real-mode→long-mode AP trampoline and wake one AP with INIT-SIPI-SIPI.
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

@@ -67,6 +67,9 @@ conquer-once = { version = "0.4.0", default-features = false }
 # serial log keeps working even when no window can open.
 run-args = [
     "-serial", "stdio",
+    # Stage 16a (SMP): give QEMU 4 CPUs. Only the BSP runs the kernel for now; the
+    # other three stay halted until Stage 16b wakes them. ACPI enumerates all four.
+    "-smp", "4",
     # Stage 13b: attach a scratch disk as the primary IDE *slave* (index 1; the boot
     # image is the auto-assigned master, index 0). The ATA driver writes here so the
     # boot image is never at risk. build.rs creates the backing file if it is missing.
@@ -86,6 +89,8 @@ test-args = [
     "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
     "-serial", "stdio",
     "-display", "none",
+    # Stage 16a (SMP): 4 CPUs, matching run-args, so the discovery test sees all four.
+    "-smp", "4",
     # Stage 13b: the same scratch disk as run-args, so the write round-trip test has a
     # drive to write to (the primary slave; the boot image stays the untouched master).
     "-drive", "format=raw,file=scratch.img,if=ide,index=1,media=disk",
