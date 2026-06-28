@@ -510,3 +510,14 @@ fn acpi_discovers_all_cpus() {
     assert_eq!(aps.len(), 3);
     assert!(aps.iter().all(|c| !c.is_bsp));
 }
+
+/// Stage 16b-1: the Local APIC can send and receive an IPI. The BSP sends a fixed
+/// IPI to its own APIC id on a dedicated vector; the handler sets a flag and EOIs.
+/// This proves the ICR send + delivery-status poll path — the same one Stage 16b-2
+/// uses for INIT-SIPI-SIPI — works, on a single core with no assembly. The harness
+/// runs with interrupts enabled (boot turns them on before reaching here), so the
+/// self-IPI can actually be taken.
+#[test_case]
+fn self_ipi_is_delivered() {
+    assert!(crate::interrupts::self_ipi_works());
+}

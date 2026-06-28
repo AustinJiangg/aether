@@ -194,8 +194,18 @@ unify later.
 > **BSP**; the rest are **APs**, halted until Stage 16b's INIT-SIPI-SIPI. QEMU now boots with
 > `-smp 4` (Cargo.toml run/test args), so boot reports "4 CPU core(s): BSP apic id 0, 3 application
 > processor(s) [1, 2, 3]". Verified by 28 tests — the new `acpi_discovers_all_cpus` asserts all four
-> are found, the BSP id matches `lapic_id()`, and the other three are APs. Next: **Stage 16b** —
-> write the real-mode→long-mode AP trampoline and wake one AP with INIT-SIPI-SIPI.
+> are found, the BSP id matches `lapic_id()`, and the other three are APs.
+>
+> **Stage 16b-1 is also done** — the IPI mechanism (the first of three steps toward waking an AP).
+> `apic.rs` gains `send_fixed_ipi(dest, vector)`, which writes the Local APIC's **ICR** (Interrupt
+> Command Register: the destination apic id in the high half, then the low half to issue the IPI) and
+> polls the delivery-status bit until the send is accepted — the exact send path Stage 16b-2's
+> INIT-SIPI-SIPI will use. To prove it end to end with no assembly and no second core, the BSP sends
+> a fixed IPI to *itself* on a dedicated vector (0x40); `interrupts.rs`'s `ipi_test_handler` sets a
+> flag and EOIs, and `self_ipi_works()` confirms the flag flipped. Verified by 29 tests (the new
+> `self_ipi_is_delivered`) and the boot log ("self-IPI delivered ... = true"). Next: **Stage 16b-2** —
+> the real-mode→long-mode AP trampoline, copied low and identity-mapped, with the BSP sending
+> INIT-SIPI-SIPI to one AP and confirming it reaches long mode via a progress marker.
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

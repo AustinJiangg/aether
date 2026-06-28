@@ -159,8 +159,12 @@ each a `CpuCore` with its Local APIC id and a BSP flag, reading every table thro
 physical-memory window (pure byte parsing, length/checksum bounds-checked, degrading to "BSP only"
 on failure). `apic.rs` gains `lapic_id()` so the running core flags its own MADT entry as the BSP;
 the rest are APs, halted until 16b wakes them with INIT-SIPI-SIPI. QEMU now boots with `-smp 4`, and
-boot reports the four discovered cores (BSP apic id 0, APs [1, 2, 3]). `ROADMAP.md` carries the
-forward plan (stages 9-18): the user-space main line (system calls, per-process address spaces +
+boot reports the four discovered cores (BSP apic id 0, APs [1, 2, 3]). **Stage 16b-1 is now also
+done**: `apic.rs` gains `send_fixed_ipi` (writes the Local APIC ICR — destination, then issue — and
+polls the delivery-status bit), the IPI send path Stage 16b-2's INIT-SIPI-SIPI will reuse; it is
+proved end to end by a self-IPI (the BSP sends a fixed IPI to its own apic id on vector 0x40, handled
+by `interrupts.rs`'s `ipi_test_handler` / `self_ipi_works`). `ROADMAP.md` carries the forward plan
+(stages 9-18): the user-space main line (system calls, per-process address spaces +
 ELF, multiprocessing), plus persistence, APIC/SMP, and networking tracks.
 
 ## Language and writing conventions
@@ -244,7 +248,10 @@ Exit QEMU: `Ctrl-A` then `X`.
   scancode onto the async keyboard's queue. Stage 10 registers the `int 0x80`
   syscall gate (DPL 3); since Stage 12c-2 it too points at a naked stub
   (`syscall::syscall_entry`) that builds the same `TrapFrame`, so a `yield`/`exit`
-  saves and restores a full register context.
+  saves and restores a full register context. Stage 16b-1 adds a self-IPI test: a
+  dedicated gate (`IPI_TEST_VECTOR` = 0x40) whose `ipi_test_handler` sets a flag and
+  EOIs, driven by `self_ipi_works()` (sends a fixed IPI to this CPU and confirms it
+  arrives) — proving the Local APIC IPI path before Stage 16b uses it to wake the APs.
 - `src/apic.rs`: Stage 15 APIC (Advanced Programmable Interrupt Controller) support.
   `init` maps the Local APIC's MMIO page uncacheable (`NO_CACHE`), software-enables it
   via the spurious-vector register, masks the 8259 PIC, then *calibrates* the LAPIC
@@ -256,7 +263,10 @@ Exit QEMU: `Ctrl-A` then `X`.
   indirectly via IOREGSEL/IOWIN): `init` maps it uncacheable and programs the keyboard's
   redirection entry to route IRQ1 to vector 33 (`ioapic_redirection` reads an entry back
   for the test). The 8259 PIC is now masked; all hardware interrupts come via the APIC. Stage 16a adds
-  `lapic_id()`, which reads this core's own Local APIC ID register (used to identify the BSP).
+  `lapic_id()`, which reads this core's own Local APIC ID register (used to identify the BSP). Stage
+  16b-1 adds `send_fixed_ipi(dest, vector)`, which issues an inter-processor interrupt through the ICR
+  (Interrupt Command Register: write the destination apic id, then the low half to send, then poll
+  the delivery-status bit) — the IPI send path Stage 16b-2's INIT-SIPI-SIPI will reuse.
 - `src/acpi.rs`: Stage 16a SMP discovery — parses just enough ACPI to enumerate the machine's CPU
   cores. `discover` scans low memory for the RSDP signature, follows it to the RSDT/XSDT (a table of
   table pointers), finds the MADT (signature "APIC"), and reads its Processor Local APIC entries into a

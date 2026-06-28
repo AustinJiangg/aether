@@ -26,7 +26,7 @@
 //! Later stages add more handlers (e.g. page fault).
 
 use core::arch::naked_asm;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use pic8259::ChainedPics;
 use spin::{Lazy, Mutex};
@@ -83,6 +83,9 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     // accepted); by the architecture it requires no EOI. With no handler registered it
     // would escalate to a #GP and then a double fault, so we back it with a no-op.
     idt[crate::apic::SPURIOUS_VECTOR as usize].set_handler_fn(spurious_interrupt_handler);
+    // Stage 16b-1: a dedicated vector for the self-IPI test that proves the Local
+    // APIC's IPI delivery works, before Stage 16b-2 uses IPIs to wake the APs.
+    idt[IPI_TEST_VECTOR as usize].set_handler_fn(ipi_test_handler);
     // Stage 10: the syscall vector. Setting the gate's DPL to 3 is what lets ring 3
     // execute `int 0x80` (a gate's DPL is the highest-numbered ring allowed to
     // invoke it); with the default DPL 0, a ring 3 `int 0x80` would raise a #GP
@@ -433,3 +436,51 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
 /// return. It exists only so the vector has a valid gate; without it a spurious
 /// interrupt would fault.
 extern "x86-interrupt" fn spurious_interrupt_handler(_stack_frame: InterruptStackFrame) {}
+
+// ---------------------------------------------------------------------------
+// Self-IPI test (Stage 16b-1).
+// ---------------------------------------------------------------------------
+//
+// Before sending the INIT-SIPI-SIPI that wakes the APs (16b-2), prove the IPI path
+// works on a single core: the BSP sends a fixed IPI to *itself* on a dedicated
+// vector, the handler sets a flag and EOIs, and the BSP confirms the flag flipped.
+// This exercises the exact ICR send + delivery-status poll that SIPI will use — with
+// no assembly and no second core — so a failure here is isolated to the IPI
+// mechanism rather than tangled up with the trampoline.
+
+/// A free interrupt vector — clear of the timer (32), keyboard (33), syscall (0x80),
+/// spurious (0xFF) vectors and the 32 exception slots — used only by the Stage 16b-1
+/// self-IPI test. At priority class 4 it outranks the timer, so it is serviced
+/// promptly once interrupts are enabled.
+pub const IPI_TEST_VECTOR: u8 = 0x40;
+
+/// Set by [`ipi_test_handler`] when the self-IPI is delivered.
+static IPI_TEST_FIRED: AtomicBool = AtomicBool::new(false);
+
+/// Handler for the self-IPI test vector. Records that the IPI arrived, then sends the
+/// EOI — a fixed IPI is an ordinary interrupt and must be acknowledged like the timer.
+extern "x86-interrupt" fn ipi_test_handler(_stack_frame: InterruptStackFrame) {
+    IPI_TEST_FIRED.store(true, Ordering::SeqCst);
+    crate::apic::end_of_interrupt();
+}
+
+/// Send a fixed IPI to this very CPU and wait (bounded) for the handler to run.
+///
+/// Returns whether the self-IPI was delivered — proving the Local APIC's IPI send +
+/// receive path works end to end before Stage 16b-2 uses it to wake the APs. Must run
+/// with interrupts enabled, so the IPI can be taken. The wait is bounded so a broken
+/// IPI path reports `false` instead of hanging the kernel.
+pub fn self_ipi_works() -> bool {
+    IPI_TEST_FIRED.store(false, Ordering::SeqCst);
+    crate::apic::send_fixed_ipi(crate::apic::lapic_id(), IPI_TEST_VECTOR);
+    // The IPI is higher priority than the timer, so with interrupts enabled the
+    // handler runs almost immediately; spin until the flag flips, bounded so a
+    // failure cannot wedge boot.
+    for _ in 0..100_000_000u64 {
+        if IPI_TEST_FIRED.load(Ordering::SeqCst) {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}

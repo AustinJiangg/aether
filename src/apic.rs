@@ -297,6 +297,52 @@ pub fn lapic_id() -> u8 {
     (unsafe { read(REG_ID) } >> 24) as u8
 }
 
+// ---------------------------------------------------------------------------
+// Inter-processor interrupts (Stage 16b): the ICR.
+// ---------------------------------------------------------------------------
+//
+// One CPU signals another — or itself — by writing the Interrupt Command Register
+// (ICR), a 64-bit register split across two 32-bit MMIO slots: the *high* half holds
+// the destination's APIC id, and writing the *low* half actually issues the IPI.
+// After a send the LAPIC sets the "delivery status" bit until the IPI is accepted, so
+// we poll it to know the send finished. Stage 16b-2 reuses this to send the
+// INIT-SIPI-SIPI sequence that wakes the APs; 16b-1 exercises it with a self-IPI.
+
+/// ICR low half: writing it issues the IPI encoded in the value.
+const REG_ICR_LOW: u32 = 0x300;
+/// ICR high half: the destination APIC id sits in bits 24..32.
+const REG_ICR_HIGH: u32 = 0x310;
+
+/// ICR delivery mode "fixed" (bits 8..11 = 000): deliver `vector` like a normal
+/// interrupt. (The INIT = 0b101 and Startup = 0b110 modes join in Stage 16b-2.)
+const ICR_FIXED: u32 = 0b000 << 8;
+/// ICR level bit (14): "assert", set for every IPI except an INIT de-assert.
+const ICR_ASSERT: u32 = 1 << 14;
+/// ICR delivery-status bit (12), read-only: set while a send is still pending.
+const ICR_DELIVERY_PENDING: u32 = 1 << 12;
+
+/// Send a fixed-delivery IPI carrying `vector` to the CPU whose Local APIC id is
+/// `dest`, returning once the Local APIC reports the IPI accepted.
+///
+/// A fixed IPI is delivered exactly like any other interrupt: the destination CPU
+/// takes vector `vector` through its IDT. Stage 16b-1 sends one to *this* CPU (a
+/// self-IPI) to prove the send/receive path; the same write sequence later targets
+/// an AP. Writing the destination must precede writing the low half, which issues
+/// the IPI.
+pub fn send_fixed_ipi(dest: u8, vector: u8) {
+    // SAFETY: `init` mapped and enabled the Local APIC before any caller. We write
+    // the destination (high half), then the low half — which issues the IPI — then
+    // poll the read-only delivery-status bit until the send completes. This is the
+    // architecturally-defined sequence for issuing an IPI through the ICR.
+    unsafe {
+        write(REG_ICR_HIGH, (dest as u32) << 24);
+        write(REG_ICR_LOW, ICR_FIXED | ICR_ASSERT | vector as u32);
+        while read(REG_ICR_LOW) & ICR_DELIVERY_PENDING != 0 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
 /// Read a 32-bit Local APIC register at `offset`.
 ///
 /// # Safety

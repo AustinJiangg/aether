@@ -324,6 +324,17 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         aps.len(),
     );
 
+    // Stage 16b-1: prove the Local APIC can deliver an IPI by sending one to *this*
+    // CPU. This exercises the exact ICR send + delivery-status poll that Stage 16b-2
+    // will use to wake the APs with INIT-SIPI-SIPI — but on one core, with no assembly,
+    // so any failure is isolated to the IPI mechanism. Interrupts were enabled above.
+    let ipi_ok = interrupts::self_ipi_works();
+    serial_println!(
+        "[ OK ] self-IPI delivered (Local APIC send/receive path works) = {}",
+        ipi_ok
+    );
+    println!("SMP: self-IPI test (Local APIC can send and receive an IPI) = {}", ipi_ok);
+
     // Stage 13a: read a raw sector from disk via ATA PIO (polling, no DMA/IRQ). The
     // bootimage is attached as the primary IDE master, so sector 0 is the boot sector —
     // its last two bytes are the MBR signature 0x55 0xAA, a stable thing to verify without
