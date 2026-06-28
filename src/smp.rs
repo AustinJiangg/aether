@@ -60,11 +60,14 @@ const AP_MARKER_REAL: u32 = 1; // reached 16-bit real mode (executing our code)
 const AP_MARKER_PROT: u32 = 2; // reached 32-bit protected mode
 const AP_MARKER_LONG: u32 = 3; // reached 64-bit long mode
 
-/// The highest stage an AP reached at boot (0 = never ran). Read by the tests.
-static AP_STAGE: AtomicU32 = AtomicU32::new(0);
+/// The *lowest* mode-ladder stage any woken AP reached (so one AP stalling shows up
+/// even when others succeed). `u32::MAX` means no AP has run yet; [`ap_stage`] maps
+/// that back to 0. Read by the tests via [`ap_stage`].
+static AP_MIN_STAGE: AtomicU32 = AtomicU32::new(u32::MAX);
 
 /// Number of application processors that have entered Rust (`ap_entry`) and reported
-/// in. Each woken AP bumps this; the BSP polls it. Read by the Stage 16b-3 test.
+/// in. Each woken AP bumps this; the BSP polls it to know one AP is up before reusing
+/// the shared trampoline for the next. Read by the Stage 16b-3 / 16c tests.
 static AP_ONLINE: AtomicU32 = AtomicU32::new(0);
 
 /// Size of the stack handed to a woken AP. It is allocated from the kernel heap, which
@@ -180,31 +183,83 @@ extern "C" {
     static ap_trampoline_end: u8;
 }
 
-/// Wake one application processor and climb it to 64-bit long mode.
+/// Wake **every** application processor ACPI discovered and climb each into the kernel
+/// in Rust (`ap_entry`).
 ///
-/// Copies the trampoline to the low page, fills the kernel CR3 into the parameter slot,
-/// identity-maps the page (so the AP can fetch after it enables paging), clears the
-/// marker, then sends the target AP INIT-SIPI-SIPI and polls (bounded) for the marker
-/// to reach the long-mode stage. `mapper`/`frame_allocator` install the identity
-/// mapping; `phys_offset` reaches the low page through the physical-memory window.
-pub fn boot_one_ap(
+/// The APs all share one trampoline page and one set of parameter slots, so they are
+/// woken **serially**: set the next AP's stack, send it INIT-SIPI-SIPI, wait for it to
+/// report online, then reuse the page for the one after. Waiting for "online" is the
+/// barrier that makes the reuse safe — by then the AP has already loaded its stack from
+/// the slot and jumped to Rust, so overwriting the slot cannot disturb it.
+///
+/// The trampoline code, the kernel CR3, and the `ap_entry` address are identical for
+/// every AP, so they are written **once** up front; only the per-AP stack and the
+/// progress marker are rewritten per core. `mapper`/`frame_allocator` install the
+/// trampoline's identity mapping; `phys_offset` reaches the low page through the
+/// physical-memory window.
+pub fn boot_aps(
     mapper: &mut OffsetPageTable,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
     phys_offset: VirtAddr,
 ) {
-    let target = match acpi::application_processors().first() {
-        Some(ap) => ap.apic_id,
-        None => {
-            serial_println!("[smp] no application processors to wake");
-            return;
-        }
-    };
+    let aps = acpi::application_processors();
+    if aps.is_empty() {
+        serial_println!("[smp] no application processors to wake");
+        return;
+    }
 
     // The AP runs the trampoline at its physical address with paging off, then loads
     // the kernel CR3 and enables paging — so the page must map to itself afterwards.
     memory::ensure_identity_mapped(AP_TRAMPOLINE_PHYS, mapper, frame_allocator);
 
     let kernel_cr3 = Cr3::read().0.start_address().as_u64();
+    let entry = ap_entry as *const () as usize as u64;
+    let win = phys_offset.as_u64() + AP_TRAMPOLINE_PHYS;
+    let marker_ptr = (win + AP_MARKER_OFFSET) as *mut u32;
+    // SAFETY: `ap_trampoline_start/end` bound the assembled blob in readable .text.
+    // `AP_TRAMPOLINE_PHYS` is a free low conventional-RAM page, so the window address
+    // for the whole page is valid to write. We copy the blob and publish the kernel CR3
+    // and the `ap_entry` address — identical for every AP — once here; the per-AP stack
+    // slot and the marker are written per core in `wake_ap`, just before its SIPI.
+    unsafe {
+        let start = core::ptr::addr_of!(ap_trampoline_start);
+        let end = core::ptr::addr_of!(ap_trampoline_end);
+        let len = end as usize - start as usize;
+        core::ptr::copy_nonoverlapping(start, win as *mut u8, len);
+        ((win + AP_CR3_OFFSET) as *mut u64).write_volatile(kernel_cr3);
+        ((win + AP_ENTRY_OFFSET) as *mut u64).write_volatile(entry);
+    }
+
+    serial_println!(
+        "[smp] waking {} application processor(s) {:?} via INIT-SIPI-SIPI \
+         (trampoline at {:#x}, kernel cr3 {:#x})",
+        aps.len(),
+        aps.iter().map(|c| c.apic_id).collect::<alloc::vec::Vec<_>>(),
+        AP_TRAMPOLINE_PHYS,
+        kernel_cr3,
+    );
+
+    let mut online = 0u32;
+    for ap in &aps {
+        if wake_ap(ap.apic_id, win, marker_ptr) {
+            online += 1;
+        }
+    }
+
+    serial_println!(
+        "[smp] {} of {} application processor(s) online; lowest stage reached {}/3",
+        online,
+        aps.len(),
+        ap_stage(),
+    );
+}
+
+/// Wake one AP (identified by `apic_id`) and wait, bounded, for it to enter Rust. The
+/// trampoline blob, kernel CR3, and entry point are already in the low page (`win` is
+/// its window address); here we hand this AP its own heap stack, clear the marker, send
+/// the wake-up, and poll [`AP_ONLINE`] for the increment `ap_entry` makes. Returns true
+/// if the AP came online. `marker_ptr` points at the shared progress marker.
+fn wake_ap(apic_id: u8, win: u64, marker_ptr: *mut u32) -> bool {
     // Allocate this AP's stack on the heap (mapped and shared via the kernel CR3) and
     // leak it — the AP owns it for its lifetime. See AP_STACK_SIZE for why not a static.
     let stack = alloc::vec![0u8; AP_STACK_SIZE];
@@ -214,74 +269,69 @@ pub fn boot_one_ap(
     // "rsp+8 is 16-aligned at entry" — we jump into it rather than `call`, so no return
     // address is pushed.
     let stack_top = ((stack_base + AP_STACK_SIZE as u64) & !0xF) - 8;
-    let entry = ap_entry as *const () as usize as u64;
-    let win = phys_offset.as_u64() + AP_TRAMPOLINE_PHYS;
-    let marker_ptr = (win + AP_MARKER_OFFSET) as *mut u32;
-    // SAFETY: `ap_trampoline_start/end` bound the assembled blob in readable .text.
-    // `AP_TRAMPOLINE_PHYS` is a free low conventional-RAM page, so the window address
-    // for the whole page is valid to write. We copy the blob and publish the kernel CR3,
-    // this AP's stack top, and the `ap_entry` address into their parameter slots, then
-    // zero the marker — all before any SIPI.
+
+    // The count before this AP runs; we wait for it to rise by one. (APs come online in
+    // order under this serial bring-up, but comparing against the pre-send value is
+    // robust regardless.)
+    let before = AP_ONLINE.load(Ordering::SeqCst);
+
+    // SAFETY: `win + AP_STACK_OFFSET` and `marker_ptr` address the low trampoline page
+    // through the physical-memory window — valid to write. We publish this AP's stack
+    // top and zero the marker before sending any SIPI; the previous AP is already online
+    // (parked in `ap_entry`), so it no longer reads these slots.
     unsafe {
-        let start = core::ptr::addr_of!(ap_trampoline_start);
-        let end = core::ptr::addr_of!(ap_trampoline_end);
-        let len = end as usize - start as usize;
-        core::ptr::copy_nonoverlapping(start, win as *mut u8, len);
-        ((win + AP_CR3_OFFSET) as *mut u64).write_volatile(kernel_cr3);
         ((win + AP_STACK_OFFSET) as *mut u64).write_volatile(stack_top);
-        ((win + AP_ENTRY_OFFSET) as *mut u64).write_volatile(entry);
         marker_ptr.write_volatile(0);
     }
 
-    serial_println!(
-        "[smp] waking AP apic id {} via INIT-SIPI-SIPI (trampoline at {:#x}, kernel cr3 {:#x})",
-        target,
-        AP_TRAMPOLINE_PHYS,
-        kernel_cr3,
-    );
-
     // The Intel universal startup sequence: INIT, wait 10 ms, SIPI, wait 200 us, SIPI.
-    apic::send_init_ipi(target);
+    apic::send_init_ipi(apic_id);
     apic::pit_sleep_us(10_000);
-    apic::send_startup_ipi(target, AP_TRAMPOLINE_VECTOR);
+    apic::send_startup_ipi(apic_id, AP_TRAMPOLINE_VECTOR);
     apic::pit_sleep_us(200);
-    apic::send_startup_ipi(target, AP_TRAMPOLINE_VECTOR);
+    apic::send_startup_ipi(apic_id, AP_TRAMPOLINE_VECTOR);
 
-    // Poll (bounded, ~100 ms) for the AP to enter Rust and report online. The marker
-    // (read afterwards) still records how far up the mode ladder it climbed, so a stall
-    // is pinned to the rung it died on.
+    // Poll (bounded, ~100 ms) for this AP to enter Rust and report online.
     let mut online = false;
     for _ in 0..100 {
-        if AP_ONLINE.load(Ordering::SeqCst) >= 1 {
+        if AP_ONLINE.load(Ordering::SeqCst) > before {
             online = true;
             break;
         }
         apic::pit_sleep_us(1_000);
     }
+
     // SAFETY: `marker_ptr` is the low-page marker we cleared; the volatile read observes
-    // the AP's cross-core write.
+    // the AP's cross-core write of how far up the mode ladder it climbed.
     let stage = unsafe { marker_ptr.read_volatile() };
-    AP_STAGE.store(stage, Ordering::SeqCst);
+    // Track the *lowest* stage any AP reached, so one AP stalling is visible even when
+    // the others succeed.
+    AP_MIN_STAGE.fetch_min(stage, Ordering::SeqCst);
 
     if online {
         serial_println!(
             "[smp] AP apic id {} is online (running ap_entry on its own stack); stage {}/3",
-            target,
+            apic_id,
             stage
         );
     } else {
         serial_println!(
             "[smp] AP apic id {} did not come online; stalled at stage {}/3 (1=real 2=prot 3=long)",
-            target,
+            apic_id,
             stage
         );
     }
+    online
 }
 
-/// The highest mode-ladder stage an AP reached at boot: 0 = never ran, 1 = real mode,
-/// 2 = protected mode, 3 = long mode. Recorded by [`boot_one_ap`]; read by the tests.
+/// The lowest mode-ladder stage any woken AP reached: 0 = none ran, 1 = real mode,
+/// 2 = protected mode, 3 = long mode. Recorded by [`boot_aps`]; read by the tests. With
+/// every AP reaching long mode this is 3; if any one stalls, it drops to that rung.
 pub fn ap_stage() -> u32 {
-    AP_STAGE.load(Ordering::SeqCst)
+    match AP_MIN_STAGE.load(Ordering::SeqCst) {
+        u32::MAX => 0, // no AP has run yet
+        stage => stage,
+    }
 }
 
 /// Number of application processors that have entered Rust (`ap_entry`) and reported
@@ -292,10 +342,28 @@ pub fn aps_online() -> u32 {
 
 /// Entry point for a freshly-woken AP: 64-bit long mode, on the kernel's address space
 /// (it loaded the kernel CR3) and its own stack. Reached by the trampoline's final
-/// `jmp`. Stage 16b-3 just records that this core is online, then parks it; later stages
-/// give the AP its own IDT, Local APIC, and a share of the scheduler.
+/// `jmp`. The AP finds its *own* per-CPU block (by its Local APIC id) and marks itself
+/// online there, then bumps the global counter the BSP polls, and parks. Later stages
+/// give the AP its own IDT, Local APIC programming, and a share of the scheduler.
 extern "C" fn ap_entry() -> ! {
+    // The stack pointer this core is running on — a distinct, per-core value the
+    // trampoline loaded from this AP's heap stack. Recording it in our own per-CPU block
+    // is concrete proof we reached the right block.
+    let rsp: u64;
+    // SAFETY: reads the stack-pointer register into `rsp`; touches no memory, clobbers
+    // nothing, and preserves flags.
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags));
+    }
+
+    // Find this core's private block (by its own LAPIC id) and record it online. The
+    // registry lives on the heap, reachable through the shared kernel CR3.
+    crate::percpu::this_cpu().mark_online(rsp);
+
+    // Bump the simple global counter the BSP's bring-up loop polls (after the per-CPU
+    // block is marked, so an observer that sees the count also sees the block online).
     AP_ONLINE.fetch_add(1, Ordering::SeqCst);
+
     // Interrupts are still disabled on this core (it has no IDT yet), so `hlt` parks it
     // cleanly — waiting for an NMI rather than busy-spinning a core.
     crate::hlt_loop();

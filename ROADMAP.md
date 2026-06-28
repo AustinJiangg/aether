@@ -239,8 +239,24 @@ unify later.
 > push; (2) the trampoline must set **`EFER.NXE`** as well as `EFER.LME` — the kernel's page tables set
 > the NX bit, which is a *reserved* bit unless NXE is enabled, so the AP reserved-bit-faulted the moment
 > it read an NX page (the `.rodata` jump table inside `atomic_add`). Verified by 32 tests (the new
-> `ap_comes_online`). Next: **Stage 16c** — wake *all* the APs (loop over the discovered list, a stack
-> and entry per core) and give each a slice of per-CPU data, all parking until 16d puts them to work.
+> `ap_comes_online`).
+>
+> **Stage 16c is also done** — waking *all* the APs, each with its own per-CPU data. A new `percpu.rs`
+> introduces the **per-CPU area**: one private `PerCpu` block per core (cpu index, APIC id, BSP flag,
+> an online flag, and the stack it runs on), held in a heap array published through two atomics (the
+> storage an AP is proven to reach), and a `this_cpu()` that finds the running core's block by its own
+> Local APIC id — the same fixed MMIO register that returns a different id on each core. `smp.rs`'s
+> `boot_one_ap` becomes `boot_aps`, which wakes the discovered APs **serially**: the trampoline code,
+> kernel CR3, and `ap_entry` address (identical for all) are written once, then each AP gets its own
+> heap stack and is sent INIT-SIPI-SIPI; the BSP waits for that AP to report online (the barrier that
+> makes reusing the one shared trampoline page safe) before starting the next. Each AP, in `ap_entry`,
+> now finds its own `PerCpu` (by LAPIC id) and marks it online with the stack it is running on, then
+> parks. `ap_stage()` reports the *lowest* rung any AP reached, so one straggler is visible even when
+> the rest succeed. Boot logs a per-CPU table — "cpu0 apic id 0 BSP online", "cpu1 apic id 1 AP online
+> (stack 0x…38f0)", … one stack per AP, 0x2000 apart. Verified by 33 tests (the new
+> `all_application_processors_online`: all three APs online, four per-CPU blocks, three distinct nonzero
+> AP stacks). Next: **Stage 16d** — give an AP its own IDT + Local APIC timer and let the scheduler run
+> a thread on it, so the idle cores actually do work.
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

@@ -265,6 +265,12 @@ pub fn cpu_count() -> usize {
     CORES.lock().len()
 }
 
+/// Every discovered CPU core (BSP + APs), in discovery order. Stage 16c builds a
+/// per-CPU data block per entry, and waking the APs walks the same list.
+pub fn cpus() -> Vec<CpuCore> {
+    CORES.lock().clone()
+}
+
 /// The BSP's Local APIC id, as recorded by [`discover`].
 pub fn bsp_apic_id() -> u8 {
     CORES

@@ -73,6 +73,7 @@ mod interrupts;
 mod apic;
 mod acpi;
 mod smp;
+mod percpu;
 mod memory;
 mod allocator;
 mod ata;
@@ -336,20 +337,43 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     );
     println!("SMP: self-IPI test (Local APIC can send and receive an IPI) = {}", ipi_ok);
 
-    // Stage 16b: wake one application processor and bring it all the way into the kernel
-    // in Rust. The trampoline climbs the AP from 16-bit real mode through protected mode
-    // to 64-bit long mode (sharing the kernel's CR3), then jumps to `ap_entry`, which
-    // runs on the AP's own stack and reports the core online. The AP then parks (16c
-    // wakes the rest; 16d puts them to work).
-    smp::boot_one_ap(&mut mapper, &mut frame_allocator, phys_mem_offset);
+    // Stage 16c: build a private per-CPU data block for every discovered core, then wake
+    // *all* the application processors. `percpu::init` must run before any AP is woken —
+    // an AP marks its own block online the instant it enters Rust. `boot_aps` then wakes
+    // the APs one at a time (each gets its own heap stack), climbing each from 16-bit real
+    // mode through protected mode to 64-bit long mode (sharing the kernel's CR3) and into
+    // `ap_entry`, which records the core online in its per-CPU block and parks. (16d puts
+    // the now-idle cores to work.)
+    percpu::init(&acpi::cpus());
+    smp::boot_aps(&mut mapper, &mut frame_allocator, phys_mem_offset);
     serial_println!(
-        "[ OK ] SMP bring-up: {} application processor(s) online (trampoline reached stage {}/3)",
+        "[ OK ] SMP bring-up: {}/{} application processor(s) online (every AP reached stage {}/3)",
         smp::aps_online(),
-        smp::ap_stage()
+        acpi::application_processors().len(),
+        smp::ap_stage(),
     );
+    // The per-CPU table: each core's private block — its dense index, APIC id, role,
+    // whether it is online, and (for an AP) the stack it is running on.
+    serial_println!(
+        "[percpu] {} per-CPU block(s), {} online:",
+        percpu::count(),
+        percpu::online_count(),
+    );
+    for cpu in percpu::all() {
+        serial_println!(
+            "[percpu]   cpu{} apic id {} {} {} (stack {:#x})",
+            cpu.cpu_index,
+            cpu.apic_id,
+            if cpu.is_bsp { "BSP" } else { "AP " },
+            if cpu.is_online() { "online " } else { "offline" },
+            cpu.stack(),
+        );
+    }
     println!(
-        "SMP: brought one AP into the kernel in Rust ({} core(s) now online)",
-        smp::aps_online()
+        "SMP: woke {} AP(s); {} of {} core(s) online, each with its own per-CPU data.",
+        smp::aps_online(),
+        percpu::online_count(),
+        percpu::count(),
     );
 
     // Stage 13a: read a raw sector from disk via ATA PIO (polling, no DMA/IRQ). The

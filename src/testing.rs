@@ -540,11 +540,44 @@ fn ap_reaches_long_mode() {
     assert_eq!(crate::smp::ap_stage(), 3);
 }
 
-/// Stage 16b-3: the woken AP far-jumped into Rust on its own stack and reported in.
-/// The trampoline loads a per-AP stack and jumps to `ap_entry`, which bumps an online
-/// counter the BSP polls. Reaching it means a second core is executing real kernel Rust
-/// — not merely sitting in the hand-written trampoline.
+/// Stage 16b-3: a woken AP far-jumped into Rust on its own stack and reported in. The
+/// trampoline loads a per-AP stack and jumps to `ap_entry`, which bumps an online counter
+/// the BSP polls. Reaching it means a second core is executing real kernel Rust — not
+/// merely sitting in the hand-written trampoline. (Stage 16c wakes *all* the APs, so the
+/// count is now >= 1; `all_application_processors_online` asserts the exact total.)
 #[test_case]
 fn ap_comes_online() {
-    assert_eq!(crate::smp::aps_online(), 1);
+    assert!(crate::smp::aps_online() >= 1);
+}
+
+/// Stage 16c: every application processor was woken — not just one — and each has its
+/// own per-CPU data block. Boot calls `percpu::init` for all four cores, then
+/// `smp::boot_aps` wakes all three APs; each AP enters `ap_entry`, finds its own block by
+/// its LAPIC id, and marks it online. So by the time this harness runs, all three APs have
+/// reported in and all four cores (BSP + APs) are online in their per-CPU data, each AP on
+/// a distinct, nonzero stack.
+#[test_case]
+fn all_application_processors_online() {
+    use crate::{percpu, smp};
+    // All three APs ran `ap_entry`; with the BSP, all four cores have a per-CPU block,
+    // and every one is marked online.
+    assert_eq!(smp::aps_online(), 3);
+    assert_eq!(percpu::count(), 4);
+    assert_eq!(percpu::online_count(), 4);
+
+    // Each AP recorded the stack it is running on — a distinct, nonzero per-core value;
+    // the BSP's stack field stays 0 (it kept the bootloader's stack).
+    let ap_stacks: alloc::vec::Vec<u64> = percpu::all()
+        .iter()
+        .filter(|cpu| !cpu.is_bsp)
+        .map(|cpu| cpu.stack())
+        .collect();
+    assert_eq!(ap_stacks.len(), 3);
+    assert!(ap_stacks.iter().all(|&s| s != 0));
+    // The three AP stacks are all different (each AP got its own heap stack).
+    for i in 0..ap_stacks.len() {
+        for j in (i + 1)..ap_stacks.len() {
+            assert_ne!(ap_stacks[i], ap_stacks[j]);
+        }
+    }
 }

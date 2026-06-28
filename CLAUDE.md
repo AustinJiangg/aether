@@ -287,14 +287,27 @@ Exit QEMU: `Ctrl-A` then `X`.
   (`.code16`->`.code32`->`.code64`: temporary GDT + CR0.PE, then CR4.PAE + kernel CR3 + EFER.LME +
   CR0.PG, each transition a raw-byte far jump), writing a progress marker at each rung (1/2/3). All
   absolute addresses are `0x8000 + (label - start)` constants, so the copied blob needs no relocation.
-  `boot_one_ap` copies the blob to physical 0x8000 (the SIPI vector is its page number), publishes the
-  kernel CR3 into a parameter slot, identity-maps the page (`memory::ensure_identity_mapped`, so the AP
-  survives enabling paging), sends INIT-SIPI-SIPI (via the `apic` helpers), then polls the marker.
-  `ap_stage()` exposes the highest rung reached. Stage 16b-3: the long-mode tail loads a per-AP
-  heap-allocated stack and jumps to the Rust `ap_entry` (its address published in a parameter slot),
-  which bumps an `AP_ONLINE` atomic (`aps_online()`) and parks — a second core running real kernel
-  Rust. The trampoline sets `EFER.NXE` (not just `LME`) so walking the kernel's NX page-table entries
-  does not reserved-bit-fault. The AP then halts; 16c wakes the rest, 16d puts them to work.
+  Stage 16c's `boot_aps` copies the blob to physical 0x8000 (the SIPI vector is its page number) and
+  publishes the kernel CR3 + `ap_entry` address once, identity-maps the page
+  (`memory::ensure_identity_mapped`, so an AP survives enabling paging), then wakes each discovered AP
+  **serially** — write its own heap stack into a slot, clear the marker, send INIT-SIPI-SIPI (via the
+  `apic` helpers), poll until that AP reports online (the barrier that makes reusing the one shared
+  trampoline page safe), repeat. `ap_stage()` exposes the *lowest* rung any AP reached (so one straggler
+  shows even when the rest succeed). Stage 16b-3: the long-mode tail loads a per-AP heap-allocated stack
+  and jumps to the Rust `ap_entry` (its address published in a parameter slot); each AP marks its own
+  per-CPU block online (`percpu::this_cpu().mark_online`) and bumps an `AP_ONLINE` atomic
+  (`aps_online()`), then parks — real kernel Rust on a second core. The trampoline sets `EFER.NXE` (not
+  just `LME`) so walking the kernel's NX page-table entries does not reserved-bit-fault. The APs then
+  park; 16d puts them to work.
+- `src/percpu.rs`: Stage 16c per-CPU data — one private `PerCpu` block per core (dense cpu index, Local
+  APIC id, BSP flag, an `online` flag, and the stack the core runs on), the foundation for "the current
+  process / run queue is per-core" that Stage 16d needs. The blocks live in a heap array published
+  through two atomics (`AtomicPtr` + `AtomicUsize` — the storage classes an AP is proven to reach, since
+  the 0.9 bootloader may leave large `.bss` unmapped). `init(cores)` builds one block per discovered
+  core (BSP pre-marked online) and must run before any AP is woken; `this_cpu()` returns the running
+  core's block, found by its own `apic::lapic_id()` (one fixed MMIO register that reads a different id on
+  each core); `all()`/`count()`/`online_count()` expose the table. An AP records itself online here in
+  `smp::ap_entry`; the BSP prints the per-CPU table at boot.
 - `src/acpi.rs`: Stage 16a SMP discovery — parses just enough ACPI to enumerate the machine's CPU
   cores. `discover` scans low memory for the RSDP signature, follows it to the RSDT/XSDT (a table of
   table pointers), finds the MADT (signature "APIC"), and reads its Processor Local APIC entries into a
