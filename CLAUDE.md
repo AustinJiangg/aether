@@ -149,8 +149,11 @@ interrupts now arrive through the APIC. Because the LAPIC timer's frequency is n
 fixed, it is *calibrated* against the PIT over a 10 ms polled window, then run periodically at 100
 Hz on vector 32 — the same gate the PIT timer used, so the naked timer entry is unchanged; the EOI
 moves from the PIC to the LAPIC's EOI register, and a no-op handler backs the spurious vector.
-Timer ticks and preemption now run on the APIC; keyboard input is off until Stage 15b routes IRQ1
-through the IO-APIC. `ROADMAP.md` carries the forward plan (stages
+Timer ticks and preemption now run on the APIC. **Stage 15b** then brought up the IO-APIC —
+accessed *indirectly* through IOREGSEL/IOWIN — and routed the keyboard's IRQ1 to vector 33 through
+it (its EOI also moving to the LAPIC), so the keyboard works again. **This completes Stage 15**: the
+8259 PIC is fully retired (masked), and both the timer and the keyboard arrive through the APIC,
+clearing the last prerequisite for SMP (Stage 16). `ROADMAP.md` carries the forward plan (stages
 9-18): the user-space main line (system calls, per-process address spaces + ELF,
 multiprocessing), plus persistence, APIC/SMP, and networking tracks.
 
@@ -243,8 +246,10 @@ Exit QEMU: `Ctrl-A` then `X`.
   architecturally fixed) and runs it periodically at 100 Hz on vector 32 (reusing the
   existing timer entry). `end_of_interrupt` writes the LAPIC EOI register, replacing
   the 8259 EOI for APIC-delivered interrupts; `TIMER_HZ` is the kernel's tick rate (the
-  shell's `uptime` reads it). The IO-APIC (routing device IRQs such as the keyboard)
-  comes in Stage 15b.
+  shell's `uptime` reads it). Stage 15b adds the IO-APIC (accessed
+  indirectly via IOREGSEL/IOWIN): `init` maps it uncacheable and programs the keyboard's
+  redirection entry to route IRQ1 to vector 33 (`ioapic_redirection` reads an entry back
+  for the test). The 8259 PIC is now masked; all hardware interrupts come via the APIC.
 - `src/memory.rs`: virtual-memory helpers — reads CR3 and builds an
   `OffsetPageTable` over the active page tables (via the bootloader's complete
   physical-memory mapping) for translating virtual addresses, plus a

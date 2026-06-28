@@ -171,8 +171,19 @@ unify later.
 > PIT timer used, so the naked timer entry is unchanged; the EOI moves from the 8259 to the LAPIC's
 > EOI register, and a no-op handler backs the spurious vector. Timer ticks and preemption now run
 > on the APIC (the boot demo shows 50+ preemptions). Verified by all 26 tests (including
-> `timer_preempted_a_process`). Next: **Stage 15b** — the IO-APIC, routing the keyboard's IRQ1 to a
-> vector (keyboard input is off until then).
+> `timer_preempted_a_process`). Keyboard input is off until 15b.
+>
+> **Stage 15b is also done** — the IO-APIC, which routes external device IRQs to LAPIC vectors.
+> Unlike the LAPIC's flat registers, the IO-APIC is accessed *indirectly*: write a register index
+> to IOREGSEL, then read/write its value through IOWIN. `apic.rs` maps the IO-APIC's MMIO page
+> uncacheable (next to the LAPIC's), then programs the keyboard's redirection entry — IRQ1 to
+> vector 33, fixed delivery, edge-triggered, unmasked, delivered to the BSP — so the keyboard works
+> again; its EOI now goes to the LAPIC like the timer's. **This completes Stage 15**: the 8259 PIC
+> is fully retired (masked), and both the timer and the keyboard arrive through the APIC — clearing
+> the last prerequisite for SMP (Stage 16). Verified by 27 tests (including `ioapic_routes_keyboard`,
+> which reads the redirection entry back) and an end-to-end check that injects keystrokes via the
+> QEMU monitor and sees the shell echo and run a typed command. Next: the hardware track continues
+> with **Stage 16** (SMP — bring up the other cores via INIT-SIPI-SIPI), now unblocked.
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|
