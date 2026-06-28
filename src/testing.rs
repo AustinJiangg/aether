@@ -264,6 +264,20 @@ fn timer_preempted_a_process() {
     assert!(crate::process::processes_preempted() >= 1);
 }
 
+/// Stage 15b: the IO-APIC routes the keyboard's IRQ to its vector. `apic::init`
+/// programs the redirection entry at boot; reading it back proves the IO-APIC's
+/// indirect IOREGSEL/IOWIN access works and the entry is armed correctly — the right
+/// vector, and unmasked (enabled). The actual keypress path is interactive (a headless
+/// QEMU cannot type), so this checks that the routing is set up.
+#[test_case]
+fn ioapic_routes_keyboard() {
+    let entry = crate::apic::ioapic_redirection(crate::apic::KEYBOARD_IRQ);
+    // Low byte of the redirection entry is the delivery vector.
+    assert_eq!((entry & 0xFF) as u8, crate::apic::KEYBOARD_VECTOR);
+    // Bit 16 is the mask; it must be clear so the keyboard IRQ is enabled.
+    assert_eq!(entry & (1 << 16), 0);
+}
+
 /// Stage 12: the `wait` syscall worked — a parent blocked until its child exited and
 /// collected the child's exit code. The boot demo spawns a parent that `wait`s and a
 /// child that `exit`s with code 42, so by the time this harness runs the parent must

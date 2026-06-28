@@ -15,11 +15,13 @@
 //!   handler diverges. We register it to run on a dedicated stack via the IST
 //!   slot set up in `gdt.rs`, so it works even when the kernel stack is gone.
 //!
-//! On top of CPU exceptions we also handle *hardware* interrupts, delivered
-//! through the legacy 8259 PIC (programmable interrupt controller): the timer
-//! on IRQ0, the keyboard on IRQ1, and so on. We remap the PIC's vectors to
-//! 32..=47 (just past the exception vectors the CPU reserves) and handle the
-//! timer and the keyboard.
+//! On top of CPU exceptions we also handle *hardware* interrupts: the timer on
+//! vector 32 and the keyboard on vector 33. Originally these came through the
+//! legacy 8259 PIC, remapped to vectors 32..=47 (just past the exception vectors
+//! the CPU reserves). Since Stage 15 the PIC is masked and the interrupts arrive
+//! through the APIC instead (see `apic.rs`) — the LAPIC timer on vector 32 and the
+//! keyboard, routed by the IO-APIC, on vector 33 — but the IDT gates and handlers
+//! here are unchanged; only the interrupt *source* and the EOI moved.
 //!
 //! Later stages add more handlers (e.g. page fault).
 
@@ -397,7 +399,8 @@ extern "C" fn timer_dispatch(tf: *mut TrapFrame) {
     }
 }
 
-/// Handler for the keyboard interrupt (IRQ1, remapped to vector 33).
+/// Handler for the keyboard interrupt (IRQ1, on vector 33 — routed by the IO-APIC
+/// since Stage 15b, previously the remapped 8259 PIC).
 ///
 /// The PS/2 controller latches one scancode byte at I/O port 0x60 for each key
 /// press or release. We must read that byte to clear the controller, or it will
@@ -415,11 +418,10 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     let scancode: u8 = unsafe { port.read() };
     crate::task::keyboard::add_scancode(scancode);
 
-    // SAFETY: we send the EOI for exactly the vector we are currently servicing.
-    unsafe {
-        PICS.lock()
-            .notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
-    }
+    // Acknowledge the interrupt. Since Stage 15b the keyboard IRQ arrives through the
+    // IO-APIC, so — like the timer — its EOI goes to the Local APIC's EOI register, not
+    // the 8259 PIC.
+    crate::apic::end_of_interrupt();
 }
 
 /// Handler for the Local APIC's spurious interrupt (Stage 15, vector

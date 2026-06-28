@@ -117,6 +117,11 @@ pub fn init(
     map_lapic(mapper, frame_allocator);
     enable_lapic();
     init_timer();
+    // Stage 15b: bring up the IO-APIC and route external device IRQs (the keyboard)
+    // through it. The Local APIC above only handles local sources (the timer) and
+    // whatever the IO-APIC forwards; without this, no device interrupt arrives.
+    map_ioapic(mapper, frame_allocator);
+    init_ioapic();
 }
 
 /// Mask every line of the legacy 8259 PIC, so all hardware interrupts now arrive
@@ -296,4 +301,162 @@ unsafe fn read(offset: u32) -> u32 {
 /// and `offset` must be a valid register offset.
 unsafe fn write(offset: u32, value: u32) {
     ((LAPIC_VIRT_BASE + offset as u64) as *mut u32).write_volatile(value);
+}
+
+// ---------------------------------------------------------------------------
+// The IO-APIC (Stage 15b): routing external device IRQs to LAPIC vectors.
+// ---------------------------------------------------------------------------
+//
+// The Local APIC handles a core's *local* interrupt sources (its timer) and
+// whatever is forwarded to it. External devices — the keyboard, disks, the NIC —
+// are wired to the **IO-APIC**, a separate, shared unit whose job is routing: each
+// of its input pins (one per legacy IRQ, plus more) carries a programmable
+// "redirection entry" saying which vector to raise, on which CPU, and how.
+//
+// Unlike the LAPIC's flat register layout, the IO-APIC is accessed *indirectly*
+// through just two MMIO registers: write a register index to IOREGSEL, then read or
+// write that register's value through IOWIN. That stateful pair is why concurrent
+// access must be serialized (see `ioapic_redirection`).
+
+/// The IO-APIC's MMIO page, mapped one page above the LAPIC (same L4 slot 100).
+const IOAPIC_VIRT_BASE: u64 = LAPIC_VIRT_BASE + 0x1000;
+/// The IO-APIC's standard physical base on a PC. A real kernel reads this from the
+/// ACPI MADT; QEMU places it here by default.
+const IOAPIC_PHYS: u64 = 0xFEC0_0000;
+
+/// Offset of IOREGSEL (the register-index port) within the IO-APIC's MMIO page.
+const IOAPIC_REGSEL: u64 = 0x00;
+/// Offset of IOWIN (the data port for the selected register).
+const IOAPIC_WIN: u64 = 0x10;
+
+/// IO-APIC register index: ID (bits 24..28).
+const IOAPIC_REG_ID: u32 = 0x00;
+/// IO-APIC register index: version (bits 0..8) + max redirection entry (bits 16..24).
+const IOAPIC_REG_VERSION: u32 = 0x01;
+/// First redirection-table register. Entry N is two 32-bit registers at
+/// `REDIR_BASE + 2*N` (low half) and `+ 2*N + 1` (high half). The low half's bit 16
+/// is the mask (1 = disabled); we leave it clear to enable an entry.
+const IOAPIC_REG_REDIR_BASE: u32 = 0x10;
+
+/// The keyboard's legacy IRQ line, which is also its IO-APIC input pin: on a PC the
+/// keyboard is IRQ1, identity-mapped to pin 1. (A real kernel confirms this via the
+/// ACPI MADT's interrupt-source overrides; QEMU uses the identity mapping.)
+pub const KEYBOARD_IRQ: u8 = 1;
+/// The vector the keyboard is routed to — the same one the 8259 PIC delivered it on
+/// (`InterruptIndex::Keyboard` = 33), so the existing keyboard handler is unchanged.
+pub const KEYBOARD_VECTOR: u8 = 33;
+
+/// Map the IO-APIC's MMIO page at [`IOAPIC_VIRT_BASE`], uncacheable.
+fn map_ioapic(
+    mapper: &mut impl Mapper<Size4KiB>,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+) {
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(IOAPIC_VIRT_BASE));
+    let frame = PhysFrame::containing_address(PhysAddr::new(IOAPIC_PHYS));
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
+
+    // SAFETY: `frame` is the IO-APIC's MMIO page (device memory, sound to map) and the
+    // only mapping of it; `page` is the next unused virtual page after the LAPIC's, so
+    // nothing is aliased. `map_to` draws intermediate-table frames only from the
+    // allocator (here it just adds an entry to the table the LAPIC mapping created).
+    // We map into the active kernel space, so flush the new page.
+    unsafe {
+        mapper
+            .map_to(page, frame, flags, frame_allocator)
+            .expect("failed to map the IO-APIC MMIO page")
+            .flush();
+    }
+    serial_println!(
+        "[apic] IO-APIC MMIO: phys {:#x} -> virt {:#x} (uncacheable)",
+        IOAPIC_PHYS,
+        IOAPIC_VIRT_BASE
+    );
+}
+
+/// Program the IO-APIC: log its identity and route the keyboard IRQ to its vector.
+fn init_ioapic() {
+    // SAFETY: `map_ioapic` ran first, so the IO-APIC MMIO is mapped. These are plain
+    // indirect register reads.
+    unsafe {
+        let id = ioapic_read(IOAPIC_REG_ID) >> 24;
+        let version = ioapic_read(IOAPIC_REG_VERSION);
+        let max_redir = ((version >> 16) & 0xFF) + 1;
+        serial_println!(
+            "[apic] IO-APIC: id {}, version {:#x}, {} redirection entries",
+            id,
+            version & 0xFF,
+            max_redir
+        );
+    }
+
+    // Route the keyboard to its vector, delivered to the BSP (LAPIC id 0), then read
+    // the entry back to confirm it (and to exercise the read path the test uses).
+    set_redirection(KEYBOARD_IRQ, KEYBOARD_VECTOR, 0);
+    let entry = ioapic_redirection(KEYBOARD_IRQ);
+    serial_println!(
+        "[apic] IO-APIC: routed keyboard IRQ{} -> vector {} (redirection entry {:#x})",
+        KEYBOARD_IRQ,
+        KEYBOARD_VECTOR,
+        entry
+    );
+}
+
+/// Program one redirection entry: deliver `irq` as `vector` to LAPIC `dest_apic`,
+/// fixed delivery, physical destination, active-high, edge-triggered, unmasked.
+fn set_redirection(irq: u8, vector: u8, dest_apic: u8) {
+    let index = IOAPIC_REG_REDIR_BASE + (irq as u32) * 2;
+    // Low word: vector in bits 0..8; all the mode bits we want are 0 (fixed delivery,
+    // physical dest, active-high, edge-triggered), and bit 16 (mask) cleared = enabled.
+    let low = vector as u32;
+    // High word: the destination APIC id sits in bits 56..64 of the 64-bit entry,
+    // i.e. bits 24..32 of the high word.
+    let high = (dest_apic as u32) << 24;
+
+    // SAFETY: the IO-APIC is mapped, and this runs during `init` with interrupts still
+    // disabled, so the stateful IOREGSEL/IOWIN pair cannot be interrupted mid-update.
+    // Write the high word first and the low word (which unmasks) last, so the entry is
+    // never live while only half-written.
+    unsafe {
+        ioapic_write(index + 1, high);
+        ioapic_write(index, low);
+    }
+}
+
+/// Read back the 64-bit redirection entry for `irq`. Exposed so a test can verify
+/// the routing is armed (the actual keypress path is interactive).
+pub fn ioapic_redirection(irq: u8) -> u64 {
+    let index = IOAPIC_REG_REDIR_BASE + (irq as u32) * 2;
+    // The IOREGSEL/IOWIN pair is stateful (an index write followed by a data access),
+    // so a concurrent IO-APIC access between the two steps would corrupt the result.
+    // Nothing else touches the IO-APIC at runtime today, but disabling interrupts here
+    // keeps this read correct regardless.
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        // SAFETY: the IO-APIC is mapped, and interrupts are disabled for the paired
+        // accesses, so no other accessor can disturb IOREGSEL between them.
+        unsafe {
+            let low = ioapic_read(index) as u64;
+            let high = ioapic_read(index + 1) as u64;
+            (high << 32) | low
+        }
+    })
+}
+
+/// Read a 32-bit IO-APIC register by index (write IOREGSEL, read IOWIN).
+///
+/// # Safety
+/// The IO-APIC MMIO page must be mapped, and callers must ensure no other access
+/// disturbs the IOREGSEL/IOWIN pair between the write and the read.
+unsafe fn ioapic_read(reg: u32) -> u32 {
+    ((IOAPIC_VIRT_BASE + IOAPIC_REGSEL) as *mut u32).write_volatile(reg);
+    ((IOAPIC_VIRT_BASE + IOAPIC_WIN) as *const u32).read_volatile()
+}
+
+/// Write a 32-bit IO-APIC register by index (write IOREGSEL, then IOWIN).
+///
+/// # Safety
+/// The IO-APIC MMIO page must be mapped, and callers must ensure no other access
+/// disturbs the IOREGSEL/IOWIN pair between the two writes.
+unsafe fn ioapic_write(reg: u32, value: u32) {
+    ((IOAPIC_VIRT_BASE + IOAPIC_REGSEL) as *mut u32).write_volatile(reg);
+    ((IOAPIC_VIRT_BASE + IOAPIC_WIN) as *mut u32).write_volatile(value);
 }

@@ -222,17 +222,17 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         serial_println!("[paging] frame allocator handed out {:?}", frame);
     }
 
-    // Stage 15a: bring up the Local APIC and move the system timer onto it. This must
-    // run after paging + the frame allocator, because it maps the APIC's
-    // memory-mapped registers into virtual memory (uncacheable) — which is why it
-    // lives here rather than beside the old PIC setup above. `apic::init` masks the
-    // 8259 PIC, software-enables the Local APIC, calibrates its timer against the PIT,
-    // and starts it firing on vector 32 (the very gate the PIT timer used, so
-    // `interrupts.rs` handles it unchanged). From here the Local APIC timer — not the
-    // PIT — drives ticks and preemption. (The keyboard stays silent until Stage 15b
-    // routes its IRQ through the IO-APIC.)
+    // Stage 15: switch from the legacy 8259 PIC to the APIC. This must run after
+    // paging + the frame allocator, because it maps the APIC's memory-mapped registers
+    // into virtual memory (uncacheable) — which is why it lives here rather than beside
+    // the old PIC setup above. `apic::init` masks the 8259 PIC, software-enables the
+    // Local APIC and runs its timer (calibrated against the PIT) on vector 32 — the
+    // very gate the PIT timer used — and brings up the IO-APIC to route the keyboard
+    // IRQ to vector 33. From here the Local APIC timer (not the PIT) drives ticks and
+    // preemption, and device IRQs arrive through the IO-APIC; `interrupts.rs`'s gates
+    // and handlers are unchanged — only the interrupt source and the EOI moved.
     apic::init(&mut mapper, &mut frame_allocator);
-    serial_println!("[ OK ] Local APIC up; system timer now runs on the APIC");
+    serial_println!("[ OK ] APIC up; timer + keyboard now delivered through the APIC");
     x86_64::instructions::interrupts::enable();
     serial_println!("[ OK ] hardware interrupts enabled; APIC timer is ticking");
 
