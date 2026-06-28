@@ -70,6 +70,7 @@ mod serial;
 mod vga_buffer;
 mod gdt;
 mod interrupts;
+mod apic;
 mod memory;
 mod allocator;
 mod ata;
@@ -166,14 +167,13 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // "DOUBLE FAULT" instead. Re-comment it before committing so boot continues.
     // stack_overflow();
 
-    // Stage 3 (step 2): bring up the 8259 PICs and enable hardware interrupts.
-    // From here the timer (IRQ0) fires on its own several times a second; its
-    // handler logs a tick to the serial port. This is the first time the CPU
-    // runs our code because an external device asked it to, not because we did.
+    // Stage 3 / Stage 15: the legacy 8259 PIC is being retired in favor of the APIC.
+    // Remap it now (clear of the CPU exception vectors, so any spurious PIC IRQ is
+    // harmless), but leave interrupts *disabled* for the moment: the APIC and its
+    // timer are brought up below, after paging maps the APIC's MMIO page, and only
+    // then do we `sti`.
     interrupts::init_pics();
-    serial_println!("[ OK ] PIC initialized");
-    x86_64::instructions::interrupts::enable();
-    serial_println!("[ OK ] hardware interrupts enabled; timer is now ticking");
+    serial_println!("[ OK ] PIC remapped (to be masked once the APIC is up)");
 
     // Stage 4a: paging. With paging on, every address the kernel uses is a
     // *virtual* address that the CPU translates to a physical one by walking a
@@ -221,6 +221,20 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     if let Some(frame) = frame_allocator.allocate_frame() {
         serial_println!("[paging] frame allocator handed out {:?}", frame);
     }
+
+    // Stage 15a: bring up the Local APIC and move the system timer onto it. This must
+    // run after paging + the frame allocator, because it maps the APIC's
+    // memory-mapped registers into virtual memory (uncacheable) — which is why it
+    // lives here rather than beside the old PIC setup above. `apic::init` masks the
+    // 8259 PIC, software-enables the Local APIC, calibrates its timer against the PIT,
+    // and starts it firing on vector 32 (the very gate the PIT timer used, so
+    // `interrupts.rs` handles it unchanged). From here the Local APIC timer — not the
+    // PIT — drives ticks and preemption. (The keyboard stays silent until Stage 15b
+    // routes its IRQ through the IO-APIC.)
+    apic::init(&mut mapper, &mut frame_allocator);
+    serial_println!("[ OK ] Local APIC up; system timer now runs on the APIC");
+    x86_64::instructions::interrupts::enable();
+    serial_println!("[ OK ] hardware interrupts enabled; APIC timer is ticking");
 
     // Map a brand-new page at 64 TiB (nothing is mapped near there) onto the VGA
     // frame. Because that region has no page tables yet, `map_to` must build the

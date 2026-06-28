@@ -37,7 +37,8 @@ use crate::usermode;
 /// Where the demo ELF asks to be loaded: slot 64 of the L4 (`0x2000_0000_0000`),
 /// which the kernel leaves empty — so the loader builds *private* lower-level
 /// tables there instead of sharing the kernel's. (Stage 11a's boot log shows the
-/// kernel's present L4 slots are 0, 2, 3, 4, 5, 31, 128, 136 — not 64.)
+/// kernel's present L4 slots are 0, 2, 3, 4, 5, 31, 128, 136 — plus 100, the Stage 15
+/// Local APIC MMIO — but not 64.)
 pub const USER_LOAD_BASE: u64 = 0x2000_0000_0000;
 
 /// Offset of the entry point within the demo image: ELF header (64) + one program

@@ -76,6 +76,11 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     idt.general_protection_fault
         .set_handler_fn(general_protection_fault_handler);
     idt[InterruptIndex::Keyboard.as_usize()].set_handler_fn(keyboard_interrupt_handler);
+    // Stage 15: the Local APIC's spurious-interrupt vector. The APIC can deliver a
+    // "spurious" interrupt here (e.g. when an IRQ is masked just as it is being
+    // accepted); by the architecture it requires no EOI. With no handler registered it
+    // would escalate to a #GP and then a double fault, so we back it with a no-op.
+    idt[crate::apic::SPURIOUS_VECTOR as usize].set_handler_fn(spurious_interrupt_handler);
     // Stage 10: the syscall vector. Setting the gate's DPL to 3 is what lets ring 3
     // execute `int 0x80` (a gate's DPL is the highest-numbered ring allowed to
     // invoke it); with the default DPL 0, a ring 3 `int 0x80` would raise a #GP
@@ -349,10 +354,11 @@ unsafe extern "C" fn timer_interrupt_entry() {
 /// [`TrapFrame`] on the kernel stack.
 ///
 /// Counts the tick and sends the EOI (mandatory, and *before* any reschedule: until
-/// the PIC is acknowledged it delivers no further timer IRQ). Through Stage 12c-2 the
-/// timer behavior is unchanged (count, EOI, dormant kernel-thread reschedule); Stage
-/// 12c-3 will, when the interrupted context is a user process, save `*tf` and
-/// round-robin to the next process — true preemption.
+/// the interrupt controller is acknowledged it delivers no further timer interrupt).
+/// Since Stage 15 the source is the Local APIC timer and the EOI goes to the LAPIC
+/// (`apic::end_of_interrupt`) rather than the 8259 PIC; the dispatch logic is
+/// otherwise unchanged. When the interrupted context is a user process (ring 3) it
+/// saves `*tf` and round-robins to the next process — true preemption (Stage 12c-3).
 extern "C" fn timer_dispatch(tf: *mut TrapFrame) {
     let count = TIMER_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     if count == 1 {
@@ -372,14 +378,11 @@ extern "C" fn timer_dispatch(tf: *mut TrapFrame) {
     } else if count % 100 == 0 {
         serial_println!("[timer] tick {}", count);
     }
-    // SAFETY: we send the EOI for exactly the vector we are currently servicing, and
-    // *before* any reschedule — until the PIC is acknowledged it delivers no further
-    // timer IRQ. Signaling the wrong vector could acknowledge an interrupt that never
-    // fired.
-    unsafe {
-        PICS.lock()
-            .notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
-    }
+    // Acknowledge the interrupt — Stage 15 moved the EOI from the 8259 PIC to the
+    // Local APIC's EOI register — and *before* any reschedule: until the controller
+    // is acknowledged it delivers no further timer interrupt. (`end_of_interrupt`
+    // encapsulates the MMIO write and its safety.)
+    crate::apic::end_of_interrupt();
     // Stage 12c-3: if the tick interrupted a *user* process (ring 3), preempt it and
     // round-robin to the next one; a tick in ring 0 instead feeds the (dormant)
     // kernel-thread scheduler, exactly as before. (Syscalls run with IF clear, so a
@@ -418,3 +421,13 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
             .notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
     }
 }
+
+/// Handler for the Local APIC's spurious interrupt (Stage 15, vector
+/// [`crate::apic::SPURIOUS_VECTOR`]).
+///
+/// The APIC raises a spurious interrupt when an IRQ it was about to deliver is
+/// withdrawn (e.g. masked) at just the wrong moment. The architecture is explicit
+/// that it must *not* be acknowledged with an EOI — so this handler does nothing but
+/// return. It exists only so the vector has a valid gate; without it a spurious
+/// interrupt would fault.
+extern "x86-interrupt" fn spurious_interrupt_handler(_stack_frame: InterruptStackFrame) {}

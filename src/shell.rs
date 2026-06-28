@@ -54,9 +54,10 @@ macro_rules! sh_println {
     }};
 }
 
-/// The default PIT rate is ~18.2 Hz. We round to 18 for a rough `uptime`; this is
-/// an estimate, not a calibrated clock.
-const TIMER_HZ: u64 = 18;
+/// The tick rate the kernel programs the Local APIC timer at (Stage 15). Sourced
+/// from `apic.rs` so `uptime`'s ticks-to-seconds conversion never drifts from the
+/// real timer. Unlike the old ~18.2 Hz PIT estimate, this rate is calibrated.
+const TIMER_HZ: u64 = crate::apic::TIMER_HZ as u64;
 
 /// Print the prompt, which shows the current working directory, e.g. `aether:/docs> `.
 fn print_prompt(cwd: &str) {
