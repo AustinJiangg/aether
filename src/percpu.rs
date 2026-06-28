@@ -55,6 +55,17 @@ pub struct PerCpu {
     /// counts its *own* timer here — the first autonomous work an AP does once its timer
     /// is enabled. (The BSP also tallies its ticks globally in `interrupts::TIMER_TICKS`.)
     timer_ticks: AtomicU64,
+    /// Units of work this core's kernel thread has done (Stage 16d-2). Bumped by the
+    /// cooperative worker thread the AP switches into, so a non-zero value proves a kernel
+    /// thread actually executed on this core.
+    work: AtomicU64,
+    /// Address of the bootstrap context's saved-stack-pointer slot (Stage 16d-2). The AP's
+    /// `ap_entry` stashes it here before switching into its worker, so the worker can read
+    /// the bootstrap's resume stack pointer and `context_switch` back to it. 0 when unused.
+    bootstrap_slot: AtomicU64,
+    /// Set once the bootstrap context resumes after its worker switched back (Stage 16d-2)
+    /// — proof the round-trip context switch completed, not just the switch in.
+    bootstrap_resumed: AtomicBool,
 }
 
 impl PerCpu {
@@ -77,6 +88,37 @@ impl PerCpu {
     /// ([`crate::interrupts`]) when the tick lands on this core.
     pub fn tick(&self) {
         self.timer_ticks.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Units of work this core's kernel thread has done (Stage 16d-2).
+    pub fn work(&self) -> u64 {
+        self.work.load(Ordering::SeqCst)
+    }
+
+    /// Add to this core's work tally — called by the core's own worker thread.
+    pub fn add_work(&self, n: u64) {
+        self.work.fetch_add(n, Ordering::SeqCst);
+    }
+
+    /// The stashed address of this core's bootstrap saved-stack-pointer slot (0 if unset).
+    pub fn bootstrap_slot(&self) -> u64 {
+        self.bootstrap_slot.load(Ordering::SeqCst)
+    }
+
+    /// Stash the address of the bootstrap context's saved-sp slot, for the worker to read
+    /// when it switches back.
+    pub fn set_bootstrap_slot(&self, addr: u64) {
+        self.bootstrap_slot.store(addr, Ordering::SeqCst);
+    }
+
+    /// Whether the bootstrap context resumed after its worker switched back.
+    pub fn bootstrap_resumed(&self) -> bool {
+        self.bootstrap_resumed.load(Ordering::SeqCst)
+    }
+
+    /// Record that the bootstrap context resumed (the round-trip context switch completed).
+    pub fn set_bootstrap_resumed(&self) {
+        self.bootstrap_resumed.store(true, Ordering::SeqCst);
     }
 
     /// Called by a core, on itself, to record that it is up and on which stack. Writes
@@ -108,6 +150,9 @@ pub fn init(cores: &[CpuCore]) {
             online: AtomicBool::new(core.is_bsp), // the BSP is already running
             stack: AtomicU64::new(0),
             timer_ticks: AtomicU64::new(0),
+            work: AtomicU64::new(0),
+            bootstrap_slot: AtomicU64::new(0),
+            bootstrap_resumed: AtomicBool::new(false),
         });
     }
 

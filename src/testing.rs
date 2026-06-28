@@ -600,3 +600,21 @@ fn aps_take_timer_interrupts() {
         );
     }
 }
+
+/// Stage 16d-2: each AP ran a kernel thread via a context switch. In `ap_entry` every AP
+/// fabricates a worker stack, `context_switch`es into it (the worker bumps this core's
+/// per-CPU `work` counter), and the worker `context_switch`es back — a full round-trip on a
+/// non-boot core. By the time these tests run, every AP must have done its work *and* had
+/// its bootstrap context resume, proving both halves of the switch work off the BSP.
+#[test_case]
+fn aps_run_a_thread_via_context_switch() {
+    use crate::percpu;
+    for cpu in percpu::all().iter().filter(|c| !c.is_bsp) {
+        assert!(cpu.work() > 0, "AP cpu{} ran no thread work", cpu.cpu_index);
+        assert!(
+            cpu.bootstrap_resumed(),
+            "AP cpu{} did not resume its bootstrap after the worker (switch-back failed)",
+            cpu.cpu_index,
+        );
+    }
+}

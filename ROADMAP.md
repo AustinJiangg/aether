@@ -272,10 +272,23 @@ unify later.
 > AP it just bumps that core's per-CPU `timer_ticks` and EOIs (the global tally and the process/thread
 > scheduler stay BSP-only and SMP-unsafe for now); a non-panicking `this_cpu_opt` handles the BSP's timer
 > firing before `percpu::init`. Boot logs each AP taking ~5 ticks over a 50 ms window; verified by 34
-> tests (the new `aps_take_timer_interrupts`: every AP's per-CPU tick count is non-zero). Next:
-> **Stage 16d-2** — give an AP a real run queue and let the scheduler run a kernel thread on it, so the
-> cores do work instead of just counting ticks; then **16d-3** unifies the async executor and the thread
-> scheduler.
+> tests (the new `aps_take_timer_interrupts`: every AP's per-CPU tick count is non-zero).
+>
+> **Stage 16d-2 is also done** — a kernel thread now runs on an AP via a context switch. Multi-core
+> scheduling is the most triple-fault-prone code yet (an async context switch on a core with no
+> console), so — following the 16b discipline of tiny sub-steps — 16d-2 validates just the primitive:
+> can `thread::context_switch` (the CPU-agnostic save-callee-saved-+-swap-stacks routine, proven on the
+> BSP in Stage 6) work *from* an application processor? In `ap_entry`, after the 16d-1 timer setup (but
+> before `sti` — a context switch must be atomic w.r.t. the timer), each AP runs one **cooperative**
+> worker thread: it fabricates a worker stack (`prepare_worker_stack`, mirroring Stage 6), `context_switch`es
+> into `ap_worker_entry` (which bumps this core's per-CPU `work` counter, then switches back), and resumes
+> — a full round-trip, exercising *both* halves of the switch off the BSP. The worker stack is freed on
+> return (it would otherwise exhaust the 100 KiB heap), and the bootstrap's resume stack pointer reaches
+> the worker through a per-CPU slot. Boot logs each AP doing `work 50000, bootstrap resumed = true`;
+> verified by 35 tests (the new `aps_run_a_thread_via_context_switch`). Next: **Stage 16d-3** — build a
+> real per-CPU run queue on this validated primitive (multiple kernel threads per core, cooperative
+> round-robin); then **16d-4** drives it from the AP timer (preemption), and **16d-5** unifies the async
+> executor with the thread scheduler.
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

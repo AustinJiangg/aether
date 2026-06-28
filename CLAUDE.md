@@ -308,7 +308,11 @@ Exit QEMU: `Ctrl-A` then `X`.
   before parking, each AP now brings its own interrupt path online — `gdt::init_ap` (load the kernel
   GDT, reload CS, null out SS/DS/ES, no TSS), `interrupts::init_idt_ap` (the shared IDT), `apic::init_ap`
   (its own Local APIC timer), then `sti` — so it takes its own timer interrupts (counted per-CPU) instead
-  of sitting idle. 16d-2 gives it a scheduler to run.
+  of sitting idle. Stage 16d-2: before that final `sti`, each AP also runs one **cooperative kernel
+  thread** to prove a context switch works off the BSP — `run_cooperative_worker` fabricates a worker
+  stack (`prepare_worker_stack`) and `context_switch`es (reused from `thread`) into `ap_worker_entry`,
+  which bumps this core's per-CPU `work` counter then switches back; the worker stack is freed on return.
+  16d-3 turns this into a real per-CPU run queue.
 - `src/percpu.rs`: Stage 16c per-CPU data — one private `PerCpu` block per core (dense cpu index, Local
   APIC id, BSP flag, an `online` flag, and the stack the core runs on), the foundation for "the current
   process / run queue is per-core" that Stage 16d needs. The blocks live in a heap array published
@@ -319,7 +323,9 @@ Exit QEMU: `Ctrl-A` then `X`.
   each core); `all()`/`count()`/`online_count()` expose the table. An AP records itself online here in
   `smp::ap_entry`; the BSP prints the per-CPU table at boot. Stage 16d-1 adds a per-CPU `timer_ticks`
   counter (each core tallies its *own* LAPIC timer interrupts) and a non-panicking `this_cpu_opt()` for
-  handlers that can fire before `init` (the BSP's timer ticks before per-CPU data is built).
+  handlers that can fire before `init` (the BSP's timer ticks before per-CPU data is built). Stage 16d-2
+  adds a `work` counter plus a `bootstrap_slot`/`bootstrap_resumed` pair the AP's cooperative context
+  switch uses (the worker reads the slot to switch back; `ap_entry` sets `bootstrap_resumed` on return).
 - `src/acpi.rs`: Stage 16a SMP discovery — parses just enough ACPI to enumerate the machine's CPU
   cores. `discover` scans low memory for the RSDP signature, follows it to the RSDT/XSDT (a table of
   table pointers), finds the MADT (signature "APIC"), and reads its Processor Local APIC entries into a
@@ -355,7 +361,10 @@ Exit QEMU: `Ctrl-A` then `X`.
   stack frame, and `schedule` called from the timer to preempt) and `switch.rs`
   (the naked `context_switch` that saves callee-saved registers and swaps stacks).
   Dormant during Stage 7 (marked `#[allow(dead_code)]`); the timer still calls
-  `schedule`, but it no-ops because preemption is never armed.
+  `schedule`, but it no-ops because preemption is never armed. Since Stage 16d-2
+  `context_switch` is re-exported (`pub use switch::context_switch`) and reused by
+  `smp.rs` to switch a kernel thread on an application processor — it is CPU-agnostic,
+  so the same routine serves the BSP's (dormant) scheduler and the APs.
 - `src/shell.rs`: Stage 7-8 interactive shell — an async task that reads decoded
   keystrokes from the keyboard `ScancodeStream`, buffers a line (with Backspace)
   against a current working directory, and on Enter routes it through a `dispatch`

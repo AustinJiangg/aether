@@ -35,6 +35,11 @@
 
 mod switch;
 
+/// The architecture context-switch primitive (save callee-saved registers + swap stacks).
+/// Re-exported because it is CPU-agnostic: Stage 16d reuses it to switch kernel threads on
+/// an application processor, not just on the BSP's (dormant) global scheduler here.
+pub use switch::context_switch;
+
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};

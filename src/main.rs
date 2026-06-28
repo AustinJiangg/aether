@@ -393,6 +393,21 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     }
     println!("SMP: each AP runs its own LAPIC timer now (per-CPU tick counts on the serial log).");
 
+    // Stage 16d-2: each AP also ran one cooperative kernel thread (in `ap_entry`) before
+    // parking — a context switch on a non-boot core. Report the per-CPU work each did and
+    // that its bootstrap context resumed afterwards (so the round-trip switch completed).
+    serial_println!("[percpu] AP cooperative kernel thread (round-trip context switch):");
+    for cpu in percpu::all().iter().filter(|c| !c.is_bsp) {
+        serial_println!(
+            "[percpu]   cpu{} apic id {}: work {}, bootstrap resumed = {}",
+            cpu.cpu_index,
+            cpu.apic_id,
+            cpu.work(),
+            cpu.bootstrap_resumed(),
+        );
+    }
+    println!("SMP: each AP ran a kernel thread via a context switch (per-CPU work on the serial log).");
+
     // Stage 13a: read a raw sector from disk via ATA PIO (polling, no DMA/IRQ). The
     // bootimage is attached as the primary IDE master, so sector 0 is the boot sector —
     // its last two bytes are the MBR signature 0x55 0xAA, a stable thing to verify without
