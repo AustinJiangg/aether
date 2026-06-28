@@ -522,12 +522,20 @@ fn self_ipi_is_delivered() {
     assert!(crate::interrupts::self_ipi_works());
 }
 
-/// Stage 16b-2a: the BSP woke an application processor. Boot copies a real-mode
-/// trampoline to low memory and sends the target AP INIT-SIPI-SIPI; the AP writes a
-/// marker the BSP polls. By the time this harness runs that wake-up must have
-/// succeeded — proving the INIT-SIPI-SIPI sequence works and a second core executed
-/// our code (still in real mode; 16b-2b takes it to long mode).
+/// Stage 16b-2a: the BSP woke an application processor. Boot copies a trampoline to
+/// low memory and sends the target AP INIT-SIPI-SIPI; the AP writes a progress marker
+/// the BSP polls. By the time this harness runs that wake-up must have succeeded —
+/// proving the INIT-SIPI-SIPI sequence works and a second core executed our code.
 #[test_case]
 fn woke_an_application_processor() {
-    assert!(crate::smp::ap_woke());
+    assert!(crate::smp::ap_stage() >= 1);
+}
+
+/// Stage 16b-2b: the woken AP climbed the full real -> protected -> long mode ladder.
+/// The trampoline writes a higher marker at each rung; reaching stage 3 means the AP
+/// loaded the kernel CR3, enabled PAE + paging + long mode, and far-jumped into 64-bit
+/// code — all on a second core. Boot records the highest stage reached.
+#[test_case]
+fn ap_reaches_long_mode() {
+    assert_eq!(crate::smp::ap_stage(), 3);
 }

@@ -336,17 +336,20 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     );
     println!("SMP: self-IPI test (Local APIC can send and receive an IPI) = {}", ipi_ok);
 
-    // Stage 16b-2a: wake one application processor. Copy a tiny real-mode trampoline
-    // into low memory, send the AP INIT-SIPI-SIPI, and confirm it runs our code by
-    // polling a marker it writes. The AP stays in real mode (paging off) and then
-    // halts, so this proves only the wake-up sequence and that a second core executes
-    // — no page tables yet. Stage 16b-2b climbs the trampoline to long mode.
-    smp::boot_one_ap(phys_mem_offset);
+    // Stage 16b-2: wake one application processor and climb it to 64-bit long mode.
+    // Copy the trampoline into low memory, send the AP INIT-SIPI-SIPI, and watch the
+    // progress marker it writes at each rung (real -> protected -> long). The AP shares
+    // the kernel's CR3 and the trampoline page is identity-mapped, so it survives
+    // enabling paging; it then halts in long mode (Stage 16b-3 will enter Rust).
+    smp::boot_one_ap(&mut mapper, &mut frame_allocator, phys_mem_offset);
     serial_println!(
-        "[ OK ] woke one application processor via INIT-SIPI-SIPI = {}",
-        smp::ap_woke()
+        "[ OK ] AP brought up via INIT-SIPI-SIPI: reached stage {}/3 (3 = long mode)",
+        smp::ap_stage()
     );
-    println!("SMP: woke one application processor (it ran our trampoline) = {}", smp::ap_woke());
+    println!(
+        "SMP: brought up one AP through real->protected->long mode (stage {}/3)",
+        smp::ap_stage()
+    );
 
     // Stage 13a: read a raw sector from disk via ATA PIO (polling, no DMA/IRQ). The
     // bootimage is attached as the primary IDE master, so sector 0 is the boot sector —

@@ -167,8 +167,12 @@ by `interrupts.rs`'s `ipi_test_handler` / `self_ipi_works`). **Stage 16b-2a is n
 `smp.rs` wakes an application processor — `boot_one_ap` copies a tiny real-mode `global_asm!`
 trampoline to physical 0x8000 and sends it INIT-SIPI-SIPI (new `apic::send_init_ipi` /
 `send_startup_ipi` / `pit_sleep_us`); the AP writes an "alive" marker the BSP polls, proving a second
-core executes our code (still real mode, paging off — 16b-2b climbs it to long mode). `ROADMAP.md`
-carries the forward plan (stages 9-18): the user-space main line (system calls, per-process address spaces +
+core executes our code. **Stage 16b-2b is now also done**: the trampoline grows into the full
+`.code16`->`.code32`->`.code64` climb (temporary GDT, CR0.PE, CR4.PAE, kernel CR3, EFER.LME, CR0.PG,
+raw-byte far jumps), writing a progress marker at each rung; `memory::ensure_identity_mapped` maps the
+trampoline page to itself so the AP survives enabling paging, and `boot_one_ap` passes it the kernel
+CR3 — boot logs "AP apic id 1 reached 64-bit long mode (stage 3/3)". `ROADMAP.md` carries the forward
+plan (stages 9-18): the user-space main line (system calls, per-process address spaces +
 ELF, multiprocessing), plus persistence, APIC/SMP, and networking tracks.
 
 ## Language and writing conventions
@@ -273,13 +277,16 @@ Exit QEMU: `Ctrl-A` then `X`.
   the delivery-status bit) — the IPI send path Stage 16b-2's INIT-SIPI-SIPI will reuse. Stage 16b-2a
   adds `send_init_ipi` / `send_startup_ipi` (the INIT and SIPI delivery modes over that same ICR
   path) and `pit_sleep_us` (a polled PIT channel-2 delay) to pace the wake-up sequence.
-- `src/smp.rs`: Stage 16b SMP bring-up — waking the application processors. Stage 16b-2a holds a tiny
-  real-mode `global_asm!` trampoline (`.code16`): an AP wakes, writes an "alive" marker to a fixed low
-  address, and halts. `boot_one_ap` copies the blob to physical 0x8000 (a free conventional-RAM page;
-  the SIPI vector is its page number), clears the marker, sends the target AP INIT-SIPI-SIPI (via the
-  `apic` helpers), then polls the marker — proving a second core executes our code. Still real mode
-  (paging off), so no page tables yet; 16b-2b extends the trampoline to long mode. `ap_woke()` exposes
-  the result for the test.
+- `src/smp.rs`: Stage 16b SMP bring-up — waking the application processors. A `global_asm!` trampoline
+  climbs a woken AP from 16-bit real mode through 32-bit protected mode to 64-bit long mode
+  (`.code16`->`.code32`->`.code64`: temporary GDT + CR0.PE, then CR4.PAE + kernel CR3 + EFER.LME +
+  CR0.PG, each transition a raw-byte far jump), writing a progress marker at each rung (1/2/3). All
+  absolute addresses are `0x8000 + (label - start)` constants, so the copied blob needs no relocation.
+  `boot_one_ap` copies the blob to physical 0x8000 (the SIPI vector is its page number), publishes the
+  kernel CR3 into a parameter slot, identity-maps the page (`memory::ensure_identity_mapped`, so the AP
+  survives enabling paging), sends INIT-SIPI-SIPI (via the `apic` helpers), then polls the marker.
+  `ap_stage()` exposes the highest rung reached for the tests. The AP halts in long mode; 16b-3 will
+  hand it a stack and enter Rust.
 - `src/acpi.rs`: Stage 16a SMP discovery — parses just enough ACPI to enumerate the machine's CPU
   cores. `discover` scans low memory for the RSDP signature, follows it to the RSDT/XSDT (a table of
   table pointers), finds the MADT (signature "APIC"), and reads its Processor Local APIC entries into a
@@ -297,7 +304,9 @@ Exit QEMU: `Ctrl-A` then `X`.
   inactive space), and switches CR3 onto it and back. Stage 12d adds a globally
   reachable kernel frame allocator + physical-memory offset
   (`install_kernel_allocator`/`with_kernel_frame_allocator`), so the `spawn` syscall can
-  load an ELF from inside the trap handler (which cannot borrow `kernel_main`'s locals).
+  load an ELF from inside the trap handler (which cannot borrow `kernel_main`'s locals). Stage 16b-2b
+  adds `ensure_identity_mapped`, which maps a low frame to itself (no-op if already mapped) so an AP's
+  trampoline page survives the AP enabling paging.
 - `src/allocator.rs`: the kernel heap — maps a fixed virtual range to frames and
   registers a `#[global_allocator]` (a hand-written fixed-size block allocator
   over a linked-list fallback), so the `alloc` crate's `Box`/`Vec`/`Rc`/`String`

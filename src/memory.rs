@@ -31,6 +31,7 @@ use spin::Mutex;
 use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::structures::paging::{
     FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB,
+    Translate,
 };
 use x86_64::{PhysAddr, VirtAddr};
 
@@ -197,6 +198,37 @@ pub fn with_kernel_frame_allocator<R>(f: impl FnOnce(&mut BootInfoFrameAllocator
 /// physical memory as the screen. It is a *safe* function because the VGA frame
 /// is device memory that is always sound to map writable, and aliasing it is the
 /// whole point; a general "map any frame" helper would have to be `unsafe`.
+/// Ensure the 4 KiB frame at physical `phys` is identity-mapped (virtual address ==
+/// physical address), present and writable, in the active page tables.
+///
+/// Stage 16b SMP bring-up needs this: an AP starts executing the trampoline at its
+/// physical address with paging off, then loads the kernel's CR3 and enables paging —
+/// at which point the very next instruction is fetched through the page tables, so the
+/// trampoline page must map to itself or the AP triple-faults. If the bootloader
+/// already identity-maps this low page (it maps low memory), this is a no-op.
+pub fn ensure_identity_mapped(
+    phys: u64,
+    mapper: &mut OffsetPageTable,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+) {
+    let addr = VirtAddr::new(phys);
+    if mapper.translate_addr(addr) == Some(PhysAddr::new(phys)) {
+        return; // already identity-mapped (e.g. the bootloader's low-memory mapping)
+    }
+    let page = Page::<Size4KiB>::containing_address(addr);
+    let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(phys));
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+    // SAFETY: `phys` is a real low-RAM frame and `addr` was just confirmed unmapped, so
+    // mapping it to itself aliases nothing unexpected. The trampoline page must be
+    // executable, which it is: we leave NO_EXECUTE clear.
+    unsafe {
+        mapper
+            .map_to(page, frame, flags, frame_allocator)
+            .expect("identity map of the AP trampoline page failed")
+            .flush();
+    }
+}
+
 pub fn create_example_mapping(
     page: Page,
     mapper: &mut OffsetPageTable,

@@ -215,10 +215,21 @@ unify later.
 > marker, and sends INIT-SIPI-SIPI via new `apic` helpers (`send_init_ipi`/`send_startup_ipi`, reusing
 > 16b-1's ICR path) paced by a `pit_sleep_us` PIT delay (10 ms, then 200 us between the two SIPIs).
 > The BSP polls the marker: boot logs "AP apic id 1 is alive (executed the trampoline)" — a second
-> core ran our code. Verified by 30 tests (the new `woke_an_application_processor`). Next: **Stage
-> 16b-2b** — extend the trampoline through 32-bit protected mode and 64-bit long mode (a progress
-> marker at each rung), which needs an identity mapping of the trampoline page so the instruction
-> after paging is enabled still fetches.
+> core ran our code. Verified by 30 tests (the new `woke_an_application_processor`).
+>
+> **Stage 16b-2b is also done** — climbing the woken AP to 64-bit long mode. The `smp.rs` trampoline
+> now grows from the 2a real-mode stub into the full `.code16` → `.code32` → `.code64` ladder: load a
+> temporary GDT and set CR0.PE (protected mode), then set CR4.PAE, load the kernel's CR3, set
+> EFER.LME, set CR0.PG (long mode), each transition a raw-byte far jump (`0xEA`) to flush CS. It
+> writes a progress marker at each rung (1 = real, 2 = protected, 3 = long) so a stall pinpoints the
+> failing transition. Two new pieces support it: `memory::ensure_identity_mapped` maps the trampoline
+> page to itself (the instruction after CR0.PG is fetched through the page tables, so 0x8000 must map
+> to 0x8000), and `boot_one_ap` publishes the kernel CR3 into a parameter slot the trampoline loads
+> (so the AP shares the kernel's address space). All absolute addresses are `0x8000 + (label - start)`
+> constants — no runtime relocation. Boot logs "AP apic id 1 reached 64-bit long mode (stage 3/3)".
+> Verified by 31 tests (the new `ap_reaches_long_mode`). Next: **Stage 16b-3** — hand the AP a per-CPU
+> stack and far-jump into a Rust `ap_entry`, which bumps an atomic so the BSP confirms "AP online"
+> (the soft-float `x86_64-unknown-none` target means no SSE setup is needed before Rust runs).
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|
