@@ -376,6 +376,23 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         percpu::count(),
     );
 
+    // Stage 16d-1: each AP enabled its *own* Local APIC timer in `ap_entry`. Give them a
+    // few timer periods, then read each core's per-CPU tick count — a climbing count is
+    // proof the APs are doing autonomous work (servicing their own timer interrupts on
+    // their own LAPIC), not just parked. (`pit_sleep_us` polls the PIT, independent of the
+    // BSP's own running timer.)
+    apic::pit_sleep_us(50_000); // ~5 ticks per AP at 100 Hz
+    serial_println!("[percpu] AP Local APIC timer ticks after ~50 ms:");
+    for cpu in percpu::all().iter().filter(|c| !c.is_bsp) {
+        serial_println!(
+            "[percpu]   cpu{} apic id {}: {} timer tick(s)",
+            cpu.cpu_index,
+            cpu.apic_id,
+            cpu.timer_ticks(),
+        );
+    }
+    println!("SMP: each AP runs its own LAPIC timer now (per-CPU tick counts on the serial log).");
+
     // Stage 13a: read a raw sector from disk via ATA PIO (polling, no DMA/IRQ). The
     // bootimage is attached as the primary IDE master, so sector 0 is the boot sector —
     // its last two bytes are the MBR signature 0x55 0xAA, a stable thing to verify without

@@ -265,6 +265,10 @@ Exit QEMU: `Ctrl-A` then `X`.
   dedicated gate (`IPI_TEST_VECTOR` = 0x40) whose `ipi_test_handler` sets a flag and
   EOIs, driven by `self_ipi_works()` (sends a fixed IPI to this CPU and confirms it
   arrives) — proving the Local APIC IPI path before Stage 16b uses it to wake the APs.
+  Stage 16d-1 makes `timer_dispatch` per-CPU aware (via `percpu::this_cpu_opt`): on an AP
+  it just bumps that core's per-CPU tick count and EOIs, leaving the global tally and the
+  process/thread scheduler BSP-only; `init_idt_ap` points a woken AP's IDTR at the one
+  shared IDT.
 - `src/apic.rs`: Stage 15 APIC (Advanced Programmable Interrupt Controller) support.
   `init` maps the Local APIC's MMIO page uncacheable (`NO_CACHE`), software-enables it
   via the spurious-vector register, masks the 8259 PIC, then *calibrates* the LAPIC
@@ -281,7 +285,10 @@ Exit QEMU: `Ctrl-A` then `X`.
   (Interrupt Command Register: write the destination apic id, then the low half to send, then poll
   the delivery-status bit) — the IPI send path Stage 16b-2's INIT-SIPI-SIPI will reuse. Stage 16b-2a
   adds `send_init_ipi` / `send_startup_ipi` (the INIT and SIPI delivery modes over that same ICR
-  path) and `pit_sleep_us` (a polled PIT channel-2 delay) to pace the wake-up sequence.
+  path) and `pit_sleep_us` (a polled PIT channel-2 delay) to pace the wake-up sequence. Stage 16d-1
+  adds `init_ap`: a woken AP software-enables its *own* Local APIC and starts its periodic timer,
+  reusing the BSP's calibrated count (saved in `TIMER_INITIAL_COUNT`) — the LAPIC MMIO address is
+  per-core-aliased, so each write targets the running core's own LAPIC.
 - `src/smp.rs`: Stage 16b SMP bring-up — waking the application processors. A `global_asm!` trampoline
   climbs a woken AP from 16-bit real mode through 32-bit protected mode to 64-bit long mode
   (`.code16`->`.code32`->`.code64`: temporary GDT + CR0.PE, then CR4.PAE + kernel CR3 + EFER.LME +
@@ -297,8 +304,11 @@ Exit QEMU: `Ctrl-A` then `X`.
   and jumps to the Rust `ap_entry` (its address published in a parameter slot); each AP marks its own
   per-CPU block online (`percpu::this_cpu().mark_online`) and bumps an `AP_ONLINE` atomic
   (`aps_online()`), then parks — real kernel Rust on a second core. The trampoline sets `EFER.NXE` (not
-  just `LME`) so walking the kernel's NX page-table entries does not reserved-bit-fault. The APs then
-  park; 16d puts them to work.
+  just `LME`) so walking the kernel's NX page-table entries does not reserved-bit-fault. Stage 16d-1:
+  before parking, each AP now brings its own interrupt path online — `gdt::init_ap` (load the kernel
+  GDT, reload CS, null out SS/DS/ES, no TSS), `interrupts::init_idt_ap` (the shared IDT), `apic::init_ap`
+  (its own Local APIC timer), then `sti` — so it takes its own timer interrupts (counted per-CPU) instead
+  of sitting idle. 16d-2 gives it a scheduler to run.
 - `src/percpu.rs`: Stage 16c per-CPU data — one private `PerCpu` block per core (dense cpu index, Local
   APIC id, BSP flag, an `online` flag, and the stack the core runs on), the foundation for "the current
   process / run queue is per-core" that Stage 16d needs. The blocks live in a heap array published
@@ -307,7 +317,9 @@ Exit QEMU: `Ctrl-A` then `X`.
   core (BSP pre-marked online) and must run before any AP is woken; `this_cpu()` returns the running
   core's block, found by its own `apic::lapic_id()` (one fixed MMIO register that reads a different id on
   each core); `all()`/`count()`/`online_count()` expose the table. An AP records itself online here in
-  `smp::ap_entry`; the BSP prints the per-CPU table at boot.
+  `smp::ap_entry`; the BSP prints the per-CPU table at boot. Stage 16d-1 adds a per-CPU `timer_ticks`
+  counter (each core tallies its *own* LAPIC timer interrupts) and a non-panicking `this_cpu_opt()` for
+  handlers that can fire before `init` (the BSP's timer ticks before per-CPU data is built).
 - `src/acpi.rs`: Stage 16a SMP discovery — parses just enough ACPI to enumerate the machine's CPU
   cores. `discover` scans low memory for the RSDP signature, follows it to the RSDT/XSDT (a table of
   table pointers), finds the MADT (signature "APIC"), and reads its Processor Local APIC entries into a

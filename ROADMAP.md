@@ -255,8 +255,27 @@ unify later.
 > the rest succeed. Boot logs a per-CPU table — "cpu0 apic id 0 BSP online", "cpu1 apic id 1 AP online
 > (stack 0x…38f0)", … one stack per AP, 0x2000 apart. Verified by 33 tests (the new
 > `all_application_processors_online`: all three APs online, four per-CPU blocks, three distinct nonzero
-> AP stacks). Next: **Stage 16d** — give an AP its own IDT + Local APIC timer and let the scheduler run
-> a thread on it, so the idle cores actually do work.
+> AP stacks).
+>
+> **Stage 16d-1 is also done** — each woken AP now runs its *own* Local APIC timer, the first autonomous
+> work a non-boot core does. In `ap_entry` an AP brings its interrupt path online: `gdt::init_ap` loads
+> the shared kernel GDT and reloads CS to the kernel code selector (the AP still ran on the trampoline's
+> temporary GDT, where the kernel selectors are absent) — and crucially reloads SS to the null selector,
+> since the trampoline left SS at its data selector, which in the kernel GDT is the *DPL 3* user-data
+> descriptor and would #GP on the first `iretq`. It loads no TSS: the kernel's one TSS is already
+> `ltr`-loaded by the BSP (its busy bit makes a second `ltr` #GP), and an AP needs no rsp0/IST yet,
+> running only ring-0 handlers on the current stack. `interrupts::init_idt_ap` points the AP's IDTR at
+> the one shared IDT; `apic::init_ap` software-enables this core's Local APIC and starts its periodic
+> timer, reusing the BSP's calibrated count (the bus clock is the same on every core, and the LAPIC MMIO
+> address is per-core-aliased, so each write targets the running core's own LAPIC). The AP then `sti`s
+> and parks, woken on each tick. `interrupts::timer_dispatch` now branches on `percpu::this_cpu()`: on an
+> AP it just bumps that core's per-CPU `timer_ticks` and EOIs (the global tally and the process/thread
+> scheduler stay BSP-only and SMP-unsafe for now); a non-panicking `this_cpu_opt` handles the BSP's timer
+> firing before `percpu::init`. Boot logs each AP taking ~5 ticks over a 50 ms window; verified by 34
+> tests (the new `aps_take_timer_interrupts`: every AP's per-CPU tick count is non-zero). Next:
+> **Stage 16d-2** — give an AP a real run queue and let the scheduler run a kernel thread on it, so the
+> cores do work instead of just counting ticks; then **16d-3** unifies the async executor and the thread
+> scheduler.
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

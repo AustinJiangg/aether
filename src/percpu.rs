@@ -51,6 +51,10 @@ pub struct PerCpu {
     /// bootloader's stack). Recorded by the core itself — concrete proof it reached
     /// and wrote its *own* block, and a distinct value per core.
     stack: AtomicU64,
+    /// Count of Local APIC timer interrupts this core has taken (Stage 16d). Each core
+    /// counts its *own* timer here — the first autonomous work an AP does once its timer
+    /// is enabled. (The BSP also tallies its ticks globally in `interrupts::TIMER_TICKS`.)
+    timer_ticks: AtomicU64,
 }
 
 impl PerCpu {
@@ -62,6 +66,17 @@ impl PerCpu {
     /// The stack pointer this core recorded for itself (0 if it never has).
     pub fn stack(&self) -> u64 {
         self.stack.load(Ordering::SeqCst)
+    }
+
+    /// How many Local APIC timer interrupts this core has taken.
+    pub fn timer_ticks(&self) -> u64 {
+        self.timer_ticks.load(Ordering::SeqCst)
+    }
+
+    /// Record one Local APIC timer interrupt on this core. Called from the timer handler
+    /// ([`crate::interrupts`]) when the tick lands on this core.
+    pub fn tick(&self) {
+        self.timer_ticks.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Called by a core, on itself, to record that it is up and on which stack. Writes
@@ -92,6 +107,7 @@ pub fn init(cores: &[CpuCore]) {
             is_bsp: core.is_bsp,
             online: AtomicBool::new(core.is_bsp), // the BSP is already running
             stack: AtomicU64::new(0),
+            timer_ticks: AtomicU64::new(0),
         });
     }
 
@@ -116,15 +132,20 @@ pub fn all() -> &'static [PerCpu] {
     unsafe { slice::from_raw_parts(ptr, len) }
 }
 
+/// This core's own per-CPU block, or `None` if [`init`] has not run yet (only the BSP
+/// runs that early) or the running core is one ACPI never listed. The non-panicking
+/// form, for interrupt handlers that can fire before `init` — notably the BSP's timer,
+/// which starts ticking before per-CPU data is built.
+pub fn this_cpu_opt() -> Option<&'static PerCpu> {
+    let id = apic::lapic_id();
+    all().iter().find(|cpu| cpu.apic_id == id)
+}
+
 /// This core's own per-CPU block, found by its Local APIC id. Works on any core — the
 /// BSP or a woken AP — because each core's read of the LAPIC id register returns its
 /// own id. Panics only if called before [`init`], or on a core ACPI never listed.
 pub fn this_cpu() -> &'static PerCpu {
-    let id = apic::lapic_id();
-    all()
-        .iter()
-        .find(|cpu| cpu.apic_id == id)
-        .expect("this_cpu: no per-CPU block for the running core (init not called?)")
+    this_cpu_opt().expect("this_cpu: no per-CPU block for the running core (init not called?)")
 }
 
 /// How many cores have a per-CPU block (BSP + APs).

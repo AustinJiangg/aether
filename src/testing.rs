@@ -581,3 +581,22 @@ fn all_application_processors_online() {
         }
     }
 }
+
+/// Stage 16d-1: each woken AP runs its own Local APIC timer. In `ap_entry` every AP loads
+/// the kernel GDT + the shared IDT, software-enables its Local APIC, starts its periodic
+/// timer, and `sti`s; from then it takes timer interrupts on its own core and counts them
+/// in its per-CPU block (`interrupts::timer_dispatch` routes an AP tick there). These tests
+/// run late in boot (after the whole user-process demo), so by now every AP must have
+/// accumulated ticks — proof the non-boot cores are doing autonomous work, not parked.
+#[test_case]
+fn aps_take_timer_interrupts() {
+    use crate::percpu;
+    for cpu in percpu::all().iter().filter(|c| !c.is_bsp) {
+        assert!(
+            cpu.timer_ticks() > 0,
+            "AP cpu{} (apic id {}) took no timer interrupts",
+            cpu.cpu_index,
+            cpu.apic_id,
+        );
+    }
+}

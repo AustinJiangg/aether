@@ -364,7 +364,20 @@ extern "C" fn ap_entry() -> ! {
     // block is marked, so an observer that sees the count also sees the block online).
     AP_ONLINE.fetch_add(1, Ordering::SeqCst);
 
-    // Interrupts are still disabled on this core (it has no IDT yet), so `hlt` parks it
-    // cleanly — waiting for an NMI rather than busy-spinning a core.
+    // Stage 16d-1: bring this core's interrupt path online so it can run its own timer.
+    // Load the kernel GDT (the IDT gates name the kernel code selector, absent in the
+    // trampoline GDT this core still runs on) and the shared IDT, then software-enable
+    // this core's Local APIC and start its periodic timer, and finally `sti`. From here
+    // the AP takes a LAPIC timer interrupt ~every 10 ms, counts it in its per-CPU block
+    // (`interrupts::timer_dispatch` routes an AP tick there), and `hlt`s until the next —
+    // the first real, autonomous work a non-boot core does.
+    crate::gdt::init_ap();
+    crate::interrupts::init_idt_ap();
+    crate::apic::init_ap();
+    x86_64::instructions::interrupts::enable();
+
+    // Park: the core is now woken on each timer tick (and any future IPI), and `hlt`s in
+    // between, so it sleeps rather than busy-spinning. 16d's next steps give it a
+    // scheduler to run instead of just counting ticks.
     crate::hlt_loop();
 }

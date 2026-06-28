@@ -109,6 +109,15 @@ pub fn init_idt() {
     IDT.load();
 }
 
+/// Load the shared kernel IDT on an application processor (Stage 16d). The IDT is a
+/// single table every core shares — the BSP built it in [`init_idt`]; each core has its
+/// own IDTR register, so a woken AP just points its IDTR at the same table with `lidt`.
+/// The handlers must be SMP-aware (e.g. `timer_dispatch` branches on the running core),
+/// but the table itself is shared, exactly as in production kernels.
+pub fn init_idt_ap() {
+    IDT.load();
+}
+
 // ---------------------------------------------------------------------------
 // Hardware interrupts: the 8259 PIC and the timer (IRQ0).
 // ---------------------------------------------------------------------------
@@ -365,6 +374,20 @@ unsafe extern "C" fn timer_interrupt_entry() {
 /// otherwise unchanged. When the interrupted context is a user process (ring 3) it
 /// saves `*tf` and round-robins to the next process — true preemption (Stage 12c-3).
 extern "C" fn timer_dispatch(tf: *mut TrapFrame) {
+    // Stage 16d-1: on an application processor the timer only keeps this core's own
+    // per-CPU tick count — the global tally and the process/thread scheduler below are
+    // not SMP-safe yet, and belong to the BSP. (Before `percpu::init` only the BSP is
+    // running, so a `None` — the registry not built yet — also means "this is the BSP",
+    // and we fall through to the BSP path.) The AP still EOIs its own LAPIC so it keeps
+    // receiving ticks.
+    if let Some(cpu) = crate::percpu::this_cpu_opt() {
+        if !cpu.is_bsp {
+            cpu.tick();
+            crate::apic::end_of_interrupt();
+            return;
+        }
+    }
+
     let count = TIMER_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     if count == 1 {
         // Prove the naked stub captured a real context: log the interrupted

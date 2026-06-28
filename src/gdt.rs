@@ -156,3 +156,38 @@ pub fn init() {
         uc.rpl(),
     );
 }
+
+/// Load the shared kernel GDT on an application processor (Stage 16d) and reload its
+/// segment registers — *without* loading a TSS.
+///
+/// A woken AP runs on the trampoline's temporary GDT, where the kernel selectors do not
+/// exist. Before it can take an interrupt — whose IDT gate names the kernel code selector
+/// — it must run on the kernel GDT. So we `lgdt` it and reload CS to the kernel code
+/// segment. We also reload SS/DS/ES to the **null** selector (valid for ring 0 in long
+/// mode, where data segments are ignored): the trampoline left them at its data selector,
+/// which in the kernel GDT is the *DPL 3* user-data descriptor — leaving SS that way would
+/// #GP on the first `iretq` (returning to ring 0 with a ring-3 stack segment).
+///
+/// We deliberately do **not** load a TSS. The kernel's single TSS is already `ltr`-loaded
+/// by the BSP, and its descriptor's busy bit makes a second `ltr` on it #GP; an AP needs
+/// no TSS yet, since it runs only ring-0 handlers that use the current stack (the timer
+/// gate has no IST, and there is no ring-3 -> ring-0 transition to need rsp0). A per-CPU
+/// TSS arrives when an AP must run ring 3 or survive a fault on a dedicated stack.
+pub fn init_ap() {
+    use x86_64::instructions::segmentation::{Segment, CS, DS, ES, SS};
+    use x86_64::PrivilegeLevel;
+
+    GDT.0.load();
+
+    // SAFETY: `code_selector` indexes the 64-bit kernel code descriptor in the GDT we
+    // just loaded, so reloading CS with it is the required sequence after `lgdt`. The
+    // null selector (index 0) is a valid ring-0 stack/data segment in long mode; loading
+    // it into SS/DS/ES replaces the trampoline's now-DPL-3 data selector.
+    unsafe {
+        CS::set_reg(GDT.1.code_selector);
+        let null = SegmentSelector::new(0, PrivilegeLevel::Ring0);
+        SS::set_reg(null);
+        DS::set_reg(null);
+        ES::set_reg(null);
+    }
+}

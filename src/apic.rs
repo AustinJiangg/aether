@@ -32,6 +32,8 @@
 //! the naked timer entry in `interrupts.rs` handles it unchanged — only the
 //! interrupt *source* and the EOI change.
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use x86_64::instructions::port::Port;
 use x86_64::registers::model_specific::Msr;
 use x86_64::structures::paging::{
@@ -90,6 +92,12 @@ const TIMER_VECTOR: u8 = 32;
 /// the single source of truth for the kernel's tick rate.
 pub const TIMER_HZ: u32 = 100;
 
+/// The LAPIC timer initial-count value the BSP measured during calibration, stored so a
+/// woken AP can program its own timer with the same period (Stage 16d). The bus clock is
+/// identical on every core, so one calibration serves them all. 0 until the BSP runs
+/// [`init_timer`].
+static TIMER_INITIAL_COUNT: AtomicU32 = AtomicU32::new(0);
+
 // The PIT (8253/8254), used once to calibrate the LAPIC timer. Its input clock is
 // a fixed 1.193182 MHz, which is what makes it a usable reference.
 const PIT_FREQUENCY: u32 = 1_193_182;
@@ -122,6 +130,39 @@ pub fn init(
     // whatever the IO-APIC forwards; without this, no device interrupt arrives.
     map_ioapic(mapper, frame_allocator);
     init_ioapic();
+}
+
+/// Bring up the **running application processor's** Local APIC and start its periodic
+/// timer (Stage 16d). Call on a woken AP, after the BSP's [`init`] has mapped the shared
+/// LAPIC MMIO page and calibrated the timer.
+///
+/// The LAPIC's MMIO page is mapped once into the kernel address space (which every AP
+/// shares via the kernel CR3), but the registers behind that one address are *per-core*:
+/// each access here targets the running core's own Local APIC. So this software-enables
+/// *this* core's LAPIC and programs *this* core's timer — reusing the BSP's calibrated
+/// count, since the bus clock is the same on every core. The IO-APIC and the 8259 are
+/// global and already configured by the BSP, so we do not touch them.
+pub fn init_ap() {
+    // Ensure this core's LAPIC is globally enabled in its (per-core) IA32_APIC_BASE MSR,
+    // mirroring what `map_lapic` did for the BSP.
+    let mut apic_base = Msr::new(IA32_APIC_BASE_MSR);
+    // SAFETY: reading IA32_APIC_BASE is side-effect-free; writing it back with bit 11 set
+    // only (re)enables this CPU's own Local APIC.
+    let base_val = unsafe { apic_base.read() };
+    unsafe { apic_base.write(base_val | APIC_GLOBAL_ENABLE) };
+
+    let initial_count = TIMER_INITIAL_COUNT.load(Ordering::Relaxed).max(1);
+    // SAFETY: the shared LAPIC MMIO page was mapped by the BSP's `init` and is reachable
+    // through the kernel CR3 this AP loaded; every access targets this core's own LAPIC.
+    // We software-enable the LAPIC (SVR), then program the timer divisor, the LVT timer
+    // (periodic, our vector, unmasked), and the initial count last — writing the count is
+    // what starts this core's periodic countdown.
+    unsafe {
+        write(REG_SVR, SVR_APIC_ENABLE | SPURIOUS_VECTOR as u32);
+        write(REG_TIMER_DIV, TIMER_DIV_16);
+        write(REG_LVT_TIMER, LVT_TIMER_PERIODIC | TIMER_VECTOR as u32);
+        write(REG_TIMER_INIT_COUNT, initial_count);
+    }
 }
 
 /// Mask every line of the legacy 8259 PIC, so all hardware interrupts now arrive
@@ -205,6 +246,9 @@ fn init_timer() {
     // Counts to load for one period at TIMER_HZ. `.max(1)` guards against a degenerate
     // measurement producing 0 (which would disable the timer).
     let initial_count = (counts_per_sec / TIMER_HZ).max(1);
+    // Stash it so a woken AP can program its own LAPIC timer with the same period
+    // (Stage 16d) without re-running the PIT calibration.
+    TIMER_INITIAL_COUNT.store(initial_count, Ordering::Relaxed);
 
     // SAFETY: the LAPIC is mapped and enabled. Program the divisor, then the LVT timer
     // (periodic, our vector, unmasked), then the initial count last — writing the
