@@ -160,8 +160,19 @@ unify later.
 > deletes a root-level file. Verified by a write/read/remove test and the shell selftest's full
 > lifecycle. **This completes Stage 14**: an on-disk FAT16 filesystem with read *and* write,
 > coexisting with `RamFs` behind the VFS. (`mkdir` and subdirectory traversal stay unsupported —
-> optional later polish.) Next: the hardware track — Stage 15, replacing the 8259 PIC with the
-> Local APIC + IO-APIC (the prerequisite for SMP).
+> optional later polish.)
+>
+> **Stage 15a is also done** — the Local APIC and its timer (the hardware track begins). A new
+> `apic.rs` maps the LAPIC's MMIO page uncacheable (`NO_CACHE`, because device registers must
+> bypass the cache), software-enables the APIC via the spurious-vector register, and masks the 8259
+> PIC, so hardware interrupts now arrive through the APIC. The LAPIC timer's frequency is not
+> architecturally fixed (unlike the PIT's known 1.193182 MHz), so it is *calibrated* against the
+> PIT over a 10 ms polled window, then run periodically at 100 Hz on vector 32 — the same gate the
+> PIT timer used, so the naked timer entry is unchanged; the EOI moves from the 8259 to the LAPIC's
+> EOI register, and a no-op handler backs the spurious vector. Timer ticks and preemption now run
+> on the APIC (the boot demo shows 50+ preemptions). Verified by all 26 tests (including
+> `timer_preempted_a_process`). Next: **Stage 15b** — the IO-APIC, routing the keyboard's IRQ1 to a
+> vector (keyboard input is off until then).
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

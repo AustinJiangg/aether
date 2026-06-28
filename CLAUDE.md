@@ -141,8 +141,16 @@ copy), wired into `FileSystem::write` so the shell's `write /mnt/foo` lands on d
 a reboot. **Stage 14c-2 is also done**: `Fat::remove_file` frees a file's cluster chain and
 marks its directory entry deleted, wired into `FileSystem::remove` (so `rm /mnt/foo` works).
 **This completes Stage 14** — an on-disk FAT16 filesystem with read *and* write, coexisting with
-`RamFs` behind the VFS (`mkdir`/subdirectory traversal remain unsupported). `ROADMAP.md` carries
-the forward plan (stages
+`RamFs` behind the VFS (`mkdir`/subdirectory traversal remain unsupported). **Stage 15a (hardware
+track) is also done**: the Local APIC and its timer (`apic.rs`) replace the 8259 PIC's timer. It
+maps the LAPIC's MMIO page uncacheable (`NO_CACHE` — device registers must bypass the cache),
+software-enables the APIC via the spurious-vector register, and masks the 8259 PIC, so hardware
+interrupts now arrive through the APIC. Because the LAPIC timer's frequency is not architecturally
+fixed, it is *calibrated* against the PIT over a 10 ms polled window, then run periodically at 100
+Hz on vector 32 — the same gate the PIT timer used, so the naked timer entry is unchanged; the EOI
+moves from the PIC to the LAPIC's EOI register, and a no-op handler backs the spurious vector.
+Timer ticks and preemption now run on the APIC; keyboard input is off until Stage 15b routes IRQ1
+through the IO-APIC. `ROADMAP.md` carries the forward plan (stages
 9-18): the user-space main line (system calls, per-process address spaces + ELF,
 multiprocessing), plus persistence, APIC/SMP, and networking tracks.
 
@@ -215,9 +223,12 @@ Exit QEMU: `Ctrl-A` then `X`.
 - `src/interrupts.rs`: the IDT, the CPU exception handlers (breakpoint, double
   fault, and — since Stage 13a — page-fault and general-protection-fault handlers
   that log CR2 / the error code and halt, instead of escalating to a double fault),
-  and the hardware interrupt handlers along with the 8259 PIC setup. Since Stage 12c the timer (IRQ0) uses a hand-written *naked* entry
-  (`timer_interrupt_entry`) that pushes the full register set into a `TrapFrame`
-  and calls `timer_dispatch`, which counts the tick, sends the EOI, then — if the
+  and the hardware interrupt handlers. The 8259 PIC is still set up (remapped) but,
+  since Stage 15, *masked* — interrupts arrive through the APIC now (see `apic.rs`),
+  and a no-op handler backs the LAPIC spurious vector. Since Stage 12c the timer uses
+  a hand-written *naked* entry (`timer_interrupt_entry`) that pushes the full register
+  set into a `TrapFrame` and calls `timer_dispatch`, which counts the tick, sends the
+  EOI (since Stage 15 to the Local APIC via `apic::end_of_interrupt`), then — if the
   tick interrupted ring 3 — preempts the running user process via
   `process::on_timer_tick` (a ring 0 tick instead feeds the dormant
   `thread::schedule`). The keyboard handler (since Stage 5) just pushes the raw
@@ -225,6 +236,15 @@ Exit QEMU: `Ctrl-A` then `X`.
   syscall gate (DPL 3); since Stage 12c-2 it too points at a naked stub
   (`syscall::syscall_entry`) that builds the same `TrapFrame`, so a `yield`/`exit`
   saves and restores a full register context.
+- `src/apic.rs`: Stage 15 APIC (Advanced Programmable Interrupt Controller) support.
+  `init` maps the Local APIC's MMIO page uncacheable (`NO_CACHE`), software-enables it
+  via the spurious-vector register, masks the 8259 PIC, then *calibrates* the LAPIC
+  timer against the PIT (a 10 ms polled window — the LAPIC timer's frequency is not
+  architecturally fixed) and runs it periodically at 100 Hz on vector 32 (reusing the
+  existing timer entry). `end_of_interrupt` writes the LAPIC EOI register, replacing
+  the 8259 EOI for APIC-delivered interrupts; `TIMER_HZ` is the kernel's tick rate (the
+  shell's `uptime` reads it). The IO-APIC (routing device IRQs such as the keyboard)
+  comes in Stage 15b.
 - `src/memory.rs`: virtual-memory helpers — reads CR3 and builds an
   `OffsetPageTable` over the active page tables (via the bootloader's complete
   physical-memory mapping) for translating virtual addresses, plus a
