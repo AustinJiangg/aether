@@ -521,3 +521,13 @@ fn acpi_discovers_all_cpus() {
 fn self_ipi_is_delivered() {
     assert!(crate::interrupts::self_ipi_works());
 }
+
+/// Stage 16b-2a: the BSP woke an application processor. Boot copies a real-mode
+/// trampoline to low memory and sends the target AP INIT-SIPI-SIPI; the AP writes a
+/// marker the BSP polls. By the time this harness runs that wake-up must have
+/// succeeded — proving the INIT-SIPI-SIPI sequence works and a second core executed
+/// our code (still in real mode; 16b-2b takes it to long mode).
+#[test_case]
+fn woke_an_application_processor() {
+    assert!(crate::smp::ap_woke());
+}

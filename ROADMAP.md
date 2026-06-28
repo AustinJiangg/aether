@@ -203,9 +203,22 @@ unify later.
 > INIT-SIPI-SIPI will use. To prove it end to end with no assembly and no second core, the BSP sends
 > a fixed IPI to *itself* on a dedicated vector (0x40); `interrupts.rs`'s `ipi_test_handler` sets a
 > flag and EOIs, and `self_ipi_works()` confirms the flag flipped. Verified by 29 tests (the new
-> `self_ipi_is_delivered`) and the boot log ("self-IPI delivered ... = true"). Next: **Stage 16b-2** —
-> the real-mode→long-mode AP trampoline, copied low and identity-mapped, with the BSP sending
-> INIT-SIPI-SIPI to one AP and confirming it reaches long mode via a progress marker.
+> `self_ipi_is_delivered`) and the boot log ("self-IPI delivered ... = true").
+>
+> **Stage 16b-2a is also done** — waking an AP (first of two trampoline sub-steps). Because the
+> AP-bring-up assembly is the most triple-fault-prone code in the kernel, Stage 16b-2 is split: 2a
+> proves the *wake-up mechanism* with a minimal real-mode stub, 2b climbs it to long mode. A new
+> `smp.rs` holds a tiny `global_asm!` trampoline (16-bit `.code16`): the AP wakes, sets DS=0, writes
+> an "alive" marker to a fixed low address, and halts — no mode switches, so it runs with paging off
+> and needs no page tables. `boot_one_ap` copies the blob to physical 0x8000 (a free conventional-RAM
+> page; the SIPI vector is its page number, 0x08) through the physical-memory window, clears the
+> marker, and sends INIT-SIPI-SIPI via new `apic` helpers (`send_init_ipi`/`send_startup_ipi`, reusing
+> 16b-1's ICR path) paced by a `pit_sleep_us` PIT delay (10 ms, then 200 us between the two SIPIs).
+> The BSP polls the marker: boot logs "AP apic id 1 is alive (executed the trampoline)" — a second
+> core ran our code. Verified by 30 tests (the new `woke_an_application_processor`). Next: **Stage
+> 16b-2b** — extend the trampoline through 32-bit protected mode and 64-bit long mode (a progress
+> marker at each rung), which needs an identity mapping of the trampoline page so the instruction
+> after paging is enabled still fetches.
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

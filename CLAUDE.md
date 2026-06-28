@@ -163,8 +163,12 @@ boot reports the four discovered cores (BSP apic id 0, APs [1, 2, 3]). **Stage 1
 done**: `apic.rs` gains `send_fixed_ipi` (writes the Local APIC ICR — destination, then issue — and
 polls the delivery-status bit), the IPI send path Stage 16b-2's INIT-SIPI-SIPI will reuse; it is
 proved end to end by a self-IPI (the BSP sends a fixed IPI to its own apic id on vector 0x40, handled
-by `interrupts.rs`'s `ipi_test_handler` / `self_ipi_works`). `ROADMAP.md` carries the forward plan
-(stages 9-18): the user-space main line (system calls, per-process address spaces +
+by `interrupts.rs`'s `ipi_test_handler` / `self_ipi_works`). **Stage 16b-2a is now also done**: a new
+`smp.rs` wakes an application processor — `boot_one_ap` copies a tiny real-mode `global_asm!`
+trampoline to physical 0x8000 and sends it INIT-SIPI-SIPI (new `apic::send_init_ipi` /
+`send_startup_ipi` / `pit_sleep_us`); the AP writes an "alive" marker the BSP polls, proving a second
+core executes our code (still real mode, paging off — 16b-2b climbs it to long mode). `ROADMAP.md`
+carries the forward plan (stages 9-18): the user-space main line (system calls, per-process address spaces +
 ELF, multiprocessing), plus persistence, APIC/SMP, and networking tracks.
 
 ## Language and writing conventions
@@ -266,7 +270,16 @@ Exit QEMU: `Ctrl-A` then `X`.
   `lapic_id()`, which reads this core's own Local APIC ID register (used to identify the BSP). Stage
   16b-1 adds `send_fixed_ipi(dest, vector)`, which issues an inter-processor interrupt through the ICR
   (Interrupt Command Register: write the destination apic id, then the low half to send, then poll
-  the delivery-status bit) — the IPI send path Stage 16b-2's INIT-SIPI-SIPI will reuse.
+  the delivery-status bit) — the IPI send path Stage 16b-2's INIT-SIPI-SIPI will reuse. Stage 16b-2a
+  adds `send_init_ipi` / `send_startup_ipi` (the INIT and SIPI delivery modes over that same ICR
+  path) and `pit_sleep_us` (a polled PIT channel-2 delay) to pace the wake-up sequence.
+- `src/smp.rs`: Stage 16b SMP bring-up — waking the application processors. Stage 16b-2a holds a tiny
+  real-mode `global_asm!` trampoline (`.code16`): an AP wakes, writes an "alive" marker to a fixed low
+  address, and halts. `boot_one_ap` copies the blob to physical 0x8000 (a free conventional-RAM page;
+  the SIPI vector is its page number), clears the marker, sends the target AP INIT-SIPI-SIPI (via the
+  `apic` helpers), then polls the marker — proving a second core executes our code. Still real mode
+  (paging off), so no page tables yet; 16b-2b extends the trampoline to long mode. `ap_woke()` exposes
+  the result for the test.
 - `src/acpi.rs`: Stage 16a SMP discovery — parses just enough ACPI to enumerate the machine's CPU
   cores. `discover` scans low memory for the RSDP signature, follows it to the RSDT/XSDT (a table of
   table pointers), finds the MADT (signature "APIC"), and reads its Processor Local APIC entries into a

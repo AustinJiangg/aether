@@ -314,8 +314,14 @@ const REG_ICR_LOW: u32 = 0x300;
 const REG_ICR_HIGH: u32 = 0x310;
 
 /// ICR delivery mode "fixed" (bits 8..11 = 000): deliver `vector` like a normal
-/// interrupt. (The INIT = 0b101 and Startup = 0b110 modes join in Stage 16b-2.)
+/// interrupt.
 const ICR_FIXED: u32 = 0b000 << 8;
+/// ICR delivery mode "INIT" (bits 8..11 = 101): reset the target AP into a clean
+/// wait-for-SIPI state — the first leg of the INIT-SIPI-SIPI wake-up (Stage 16b-2).
+const ICR_INIT: u32 = 0b101 << 8;
+/// ICR delivery mode "Startup" (bits 8..11 = 110): the SIPI; its vector tells the AP
+/// to begin executing 16-bit code at physical `vector << 12`.
+const ICR_STARTUP: u32 = 0b110 << 8;
 /// ICR level bit (14): "assert", set for every IPI except an INIT de-assert.
 const ICR_ASSERT: u32 = 1 << 14;
 /// ICR delivery-status bit (12), read-only: set while a send is still pending.
@@ -337,8 +343,72 @@ pub fn send_fixed_ipi(dest: u8, vector: u8) {
     unsafe {
         write(REG_ICR_HIGH, (dest as u32) << 24);
         write(REG_ICR_LOW, ICR_FIXED | ICR_ASSERT | vector as u32);
-        while read(REG_ICR_LOW) & ICR_DELIVERY_PENDING != 0 {
-            core::hint::spin_loop();
+        wait_for_ipi_delivery();
+    }
+}
+
+/// Spin until the Local APIC reports the last IPI accepted (delivery-status clears).
+///
+/// # Safety
+/// The LAPIC MMIO page must be mapped.
+unsafe fn wait_for_ipi_delivery() {
+    while read(REG_ICR_LOW) & ICR_DELIVERY_PENDING != 0 {
+        core::hint::spin_loop();
+    }
+}
+
+/// Send an INIT IPI to the CPU with Local APIC id `dest` — the first leg of the
+/// INIT-SIPI-SIPI wake-up (Stage 16b-2). It resets the target AP into a clean
+/// wait-for-SIPI state; the vector field is unused for INIT.
+pub fn send_init_ipi(dest: u8) {
+    // SAFETY: the LAPIC is mapped and enabled by `init`. The ICR write sequence
+    // (destination, then the issuing low half, then poll) matches `send_fixed_ipi`;
+    // only the delivery mode differs (INIT instead of fixed).
+    unsafe {
+        write(REG_ICR_HIGH, (dest as u32) << 24);
+        write(REG_ICR_LOW, ICR_INIT | ICR_ASSERT);
+        wait_for_ipi_delivery();
+    }
+}
+
+/// Send a Startup IPI (SIPI) to `dest`, telling it to begin executing 16-bit code at
+/// physical `vector << 12`. The Intel protocol sends two SIPIs after the INIT, so the
+/// caller invokes this twice with the right delays around it (Stage 16b-2).
+pub fn send_startup_ipi(dest: u8, vector: u8) {
+    // SAFETY: same ICR write sequence as the other senders; the Startup delivery mode
+    // carries the trampoline page number in the vector field.
+    unsafe {
+        write(REG_ICR_HIGH, (dest as u32) << 24);
+        write(REG_ICR_LOW, ICR_STARTUP | ICR_ASSERT | vector as u32);
+        wait_for_ipi_delivery();
+    }
+}
+
+/// Busy-wait approximately `microseconds`, timed by PIT channel 2 (polled).
+///
+/// Used to pace the INIT-SIPI-SIPI sequence and the wake-up poll. Like [`calibrate`]
+/// it drives channel 2 directly (gate + output on port 0x61), so it needs no interrupt
+/// and works with the 8259 PIC masked. Interrupts may be enabled; they only lengthen
+/// the wait slightly, harmless for these lower-bound delays.
+pub fn pit_sleep_us(microseconds: u32) {
+    // PIT counts for the interval: input clock * seconds. Channel 2's counter is
+    // 16-bit, so split a longer wait into <=65535-count chunks.
+    let mut remaining = ((PIT_FREQUENCY as u64 * microseconds as u64) / 1_000_000).max(1);
+    // SAFETY: ports 0x42/0x43/0x61 are the fixed PIT data/command/gate ports; driving
+    // channel 2 here cannot misconfigure another device, and we only poll its output.
+    unsafe {
+        let mut gate: Port<u8> = Port::new(PIT_CH2_GATE);
+        while remaining > 0 {
+            let chunk = remaining.min(0xFFFF) as u16;
+            remaining -= chunk as u64;
+            let base = gate.read() & 0xFC; // clear gate (bit 0) + speaker (bit 1)
+            gate.write(base); // gate low: pause while we load the count
+            Port::<u8>::new(PIT_CMD).write(0xB0); // ch2, lo/hi byte, mode 0, binary
+            let mut ch2: Port<u8> = Port::new(PIT_CH2_DATA);
+            ch2.write((chunk & 0xFF) as u8);
+            ch2.write((chunk >> 8) as u8);
+            gate.write(base | 1); // gate high: start counting down
+            while gate.read() & 0x20 == 0 {} // OUT (bit 5) goes high at terminal count
         }
     }
 }

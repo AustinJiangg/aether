@@ -72,6 +72,7 @@ mod gdt;
 mod interrupts;
 mod apic;
 mod acpi;
+mod smp;
 mod memory;
 mod allocator;
 mod ata;
@@ -334,6 +335,18 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         ipi_ok
     );
     println!("SMP: self-IPI test (Local APIC can send and receive an IPI) = {}", ipi_ok);
+
+    // Stage 16b-2a: wake one application processor. Copy a tiny real-mode trampoline
+    // into low memory, send the AP INIT-SIPI-SIPI, and confirm it runs our code by
+    // polling a marker it writes. The AP stays in real mode (paging off) and then
+    // halts, so this proves only the wake-up sequence and that a second core executes
+    // — no page tables yet. Stage 16b-2b climbs the trampoline to long mode.
+    smp::boot_one_ap(phys_mem_offset);
+    serial_println!(
+        "[ OK ] woke one application processor via INIT-SIPI-SIPI = {}",
+        smp::ap_woke()
+    );
+    println!("SMP: woke one application processor (it ran our trampoline) = {}", smp::ap_woke());
 
     // Stage 13a: read a raw sector from disk via ATA PIO (polling, no DMA/IRQ). The
     // bootimage is attached as the primary IDE master, so sector 0 is the boot sector —
