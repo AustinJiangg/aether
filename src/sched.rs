@@ -248,10 +248,19 @@ pub fn run_to_completion() {
         x86_64::instructions::hlt();
     }
 
-    // Restore the interrupts-disabled state `ap_entry` expects, then free the finished
-    // workers' stacks (we are the bootstrap, running on a stack nobody reaps).
+    // Restore the interrupts-disabled state the caller expects, then free the finished
+    // workers' stacks (we are the bootstrap, running on a stack nobody reaps) and remove
+    // our own bootstrap entry — leaving the queue empty, so this can be called again on
+    // a clean queue (the BSP runs it twice in Stage 16d-5: once for the unify demo, once
+    // for the shell). The bootstrap's `stack` is an empty placeholder, so dropping it
+    // frees nothing real; the core keeps running on its actual stack.
     interrupts::disable();
     reap_finished();
+    {
+        let mut q = this_queue().lock();
+        q.threads.remove(&bootstrap_id);
+        q.current = None;
+    }
 }
 
 /// Voluntarily give up the current core's CPU to the next ready thread on **this

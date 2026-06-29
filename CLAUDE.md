@@ -256,8 +256,9 @@ Exit QEMU: `Ctrl-A` then `X`.
   set into a `TrapFrame` and calls `timer_dispatch`, which counts the tick, sends the
   EOI (since Stage 15 to the Local APIC via `apic::end_of_interrupt`), then — if the
   tick interrupted ring 3 — preempts the running user process via
-  `process::on_timer_tick` (a ring 0 tick instead feeds the dormant
-  `thread::schedule`). The keyboard handler (since Stage 5) just pushes the raw
+  `process::on_timer_tick` (a ring 0 tick instead preempts the BSP's per-CPU
+  run queue via `sched::preempt` — Stage 16d-5, unifying the async executor and
+  kernel threads under one scheduler). The keyboard handler (since Stage 5) just pushes the raw
   scancode onto the async keyboard's queue. Stage 10 registers the `int 0x80`
   syscall gate (DPL 3); since Stage 12c-2 it too points at a naked stub
   (`syscall::syscall_entry`) that builds the same `TrapFrame`, so a `yield`/`exit`
@@ -360,7 +361,10 @@ Exit QEMU: `Ctrl-A` then `X`.
   reference), `keyboard.rs` (the async keyboard: a lock-free scancode queue filled
   by the IRQ1 handler and drained by a `Stream`-based task that decodes and
   echoes), and `executor.rs` (the waker-driven executor that sleeps on `hlt` when
-  no task is ready). Revived in Stage 7 to drive the shell.
+  no task is ready). Revived in Stage 7 to drive the shell. Stage 16d-5 adds
+  `Executor::run_until_empty` (run until tasks finish, then *return*) so an executor
+  can be a finite kernel thread, and runs the shell's executor as a scheduled thread
+  under `sched` (via `unify.rs`) rather than as a separate top-level owner of the CPU.
 - `src/thread/`: Stage 6 preemptive kernel threads — `mod.rs` (`Thread`/`ThreadId`,
   a round-robin `Scheduler`, `spawn`/`yield_now`/`run`, the fabricated initial
   stack frame, and `schedule` called from the timer to preempt) and `switch.rs`
@@ -383,8 +387,18 @@ Exit QEMU: `Ctrl-A` then `X`.
   each tick (a `try_lock` so a tick during a queue update simply skips). `run_to_completion` registers the
   caller as a bootstrap thread, **enables interrupts**, and idles on `hlt` while the timer rotates the
   workers (it pre-reserves the ready deque so the interrupt-context switch never allocates); when they all
-  `Finished` it reaps their stacks and returns. Used by `smp::ap_entry` to preemptively schedule several
-  kernel threads on each AP. (16d-5 folds in the async executor.)
+  `Finished` it reaps their stacks and returns, clearing its bootstrap so the queue is left empty (the BSP
+  calls it twice — Stage 16d-5). Used by `smp::ap_entry` to schedule kernel threads on each AP, and (Stage
+  16d-5) by the BSP, where the async executor runs as one of these threads.
+- `src/unify.rs`: Stage 16d-5 unification of the async executor with the per-CPU scheduler. The async
+  executor (`task/`) used to `run()` forever owning the BSP; now it runs **as a kernel thread** on the
+  BSP's own `sched` run queue, peer to ordinary kernel threads, with the BSP timer preempting between them
+  (`interrupts::timer_dispatch`'s ring-0 path calls `sched::preempt`). `demo()` — run in *both* build
+  profiles, so `cargo test` covers it — spawns an async-executor thread (a bounded async task) and a plain
+  kernel thread on the BSP run queue and lets the timer preempt them to completion, recording `async_work`/
+  `kernel_work` (and BSP `preemptions` via `percpu`). `run_shell_threaded` (non-test) runs the interactive
+  shell as a scheduled thread alongside a coexisting heartbeat thread, forever. Concurrent printing from
+  these BSP threads is safe because the VGA/serial writers lock inside `without_interrupts`.
 - `src/shell.rs`: Stage 7-8 interactive shell — an async task that reads decoded
   keystrokes from the keyboard `ScancodeStream`, buffers a line (with Backspace)
   against a current working directory, and on Enter routes it through a `dispatch`

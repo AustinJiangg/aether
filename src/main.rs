@@ -86,10 +86,13 @@ mod task;
 // subtree until a later stage folds async tasks and threads together.
 #[allow(dead_code)]
 mod thread;
-// Stage 16d-3: a per-CPU cooperative run queue, built on `thread`'s context switch.
-// Each woken AP schedules several kernel threads on its own queue; `sched::yield_now`
-// is the cooperative hand-off. (16d-4 will drive it from the per-core timer.)
+// Stage 16d-3/16d-4: a per-CPU preemptive run queue, built on `thread`'s context
+// switch. Each core schedules kernel threads on its own queue; the per-core timer
+// preempts them (`sched::preempt`).
 mod sched;
+// Stage 16d-5: unify the async executor with the per-CPU scheduler — the executor runs
+// as a kernel thread under `sched` on the BSP, peer to ordinary kernel threads.
+mod unify;
 mod fs;
 mod shell;
 mod syscall;
@@ -686,6 +689,14 @@ fn boot_continue() -> ! {
         serial_println!("[syscall] getpid() returned {}", pid);
     }
 
+    // Stage 16d-5: unify the async executor with the per-CPU scheduler. Run a brief,
+    // *testable* coexistence demo on the BSP — an async-executor thread and a plain
+    // kernel thread, both scheduled on the BSP's own per-CPU run queue and time-sliced
+    // by the BSP timer (its ring-0 tick now calls `sched::preempt`). This runs in BOTH
+    // build profiles, so `cargo test` covers the unification (the interactive shell,
+    // which only the non-test build runs, otherwise would not be reachable by a test).
+    unify::demo();
+
     // From here the two builds diverge (`#[cfg(test)]` compiles exactly one block;
     // see the test-harness note in `src/testing.rs`). The interactive shell's
     // executor never returns, so in a test build it would keep the tests from ever
@@ -697,25 +708,17 @@ fn boot_continue() -> ! {
         hlt_loop(); // only to satisfy the `-> !` return type
     }
 
-    // Stage 7: an interactive shell on the revived async executor. A boot self-test
-    // first runs canned commands through the dispatcher (so the command logic is
-    // verifiable without a keyboard), then we hand the CPU to the executor running
-    // the shell task, which reads keystrokes, buffers a line, and dispatches it on
-    // Enter. `Executor::run` never returns (`-> !`), so it is the kernel's final call.
+    // Stage 7 + 16d-5: an interactive shell on the async executor — but the executor
+    // now runs as a *kernel thread under the per-CPU scheduler* (`unify::run_shell_threaded`),
+    // not as a separate top-level owner of the CPU. A boot self-test first runs canned
+    // commands through the dispatcher (verifiable without a keyboard); then the shell
+    // thread (and a coexisting kernel thread) run on the BSP scheduler forever.
     #[cfg(not(test))]
     {
-        // Imported here, inside the non-test block, so they don't read as unused
-        // when building the test harness (which excludes this whole block).
-        use task::executor::Executor;
-        use task::Task;
-
         println!();
-        serial_println!("Kernel starting the interactive shell on the async executor.");
+        serial_println!("Kernel starting the interactive shell as a scheduled kernel thread.");
         shell::selftest();
-
-        let mut executor = Executor::new();
-        executor.spawn(Task::new(shell::run()));
-        executor.run();
+        unify::run_shell_threaded();
     }
 }
 

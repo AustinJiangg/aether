@@ -417,17 +417,19 @@ extern "C" fn timer_dispatch(tf: *mut TrapFrame) {
     // is acknowledged it delivers no further timer interrupt. (`end_of_interrupt`
     // encapsulates the MMIO write and its safety.)
     crate::apic::end_of_interrupt();
-    // Stage 12c-3: if the tick interrupted a *user* process (ring 3), preempt it and
-    // round-robin to the next one; a tick in ring 0 instead feeds the (dormant)
-    // kernel-thread scheduler, exactly as before. (Syscalls run with IF clear, so a
-    // tick never lands inside one — only in user code or plain kernel code.)
+    // Stage 12c-3 / 16d-5: if the tick interrupted a *user* process (ring 3), preempt it
+    // and round-robin to the next one; a tick in ring 0 instead preempts the BSP's own
+    // per-CPU kernel-thread run queue (`sched::preempt` — Stage 16d-5 unified the async
+    // executor and kernel threads under it; a no-op until the BSP spawns threads). (Syscalls
+    // run with IF clear, so a tick never lands inside one — only in user code or plain
+    // kernel code.)
     // SAFETY: `tf` points at this interrupt's TrapFrame; `on_timer_tick` may rewrite it
     // (and switch CR3) to resume a different process, which the stub's `iretq` enters.
     let frame = unsafe { &mut *tf };
     if frame.iframe.code_segment & 3 == 3 {
         crate::process::on_timer_tick(frame);
     } else {
-        crate::thread::schedule();
+        crate::sched::preempt();
     }
 }
 

@@ -116,6 +116,21 @@ impl Executor {
         }
     }
 
+    /// Run until every spawned task has finished, then **return** (unlike [`run`],
+    /// which never returns). Polls ready tasks, and if tasks remain but none are
+    /// ready, sleeps until an interrupt wakes one. Used by Stage 16d-5 to run an
+    /// executor *as a finite kernel thread* — the thread can exit once its async work
+    /// is done, so the per-CPU scheduler reclaims it. (The interactive shell still
+    /// uses `run`, since it is meant to live for the rest of the kernel's life.)
+    pub fn run_until_empty(&mut self) {
+        while !self.tasks.is_empty() {
+            self.run_ready_tasks();
+            if !self.tasks.is_empty() {
+                self.sleep_if_idle();
+            }
+        }
+    }
+
     /// Halt the CPU until the next interrupt, but only if no task is ready.
     ///
     /// The subtlety is a race against interrupts. Between checking "is the ready

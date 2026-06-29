@@ -319,8 +319,26 @@ unify later.
 > interrupts — so the only thing that interleaves them is preemption; a per-CPU `preemptions` counter
 > proves it. Boot logs each AP "3 thread(s) completed, N preemption(s)" with N > 0; verified by 35 tests
 > (the new `aps_preempt_threads`, replacing 16d-3's exact-work test, asserts each AP completed 3 threads,
-> took ≥1 preemption, and drained cleanly). Next: **16d-5** unifies the async executor with the thread
-> scheduler.
+> took ≥1 preemption, and drained cleanly).
+>
+> **Stage 16d-5 is also done** — the async executor and the per-CPU scheduler are **unified**, completing
+> the 16d series (and the SMP track). Until now the kernel ran two multitasking models that never
+> coexisted: the async executor (`task/`), which on the BSP `run()`s forever driving the shell, and the
+> preemptive per-CPU run queue (`sched`), which ran only on the APs. 16d-5 makes the executor run **as a
+> kernel thread** on the BSP's own per-CPU run queue, peer to ordinary kernel threads, with the BSP timer
+> preempting between them (`interrupts::timer_dispatch`'s ring-0 path now calls `sched::preempt` instead
+> of the dormant `thread::schedule`). A new `unify.rs` holds: (1) a testable `demo` — run in *both* build
+> profiles — that spawns an async-executor thread (running a bounded async task) and a plain kernel thread
+> on the BSP run queue and lets the BSP timer preempt them to completion (so `cargo test` covers the
+> unification, which otherwise lives only in the non-test shell path); and (2) `run_shell_threaded`
+> (non-test), which runs the interactive shell as a scheduled kernel thread alongside a coexisting
+> heartbeat thread, forever. `Executor` gains `run_until_empty` (return when its tasks are done, so an
+> executor can be a finite thread), and `sched::run_to_completion` now clears its bootstrap on return (so
+> the BSP can call it twice — once for the demo, once for the shell). Boot logs "async work N, kernel work
+> M, BSP preemptions K", and the real kernel shows heartbeats interleaving with the live shell; verified
+> by 36 tests (the new `bsp_unifies_executor_and_threads`) and a headless run. **This completes Stage 16
+> (SMP): all cores discovered, woken, and running an interrupt-driven preemptive scheduler over a unified
+> task/thread model.**
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

@@ -633,3 +633,28 @@ fn aps_preempt_threads() {
         );
     }
 }
+
+/// Stage 16d-5: the async executor runs as a scheduled kernel thread, unified with the
+/// per-CPU scheduler on the BSP. `boot_continue` calls `unify::demo()` (in both build
+/// profiles) before the tests: it spawns an async-executor thread and a plain kernel
+/// thread on the BSP's own run queue and lets the BSP timer preempt them to completion.
+/// By the time this runs, both must have done work (so the executor really ran *as a
+/// thread* alongside a kernel thread under one scheduler) and the BSP timer must have
+/// preempted between them (so the BSP's ring-0 tick now drives `sched::preempt`).
+#[test_case]
+fn bsp_unifies_executor_and_threads() {
+    use crate::{percpu, unify};
+    assert!(
+        unify::async_work() > 0,
+        "the async task never ran on its executor thread"
+    );
+    assert!(unify::kernel_work() > 0, "the kernel demo thread never ran");
+    let bsp = percpu::all()
+        .iter()
+        .find(|c| c.is_bsp)
+        .expect("no BSP per-CPU block");
+    assert!(
+        bsp.preemptions() > 0,
+        "the BSP timer did not preempt the unify demo threads"
+    );
+}
