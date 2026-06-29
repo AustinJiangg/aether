@@ -401,26 +401,27 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     }
     println!("SMP: each AP runs its own LAPIC timer now (per-CPU tick counts on the serial log).");
 
-    // Stage 16d-3: each AP ran several cooperative kernel threads on its *own* per-CPU run
-    // queue (in `ap_entry`) before parking — real per-core round-robin scheduling. Report,
-    // per AP, how many threads completed, the total work they did, and that the run queue
-    // drained back to its bootstrap context (so the whole rotation unwound cleanly).
+    // Stage 16d-4: each AP ran several kernel threads on its *own* per-CPU run queue under
+    // timer preemption (in `ap_entry`) before parking — real per-core preemptive scheduling.
+    // Report, per AP, how many threads completed, how many times the timer preempted one, the
+    // work they did, and that the run queue drained back to its bootstrap context.
     serial_println!(
-        "[percpu] AP per-CPU run queue ({} threads x {} rounds each):",
+        "[percpu] AP per-CPU run queue ({} threads, preemptive, each spans {} tick(s)):",
         smp::AP_THREADS,
-        smp::AP_THREAD_ROUNDS,
+        smp::AP_THREAD_TICKS,
     );
     for cpu in percpu::all().iter().filter(|c| !c.is_bsp) {
         serial_println!(
-            "[percpu]   cpu{} apic id {}: {} thread(s) completed, work {}, scheduler done = {}",
+            "[percpu]   cpu{} apic id {}: {} thread(s) completed, {} preemption(s), work {}, scheduler done = {}",
             cpu.cpu_index,
             cpu.apic_id,
             cpu.threads_completed(),
+            cpu.preemptions(),
             cpu.work(),
             cpu.scheduler_done(),
         );
     }
-    println!("SMP: each AP round-robined several kernel threads on its own run queue (serial log).");
+    println!("SMP: each AP preemptively scheduled several kernel threads on its own run queue (serial log).");
 
     // Stage 13a: read a raw sector from disk via ATA PIO (polling, no DMA/IRQ). The
     // bootimage is attached as the primary IDE master, so sector 0 is the boot sector —

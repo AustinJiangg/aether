@@ -601,17 +601,16 @@ fn aps_take_timer_interrupts() {
     }
 }
 
-/// Stage 16d-3: each AP round-robined several kernel threads on its own per-CPU run queue.
-/// In `ap_entry` every AP spawns `AP_THREADS` worker threads onto its private queue and
-/// drives them to completion cooperatively; each thread does `AP_THREAD_ROUNDS` rounds of
-/// (per-CPU work + `yield_now`) then exits. By the time these tests run, every AP must have:
-/// completed exactly `AP_THREADS` threads, accumulated exactly `AP_THREADS * AP_THREAD_ROUNDS`
-/// work (so every round of every thread ran — proof the cooperative hand-offs all happened),
-/// and returned to its bootstrap context (`scheduler_done`, so the rotation unwound cleanly).
+/// Stage 16d-4: each AP preemptively scheduled several kernel threads on its own per-CPU run
+/// queue. In `ap_entry` every AP spawns `AP_THREADS` workers that busy-spin and **never
+/// yield**, then idles; this core's timer preempts whatever is running on each tick,
+/// round-robining them. By the time these tests run, every AP must have: completed exactly
+/// `AP_THREADS` threads, recorded at least one timer preemption (proof scheduling was
+/// preemptive, not cooperative — nothing yielded), done some work, and drained back to its
+/// bootstrap context (`scheduler_done`).
 #[test_case]
-fn aps_run_threads_round_robin() {
+fn aps_preempt_threads() {
     use crate::{percpu, smp};
-    let expected_work = smp::AP_THREADS as u64 * smp::AP_THREAD_ROUNDS;
     for cpu in percpu::all().iter().filter(|c| !c.is_bsp) {
         assert_eq!(
             cpu.threads_completed(),
@@ -621,16 +620,12 @@ fn aps_run_threads_round_robin() {
             cpu.threads_completed(),
             smp::AP_THREADS,
         );
-        assert_eq!(
-            cpu.work(),
-            expected_work,
-            "AP cpu{} did {} work, expected {} ({} threads x {} rounds)",
+        assert!(
+            cpu.preemptions() > 0,
+            "AP cpu{} recorded no timer preemptions (scheduling was not preemptive)",
             cpu.cpu_index,
-            cpu.work(),
-            expected_work,
-            smp::AP_THREADS,
-            smp::AP_THREAD_ROUNDS,
         );
+        assert!(cpu.work() > 0, "AP cpu{} did no work", cpu.cpu_index);
         assert!(
             cpu.scheduler_done(),
             "AP cpu{} run queue did not drain back to its bootstrap context",

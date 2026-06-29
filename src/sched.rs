@@ -20,16 +20,22 @@
 //! storage classes an AP is already proven to reach (the 0.9 bootloader may leave
 //! large `.bss` unmapped; see `percpu`/`smp`).
 //!
-//! Scheduling here is **cooperative**: a thread keeps the CPU until it calls
-//! [`yield_now`] or returns from its entry function. Stage 16d-4 will let the
-//! per-core timer preempt it; Stage 16d-5 folds the async executor in.
+//! Stage 16d-3 drove this cooperatively (a thread ran until it called [`yield_now`]);
+//! **Stage 16d-4** adds **preemption**: this core's timer interrupt calls [`preempt`],
+//! which performs the very same `switch_to_next` from interrupt context, so a thread is
+//! switched out at any instruction without its cooperation. The trick is the same one
+//! the process scheduler uses (Stage 12c) — the timer's naked stub has already saved the
+//! interrupted thread's full register set in a `TrapFrame` on its stack, so `context_switch`
+//! need only swap stacks; when the thread is resumed, the stub's epilogue restores that
+//! `TrapFrame` and `iretq`s back to the exact instruction the tick interrupted. (Stage 16d-5
+//! folds the async executor in.)
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
-use spin::Mutex;
+use spin::{Mutex, MutexGuard};
 use x86_64::instructions::interrupts;
 
 use crate::percpu;
@@ -153,6 +159,14 @@ fn this_queue() -> &'static Mutex<RunQueue> {
         .expect("sched::this_queue: no run queue for the running core (init not called?)")
 }
 
+/// This core's run queue, or `None` if the queues are not built yet (before [`init`])
+/// or the running core has no per-CPU block. The non-panicking form, for the timer's
+/// [`preempt`] path, which must never fault no matter how early a tick lands.
+fn this_queue_opt() -> Option<&'static Mutex<RunQueue>> {
+    let index = percpu::this_cpu_opt()?.cpu_index;
+    queues().get(index)
+}
+
 /// Spawn a kernel thread that will run `entry` on the **current** core's run queue.
 ///
 /// Allocates a stack, fabricates an initial frame on it (see [`prepare_stack`]) so
@@ -179,16 +193,19 @@ pub fn spawn(entry: fn()) {
     q.ready.push_back(id);
 }
 
-/// Run every thread spawned on this core to completion, cooperatively, then return.
+/// Run every thread spawned on this core to completion under **timer preemption**,
+/// then return (Stage 16d-4).
 ///
-/// Registers the calling (bootstrap) context as a yield-only thread so the
-/// scheduler always has somewhere to come back to, then drives the round-robin:
-/// while any spawned worker is still live, [`yield_now`] hands the CPU on. Each
-/// time the bootstrap is scheduled it checks again; once every worker has
-/// `Finished`, it reaps their stacks and returns — back to `ap_entry`, which parks.
+/// Registers the calling (bootstrap) context as a thread so the scheduler always has
+/// somewhere to come back to, then **enables interrupts** and idles on `hlt`. From
+/// there this core's timer drives the rotation: each tick [`preempt`]s whatever is
+/// running (this bootstrap, or a worker busy-spinning) to the next ready thread — no
+/// `yield` required. When every worker has `Finished`, a tick finds only the
+/// bootstrap ready (a no-op switch), so control keeps returning to the idle loop,
+/// which then reaps the workers' stacks and returns to `ap_entry`.
 ///
-/// Call once per core, with interrupts disabled (the first switch must be atomic
-/// w.r.t. the timer); the workers re-enable interrupts for their own bodies.
+/// Call once per core, with interrupts disabled (we enable them ourselves once the
+/// bootstrap is safely registered).
 pub fn run_to_completion() {
     // Register the bootstrap context (no entry, empty stack — it runs on the core's
     // existing stack; its stack_pointer is filled in by the first switch away).
@@ -206,10 +223,18 @@ pub fn run_to_completion() {
             },
         );
         q.current = Some(bootstrap_id);
+        // Reserve ready-queue capacity for every thread now, with interrupts still
+        // off, so the `push_back` in the timer-driven `switch_to_next` never has to
+        // grow the deque (which would allocate — spinning on the heap lock from inside
+        // an interrupt). After this the preemptive switch path touches no allocator.
+        let n = q.threads.len();
+        q.ready.reserve(n);
     }
 
-    // Drive the rotation until no spawned worker remains un-finished.
+    // Arm preemption: enable this core's timer interrupt to switch threads for us.
+    interrupts::enable();
     loop {
+        reap_finished();
         let work_remains = {
             let q = this_queue().lock();
             q.threads
@@ -219,11 +244,13 @@ pub fn run_to_completion() {
         if !work_remains {
             break;
         }
-        yield_now();
+        // Sleep until the next timer interrupt, which preempts us into a ready worker.
+        x86_64::instructions::hlt();
     }
 
-    // We are the bootstrap, running on a stack nobody reaps; free the finished
-    // workers' stacks now that the rotation is done.
+    // Restore the interrupts-disabled state `ap_entry` expects, then free the finished
+    // workers' stacks (we are the bootstrap, running on a stack nobody reaps).
+    interrupts::disable();
     reap_finished();
 }
 
@@ -231,21 +258,51 @@ pub fn run_to_completion() {
 /// core** (round-robin). Returns `true` if it switched, `false` if this thread was
 /// the only one ready. Disables interrupts around the whole switch so the timer
 /// cannot preempt between picking the next thread and the stack swap.
+///
+/// The cooperative API. Since Stage 16d-4 the AP demo relies on timer preemption
+/// instead, so nothing calls this at runtime — but it remains the voluntary
+/// switch point a thread would use, and shares its switch path with [`preempt`].
+#[allow(dead_code)]
 pub fn yield_now() -> bool {
-    interrupts::without_interrupts(switch_to_next)
+    interrupts::without_interrupts(|| switch_to_next(this_queue().lock()))
 }
 
-/// Rotate to the next ready thread on this core. Moves the current thread to the
-/// back of the ready queue, makes the front thread current, **drops the lock**,
-/// then switches. Returns `false` (lock dropped) if nothing else is ready.
+/// Preempt the kernel thread running on this core, rotating to the next ready thread
+/// on this core's run queue (Stage 16d-4). Called from the timer interrupt
+/// ([`crate::interrupts::timer_dispatch`]) on an application processor.
+///
+/// We are already in interrupt context with interrupts disabled — exactly what
+/// [`switch_to_next`] requires. We `try_lock` the queue so that if this core was
+/// interrupted while mid-update (already holding the lock), we skip this tick rather
+/// than spin forever on a lock only we could release. A no-op when nothing else is
+/// ready (e.g. the core is parked with just its bootstrap thread), so it costs only
+/// a `try_lock` once the workers are done.
+pub fn preempt() {
+    let q = match this_queue_opt() {
+        Some(q) => q,
+        None => return, // run queues not built yet
+    };
+    if let Some(guard) = q.try_lock() {
+        if guard.ready.is_empty() {
+            return; // nothing to switch to; the guard drops here
+        }
+        percpu::this_cpu().count_preemption();
+        switch_to_next(guard);
+    }
+}
+
+/// Rotate to the next ready thread on this core, given an already-acquired lock.
+/// Moves the current thread to the back of the ready queue, makes the front thread
+/// current, **drops the lock**, then switches. Returns `false` (lock dropped) if
+/// nothing else is ready. Shared by the cooperative [`yield_now`] and the preemptive
+/// [`preempt`].
 ///
 /// Callers MUST have interrupts disabled: `context_switch` must never run with
 /// interrupts on (a tick striking mid-switch, while the stack is half-swapped, is
-/// fatal), and the switch must be atomic w.r.t. the timer.
-fn switch_to_next() -> bool {
-    let q = this_queue();
-    let mut guard = q.lock();
-
+/// fatal), and the switch must be atomic w.r.t. the timer. The interrupt path is
+/// allocation-free — `run_to_completion` pre-reserved the ready queue, so the
+/// `push_back` below never grows the deque.
+fn switch_to_next(mut guard: MutexGuard<'static, RunQueue>) -> bool {
     let current_id = guard
         .current
         .expect("sched::switch_to_next: no current thread");

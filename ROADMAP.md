@@ -302,9 +302,25 @@ unify later.
 > `threads_completed` counter and a `scheduler_done` flag. Scheduling is still **cooperative** (a thread
 > runs until it yields or returns). Boot logs each AP "3 thread(s) completed, work 15, scheduler done =
 > true"; verified by 35 tests (the new `aps_run_threads_round_robin`, which replaces 16d-2's single-worker
-> test and asserts each AP completed exactly 3 threads and 15 work and drained cleanly). Next: **16d-4**
-> drives this run queue from the per-core timer (preemption), and **16d-5** unifies the async executor
-> with the thread scheduler.
+> test and asserts each AP completed exactly 3 threads and 15 work and drained cleanly).
+>
+> **Stage 16d-4 is also done** — the per-CPU run queue is now **preemptive**. Stage 16d-3 rotated a core's
+> threads only when they cooperatively `yield`ed; 16d-4 lets that core's *timer* rotate them, so a thread
+> is switched out at any instruction without its cooperation. `sched.rs` gains `preempt`, which performs
+> the same `switch_to_next` from interrupt context; `interrupts::timer_dispatch` calls it on the AP path
+> (after the EOI) each tick. The trick is the one the process scheduler already uses (Stage 12c): the
+> timer's naked stub has saved the interrupted thread's full register set in a `TrapFrame` on its stack,
+> so `context_switch` need only swap stacks — when the thread is later rescheduled, the stub's epilogue
+> restores that `TrapFrame` and `iretq`s back to the exact instruction the tick interrupted. `preempt`
+> `try_lock`s the run queue (skipping a tick that lands mid-update, like the BSP's `thread::schedule`),
+> and `run_to_completion` now enables interrupts and idles on `hlt` while the timer drives the rotation
+> (pre-reserving the ready deque so the interrupt-context switch never allocates). The AP demo workers
+> now **busy-spin and never yield** — each runs until its core has taken `AP_THREAD_TICKS` (2) timer
+> interrupts — so the only thing that interleaves them is preemption; a per-CPU `preemptions` counter
+> proves it. Boot logs each AP "3 thread(s) completed, N preemption(s)" with N > 0; verified by 35 tests
+> (the new `aps_preempt_threads`, replacing 16d-3's exact-work test, asserts each AP completed 3 threads,
+> took ≥1 preemption, and drained cleanly). Next: **16d-5** unifies the async executor with the thread
+> scheduler.
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

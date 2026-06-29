@@ -266,9 +266,9 @@ Exit QEMU: `Ctrl-A` then `X`.
   EOIs, driven by `self_ipi_works()` (sends a fixed IPI to this CPU and confirms it
   arrives) — proving the Local APIC IPI path before Stage 16b uses it to wake the APs.
   Stage 16d-1 makes `timer_dispatch` per-CPU aware (via `percpu::this_cpu_opt`): on an AP
-  it just bumps that core's per-CPU tick count and EOIs, leaving the global tally and the
-  process/thread scheduler BSP-only; `init_idt_ap` points a woken AP's IDTR at the one
-  shared IDT.
+  it bumps that core's per-CPU tick count, EOIs, and (Stage 16d-4) calls `sched::preempt`
+  to round-robin this core's *own* per-CPU run queue — leaving the global tally and the
+  process scheduler BSP-only; `init_idt_ap` points a woken AP's IDTR at the one shared IDT.
 - `src/apic.rs`: Stage 15 APIC (Advanced Programmable Interrupt Controller) support.
   `init` maps the Local APIC's MMIO page uncacheable (`NO_CACHE`), software-enables it
   via the spurious-vector register, masks the 8259 PIC, then *calibrates* the LAPIC
@@ -309,12 +309,14 @@ Exit QEMU: `Ctrl-A` then `X`.
   GDT, reload CS, null out SS/DS/ES, no TSS), `interrupts::init_idt_ap` (the shared IDT), `apic::init_ap`
   (its own Local APIC timer), then `sti` — so it takes its own timer interrupts (counted per-CPU) instead
   of sitting idle. Stage 16d-2 validated the context-switch primitive on an AP with a single hand-driven
-  worker; **Stage 16d-3** builds the real scheduler on it: before that final `sti`, each AP spawns
-  `AP_THREADS` (3) cooperative kernel threads onto its **own per-CPU run queue** (`sched.rs`) and
-  `run_to_completion`s them — round-robin scheduling on a non-boot core — then marks `scheduler_done` and
-  parks. The 16d-2 single-worker scaffolding (`run_cooperative_worker`/`ap_worker_entry`/
-  `prepare_worker_stack`) is gone, replaced by `sched::spawn`/`run_to_completion` and a small `ap_worker`
-  body (per-CPU `work` + `sched::yield_now` for `AP_THREAD_ROUNDS` rounds).
+  worker; **Stage 16d-3** built the real per-CPU scheduler on it, and **Stage 16d-4** makes it
+  *preemptive*: before parking, each AP spawns `AP_THREADS` (3) kernel threads onto its **own per-CPU run
+  queue** (`sched.rs`) and `run_to_completion`s them. The `ap_worker` body now busy-spins (per-CPU `work`)
+  for `AP_THREAD_TICKS` (2) of this core's timer ticks and **never yields** — so the only thing that
+  switches between the threads is this core's timer (`sched::preempt`), round-robining them with no
+  cooperation. `run_to_completion` enables interrupts and idles on `hlt`; the timer drives the rotation,
+  and when the workers finish it marks `scheduler_done` and returns. (The 16d-2 single-worker scaffolding
+  is gone.)
 - `src/percpu.rs`: Stage 16c per-CPU data — one private `PerCpu` block per core (dense cpu index, Local
   APIC id, BSP flag, an `online` flag, and the stack the core runs on), the foundation for "the current
   process / run queue is per-core" that Stage 16d needs. The blocks live in a heap array published
@@ -325,10 +327,10 @@ Exit QEMU: `Ctrl-A` then `X`.
   each core); `all()`/`count()`/`online_count()` expose the table. An AP records itself online here in
   `smp::ap_entry`; the BSP prints the per-CPU table at boot. Stage 16d-1 adds a per-CPU `timer_ticks`
   counter (each core tallies its *own* LAPIC timer interrupts) and a non-panicking `this_cpu_opt()` for
-  handlers that can fire before `init` (the BSP's timer ticks before per-CPU data is built). Stage 16d-2/
-  16d-3 add a `work` counter, a `threads_completed` counter, and a `scheduler_done` flag that the per-CPU
-  run queue (`sched.rs`) updates as its cooperative threads run and the rotation unwinds back to the
-  bootstrap context.
+  handlers that can fire before `init` (the BSP's timer ticks before per-CPU data is built). Stage
+  16d-2/16d-3/16d-4 add a `work` counter, a `threads_completed` counter, a `preemptions` counter, and a
+  `scheduler_done` flag that the per-CPU run queue (`sched.rs`) updates as its threads run, the timer
+  preempts them, and the rotation unwinds back to the bootstrap context.
 - `src/acpi.rs`: Stage 16a SMP discovery — parses just enough ACPI to enumerate the machine's CPU
   cores. `discover` scans low memory for the RSDP signature, follows it to the RSDT/XSDT (a table of
   table pointers), finds the MADT (signature "APIC"), and reads its Processor Local APIC entries into a
@@ -369,17 +371,20 @@ Exit QEMU: `Ctrl-A` then `X`.
   the per-CPU run queue (`sched.rs`) to switch kernel threads on the application
   processors — it is CPU-agnostic, so the same routine serves the BSP's (dormant)
   global `Scheduler` here and each AP's per-CPU run queue.
-- `src/sched.rs`: Stage 16d-3 per-CPU cooperative run queue — the per-CPU analog of the Stage 6 global
-  `thread` scheduler. One `RunQueue` (a `BTreeMap` of `KThread`s + a ready `VecDeque` + a `current`) per
-  core, published like the per-CPU array (a heap `Vec` leaked to a `'static` slice behind an `AtomicPtr` +
+- `src/sched.rs`: Stage 16d-3/16d-4 per-CPU run queue — the per-CPU analog of the Stage 6 global `thread`
+  scheduler. One `RunQueue` (a `BTreeMap` of `KThread`s + a ready `VecDeque` + a `current`) per core,
+  published like the per-CPU array (a heap `Vec` leaked to a `'static` slice behind an `AtomicPtr` +
   length) and indexed by the running core's dense `cpu_index` (`percpu`). `init(n_cpus)` builds one empty
   queue per core (on the BSP, before any AP is woken); `spawn(entry)` fabricates a stack (mirroring Stage
   6's `prepare_stack`, return address = `thread_trampoline`) and enqueues a `Ready` thread on *this*
-  core's queue; `yield_now` round-robins to the next ready thread (interrupts off around the
-  `thread::context_switch`); `run_to_completion` registers the caller as a yield-only bootstrap thread,
-  drives the rotation until every spawned worker `Finished`, reaps their stacks, and returns. Cooperative
-  only (a thread runs until it yields/returns); 16d-4 will drive it from the per-core timer, and 16d-5
-  folds in the async executor. Used by `smp::ap_entry` to round-robin several kernel threads on each AP.
+  core's queue; the shared `switch_to_next` round-robins to the next ready thread (interrupts off around
+  the `thread::context_switch`), reached either cooperatively via `yield_now` (the now-`dead_code` API) or
+  — Stage 16d-4 — preemptively via `preempt`, which the AP's timer (`interrupts::timer_dispatch`) calls
+  each tick (a `try_lock` so a tick during a queue update simply skips). `run_to_completion` registers the
+  caller as a bootstrap thread, **enables interrupts**, and idles on `hlt` while the timer rotates the
+  workers (it pre-reserves the ready deque so the interrupt-context switch never allocates); when they all
+  `Finished` it reaps their stacks and returns. Used by `smp::ap_entry` to preemptively schedule several
+  kernel threads on each AP. (16d-5 folds in the async executor.)
 - `src/shell.rs`: Stage 7-8 interactive shell — an async task that reads decoded
   keystrokes from the keyboard `ScancodeStream`, buffers a line (with Backspace)
   against a current working directory, and on Enter routes it through a `dispatch`

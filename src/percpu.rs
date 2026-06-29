@@ -63,6 +63,11 @@ pub struct PerCpu {
     /// thread on this core's per-CPU run queue bumps it as it exits, so the count proves
     /// the per-CPU scheduler ran *several* threads, not just one.
     threads_completed: AtomicU64,
+    /// How many times this core's timer preempted a running kernel thread (Stage 16d-4).
+    /// Bumped whenever `sched::preempt` rotates this core's run queue from the timer
+    /// interrupt; a non-zero count proves scheduling here is *preemptive*, not just
+    /// cooperative — the timer switched threads with no `yield`.
+    preemptions: AtomicU64,
     /// Set once this core's run queue has drained and control returned to its bootstrap
     /// context (Stage 16d-3) — proof the whole cooperative round-robin completed and
     /// unwound cleanly, rather than deadlocking or losing the core.
@@ -112,6 +117,16 @@ impl PerCpu {
         self.threads_completed.fetch_add(1, Ordering::SeqCst);
     }
 
+    /// How many times this core's timer preempted a running kernel thread (Stage 16d-4).
+    pub fn preemptions(&self) -> u64 {
+        self.preemptions.load(Ordering::SeqCst)
+    }
+
+    /// Record one timer-driven preemption on this core — called by `sched::preempt`.
+    pub fn count_preemption(&self) {
+        self.preemptions.fetch_add(1, Ordering::SeqCst);
+    }
+
     /// Whether this core's run queue drained and returned to its bootstrap context.
     pub fn scheduler_done(&self) -> bool {
         self.scheduler_done.load(Ordering::SeqCst)
@@ -153,6 +168,7 @@ pub fn init(cores: &[CpuCore]) {
             timer_ticks: AtomicU64::new(0),
             work: AtomicU64::new(0),
             threads_completed: AtomicU64::new(0),
+            preemptions: AtomicU64::new(0),
             scheduler_done: AtomicBool::new(false),
         });
     }

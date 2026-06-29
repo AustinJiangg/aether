@@ -81,11 +81,12 @@ const AP_STACK_SIZE: usize = 8 * 1024;
 /// not just a single switch in and out.
 pub const AP_THREADS: usize = 3;
 
-/// How many rounds each AP worker thread runs — a unit of per-CPU `work` then a
-/// [`crate::sched::yield_now`] — before it finishes. With `AP_THREADS` threads each
-/// doing this, a core tallies `AP_THREADS * AP_THREAD_ROUNDS` work and the threads
-/// interleave through that many cooperative switches.
-pub const AP_THREAD_ROUNDS: u64 = 5;
+/// How many of this core's timer ticks each AP worker thread spans before it finishes
+/// (Stage 16d-4). A worker busy-spins (doing visible per-CPU `work`) until this core has
+/// taken this many timer interrupts since the worker first ran — so the timer is
+/// guaranteed to fire, and *preempt* the worker, while it runs (it never yields). Two
+/// ticks keeps boot brisk while guaranteeing the worker is alive across a preemption.
+pub const AP_THREAD_TICKS: u64 = 2;
 
 // The AP trampoline blob, assembled in place and copied to the low page at runtime.
 //
@@ -351,19 +352,24 @@ pub fn aps_online() -> u32 {
     AP_ONLINE.load(Ordering::SeqCst)
 }
 
-/// The body of one cooperative kernel thread on an AP's per-CPU run queue (Stage 16d-3).
+/// The body of one preemptively-scheduled kernel thread on an AP's per-CPU run queue
+/// (Stage 16d-4).
 ///
-/// It runs [`AP_THREAD_ROUNDS`] rounds; each round bumps this core's per-CPU `work`
-/// tally then [`crate::sched::yield_now`]s, handing the core to the next ready thread on
-/// *this same core*. With [`AP_THREADS`] of these spawned per core, the rounds interleave
-/// (A -> B -> C -> A -> ...), which is the round-robin we are proving. When it returns,
-/// the scheduler's trampoline calls the per-CPU `thread_exit`, which tallies the
-/// completion and switches on — so this function never has to know it is being scheduled.
+/// It busy-spins — bumping this core's per-CPU `work` tally — until this core has taken
+/// [`AP_THREAD_TICKS`] timer interrupts since the worker first ran. Crucially it never
+/// calls `yield`: the only thing that switches away from it is this core's **timer**,
+/// which preempts it mid-spin and round-robins to the next ready thread. With
+/// [`AP_THREADS`] of these spinning on one core, the timer interleaves them with no
+/// cooperation — the preemption we are proving. When it returns, the scheduler's
+/// trampoline calls the per-CPU `thread_exit`, which tallies the completion and switches
+/// on. (A thread never migrates cores, so `cpu` stays this core's block across every
+/// preemption.)
 fn ap_worker() {
     let cpu = crate::percpu::this_cpu();
-    for _ in 0..AP_THREAD_ROUNDS {
+    let start = cpu.timer_ticks();
+    while cpu.timer_ticks() - start < AP_THREAD_TICKS {
         cpu.add_work(1);
-        crate::sched::yield_now();
+        core::hint::spin_loop();
     }
 }
 
@@ -402,12 +408,13 @@ extern "C" fn ap_entry() -> ! {
     crate::interrupts::init_idt_ap();
     crate::apic::init_ap();
 
-    // Stage 16d-3: run several cooperative kernel threads on this core's *own* run queue.
-    // Spawn AP_THREADS worker threads onto this core's queue, then drive them round-robin
-    // to completion. Interrupts are still disabled (the first context switch must be atomic
-    // w.r.t. the timer); each worker re-enables them for its own body, and the per-CPU timer
-    // keeps ticking through the run (counted harmlessly per core). `run_to_completion`
-    // returns once every worker has finished and control is back on this bootstrap context.
+    // Stage 16d-4: run several kernel threads on this core's *own* run queue under timer
+    // preemption. Spawn AP_THREADS workers (each busy-spins and never yields), then
+    // `run_to_completion` enables interrupts and idles — this core's timer preempts whatever
+    // is running on each tick, round-robining the workers with no cooperation. It returns
+    // (interrupts disabled again) once every worker has finished. Interrupts are disabled now
+    // (the spawn touches the run queue and the bootstrap registration must be atomic w.r.t.
+    // the timer); `run_to_completion` enables them itself once the bootstrap is registered.
     for _ in 0..AP_THREADS {
         crate::sched::spawn(ap_worker);
     }
@@ -415,8 +422,8 @@ extern "C" fn ap_entry() -> ! {
     crate::percpu::this_cpu().set_scheduler_done();
 
     // Park: enable interrupts and `hlt` between timer ticks, so the core sleeps rather than
-    // busy-spinning, woken on each tick (and any future IPI). 16d-4 will drive this per-CPU
-    // run queue from the timer (preemption) instead of relying on cooperative yields.
+    // busy-spinning, woken on each tick (and any future IPI). With the run queue drained, a
+    // tick's `sched::preempt` finds nothing ready and is a no-op, so the core stays parked.
     x86_64::instructions::interrupts::enable();
     crate::hlt_loop();
 }
