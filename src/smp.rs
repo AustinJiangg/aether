@@ -76,14 +76,16 @@ static AP_ONLINE: AtomicU32 = AtomicU32::new(0);
 /// the kernel file image, so the AP faults (not-present) on its first stack push.
 const AP_STACK_SIZE: usize = 8 * 1024;
 
-/// Size of the stack for an AP's cooperative worker thread (Stage 16d-2): 8 KiB — ample for
-/// the worker, and able to absorb a timer frame if a tick lands while it runs. Freed once the
-/// worker switches back, so it does not permanently consume the (small, 100 KiB) kernel heap.
-const AP_WORKER_STACK_SIZE: usize = 8 * 1024;
+/// How many cooperative kernel threads each woken AP runs on its per-CPU run queue
+/// (Stage 16d-3). Three is enough to show real round-robin rotation (A -> B -> C -> A),
+/// not just a single switch in and out.
+pub const AP_THREADS: usize = 3;
 
-/// How many units of work the AP's worker thread does before yielding the core back. Kept
-/// modest: this cooperative excursion runs once, during AP bring-up.
-const AP_WORKER_ITERS: u64 = 50_000;
+/// How many rounds each AP worker thread runs — a unit of per-CPU `work` then a
+/// [`crate::sched::yield_now`] — before it finishes. With `AP_THREADS` threads each
+/// doing this, a core tallies `AP_THREADS * AP_THREAD_ROUNDS` work and the threads
+/// interleave through that many cooperative switches.
+pub const AP_THREAD_ROUNDS: u64 = 5;
 
 // The AP trampoline blob, assembled in place and copied to the low page at runtime.
 //
@@ -349,108 +351,20 @@ pub fn aps_online() -> u32 {
     AP_ONLINE.load(Ordering::SeqCst)
 }
 
-/// Fabricate an initial stack frame for an AP's cooperative worker thread (Stage 16d-2),
-/// laid out so the first [`crate::thread::context_switch`] into it lands in
-/// [`ap_worker_entry`]. Mirrors the kernel-thread machinery (Stage 6's `prepare_stack`):
-/// six zeroed callee-saved register slots beneath a return address, plus one padding word so
-/// the entry sees `rsp ≡ 8 (mod 16)` (the SysV ABI) after the six pops and the `ret`.
-/// Returns the fabricated stack pointer to switch into.
+/// The body of one cooperative kernel thread on an AP's per-CPU run queue (Stage 16d-3).
 ///
-/// # Safety
-/// `stack` must be a writable buffer far larger than the handful of fabricated words, and
-/// must outlive the worker that runs on it.
-unsafe fn prepare_worker_stack(stack: &mut [u8]) -> u64 {
-    let bottom = stack.as_mut_ptr() as u64;
-    let top = bottom + stack.len() as u64;
-    let mut sp = top & !0xF; // start 16-byte aligned at the top of the buffer
-    sp -= 8; // one padding word: makes the entry see rsp ≡ 8 (mod 16) after the pops + ret
-    sp -= 8;
-    // SAFETY: `sp` is inside the buffer and 8-byte aligned; write the return address the
-    // restore half of `context_switch` will `ret` to on the first switch-in.
-    (sp as *mut u64).write(ap_worker_entry as *const () as usize as u64);
-    for _ in 0..6 {
-        sp -= 8;
-        // SAFETY: still inside the buffer, 8-byte aligned; zero one callee-saved slot (the
-        // values are irrelevant for a thread that has never run).
-        (sp as *mut u64).write(0);
-    }
-    sp
-}
-
-/// Entry point of an AP's cooperative worker thread (Stage 16d-2), reached by the first
-/// context switch into the fabricated worker stack. It does a bounded amount of per-CPU
-/// work, then switches back to the bootstrap (`ap_entry`) context that started it.
-///
-/// This is what proves a context switch works *from* an application processor: the AP
-/// switched onto a fresh stack into this function (the restore half of `context_switch`),
-/// and the switch back restores a context this core saved (both halves), all off the BSP.
-extern "C" fn ap_worker_entry() -> ! {
+/// It runs [`AP_THREAD_ROUNDS`] rounds; each round bumps this core's per-CPU `work`
+/// tally then [`crate::sched::yield_now`]s, handing the core to the next ready thread on
+/// *this same core*. With [`AP_THREADS`] of these spawned per core, the rounds interleave
+/// (A -> B -> C -> A -> ...), which is the round-robin we are proving. When it returns,
+/// the scheduler's trampoline calls the per-CPU `thread_exit`, which tallies the
+/// completion and switches on — so this function never has to know it is being scheduled.
+fn ap_worker() {
     let cpu = crate::percpu::this_cpu();
-
-    // A kernel thread runs with interrupts enabled (so the timer can still tick — counted
-    // harmlessly on an AP). The switch *into* us happened with interrupts off; turn them on.
-    x86_64::instructions::interrupts::enable();
-
-    // Visible per-CPU work, proof this thread actually ran on this core.
-    for _ in 0..AP_WORKER_ITERS {
+    for _ in 0..AP_THREAD_ROUNDS {
         cpu.add_work(1);
-        core::hint::spin_loop();
+        crate::sched::yield_now();
     }
-
-    // Switch back to the bootstrap context. Interrupts OFF first: a timer tick striking
-    // between the two halves of a context switch — while the stack is half-swapped — is fatal.
-    x86_64::instructions::interrupts::disable();
-    let slot = cpu.bootstrap_slot() as *const u64;
-    // SAFETY: `slot` is the address of `ap_entry`'s `bootstrap_rsp` local, alive on the
-    // parked bootstrap stack; the first `context_switch` wrote the bootstrap's resume stack
-    // pointer there, so this reads a stack pointer a prior `context_switch` produced.
-    let bootstrap_rsp = unsafe { *slot };
-    let mut discard = 0u64;
-    // SAFETY: `bootstrap_rsp` came from a prior `context_switch`, so switching to it resumes
-    // `ap_entry` right after its switch-in call. `discard` is a valid throwaway save slot we
-    // never read (this worker never runs again). Interrupts are disabled, so the swap is atomic.
-    unsafe {
-        crate::thread::context_switch(&mut discard, bootstrap_rsp);
-    }
-    unreachable!("AP worker resumed after switching back to its bootstrap context");
-}
-
-/// Run one cooperative kernel worker thread on the current AP, returning once it has
-/// switched back (Stage 16d-2). Called from [`ap_entry`] with interrupts disabled.
-///
-/// Fabricates a worker stack, records where the worker should switch back to, and
-/// `context_switch`es into [`ap_worker_entry`]; when the worker switches back, this returns
-/// — a full round-trip context switch on an application processor.
-fn run_cooperative_worker() {
-    let cpu = crate::percpu::this_cpu();
-
-    // Allocate the worker's stack on the shared kernel heap. Its allocator is spinlocked, so
-    // this is safe even while the BSP allocates concurrently. We keep `worker_stack` owned
-    // here rather than leaking it: the worker switches back to us before this function returns
-    // and can never run again, so its stack is reclaimed when `worker_stack` drops — important
-    // on the small (100 KiB) kernel heap.
-    let mut worker_stack = alloc::vec![0u8; AP_WORKER_STACK_SIZE];
-    // SAFETY: freshly allocated, writable, far larger than the fabricated frame.
-    let worker_rsp = unsafe { prepare_worker_stack(&mut worker_stack) };
-
-    // The slot `context_switch` saves our (bootstrap) resume stack pointer into; the worker
-    // reads its address (from the per-CPU block) to switch back. It lives on this bootstrap
-    // stack, which is never freed, so the address stays valid while the worker uses it.
-    let mut bootstrap_rsp = 0u64;
-    cpu.set_bootstrap_slot(&mut bootstrap_rsp as *mut u64 as u64);
-
-    // SAFETY: `bootstrap_rsp` is a live local for `context_switch` to save our resume sp into;
-    // `worker_rsp` is the fabricated worker stack (kept alive by `worker_stack`). The caller
-    // guarantees interrupts are disabled, so the swap is atomic. The worker switches back to
-    // us, so — unlike a one-way switch — this call returns.
-    unsafe {
-        crate::thread::context_switch(&mut bootstrap_rsp, worker_rsp);
-    }
-
-    // The worker switched back into us: the round-trip completed. Interrupts are still disabled
-    // (the worker cleared them before switching back), so `worker_stack` is safely freed as
-    // this function returns — the worker can never run again, and nothing else lands on it.
-    cpu.set_bootstrap_resumed();
 }
 
 /// Entry point for a freshly-woken AP: 64-bit long mode, on the kernel's address space
@@ -488,14 +402,21 @@ extern "C" fn ap_entry() -> ! {
     crate::interrupts::init_idt_ap();
     crate::apic::init_ap();
 
-    // Stage 16d-2: run one cooperative kernel thread on this core, proving a context switch
-    // works from an application processor. The worker enables interrupts for its body (the
-    // timer ticks during it, counted per-CPU), does some per-CPU work, then switches back here.
-    run_cooperative_worker();
+    // Stage 16d-3: run several cooperative kernel threads on this core's *own* run queue.
+    // Spawn AP_THREADS worker threads onto this core's queue, then drive them round-robin
+    // to completion. Interrupts are still disabled (the first context switch must be atomic
+    // w.r.t. the timer); each worker re-enables them for its own body, and the per-CPU timer
+    // keeps ticking through the run (counted harmlessly per core). `run_to_completion`
+    // returns once every worker has finished and control is back on this bootstrap context.
+    for _ in 0..AP_THREADS {
+        crate::sched::spawn(ap_worker);
+    }
+    crate::sched::run_to_completion();
+    crate::percpu::this_cpu().set_scheduler_done();
 
     // Park: enable interrupts and `hlt` between timer ticks, so the core sleeps rather than
-    // busy-spinning, woken on each tick (and any future IPI). 16d-3 gives it a per-CPU run
-    // queue to schedule real threads instead of this single cooperative excursion.
+    // busy-spinning, woken on each tick (and any future IPI). 16d-4 will drive this per-CPU
+    // run queue from the timer (preemption) instead of relying on cooperative yields.
     x86_64::instructions::interrupts::enable();
     crate::hlt_loop();
 }

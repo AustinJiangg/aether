@@ -55,17 +55,18 @@ pub struct PerCpu {
     /// counts its *own* timer here — the first autonomous work an AP does once its timer
     /// is enabled. (The BSP also tallies its ticks globally in `interrupts::TIMER_TICKS`.)
     timer_ticks: AtomicU64,
-    /// Units of work this core's kernel thread has done (Stage 16d-2). Bumped by the
-    /// cooperative worker thread the AP switches into, so a non-zero value proves a kernel
-    /// thread actually executed on this core.
+    /// Units of work this core's kernel threads have done (Stage 16d). Bumped by the
+    /// cooperative threads on this core's run queue, so a non-zero value proves kernel
+    /// threads actually executed here.
     work: AtomicU64,
-    /// Address of the bootstrap context's saved-stack-pointer slot (Stage 16d-2). The AP's
-    /// `ap_entry` stashes it here before switching into its worker, so the worker can read
-    /// the bootstrap's resume stack pointer and `context_switch` back to it. 0 when unused.
-    bootstrap_slot: AtomicU64,
-    /// Set once the bootstrap context resumes after its worker switched back (Stage 16d-2)
-    /// — proof the round-trip context switch completed, not just the switch in.
-    bootstrap_resumed: AtomicBool,
+    /// How many kernel threads have run to completion on this core (Stage 16d-3). Each
+    /// thread on this core's per-CPU run queue bumps it as it exits, so the count proves
+    /// the per-CPU scheduler ran *several* threads, not just one.
+    threads_completed: AtomicU64,
+    /// Set once this core's run queue has drained and control returned to its bootstrap
+    /// context (Stage 16d-3) — proof the whole cooperative round-robin completed and
+    /// unwound cleanly, rather than deadlocking or losing the core.
+    scheduler_done: AtomicBool,
 }
 
 impl PerCpu {
@@ -95,30 +96,30 @@ impl PerCpu {
         self.work.load(Ordering::SeqCst)
     }
 
-    /// Add to this core's work tally — called by the core's own worker thread.
+    /// Add to this core's work tally — called by the core's own worker threads.
     pub fn add_work(&self, n: u64) {
         self.work.fetch_add(n, Ordering::SeqCst);
     }
 
-    /// The stashed address of this core's bootstrap saved-stack-pointer slot (0 if unset).
-    pub fn bootstrap_slot(&self) -> u64 {
-        self.bootstrap_slot.load(Ordering::SeqCst)
+    /// How many kernel threads have run to completion on this core (Stage 16d-3).
+    pub fn threads_completed(&self) -> u64 {
+        self.threads_completed.load(Ordering::SeqCst)
     }
 
-    /// Stash the address of the bootstrap context's saved-sp slot, for the worker to read
-    /// when it switches back.
-    pub fn set_bootstrap_slot(&self, addr: u64) {
-        self.bootstrap_slot.store(addr, Ordering::SeqCst);
+    /// Record that one kernel thread finished on this core — called by the per-CPU
+    /// scheduler as a thread exits.
+    pub fn complete_thread(&self) {
+        self.threads_completed.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// Whether the bootstrap context resumed after its worker switched back.
-    pub fn bootstrap_resumed(&self) -> bool {
-        self.bootstrap_resumed.load(Ordering::SeqCst)
+    /// Whether this core's run queue drained and returned to its bootstrap context.
+    pub fn scheduler_done(&self) -> bool {
+        self.scheduler_done.load(Ordering::SeqCst)
     }
 
-    /// Record that the bootstrap context resumed (the round-trip context switch completed).
-    pub fn set_bootstrap_resumed(&self) {
-        self.bootstrap_resumed.store(true, Ordering::SeqCst);
+    /// Record that this core's cooperative run queue completed and unwound cleanly.
+    pub fn set_scheduler_done(&self) {
+        self.scheduler_done.store(true, Ordering::SeqCst);
     }
 
     /// Called by a core, on itself, to record that it is up and on which stack. Writes
@@ -151,8 +152,8 @@ pub fn init(cores: &[CpuCore]) {
             stack: AtomicU64::new(0),
             timer_ticks: AtomicU64::new(0),
             work: AtomicU64::new(0),
-            bootstrap_slot: AtomicU64::new(0),
-            bootstrap_resumed: AtomicBool::new(false),
+            threads_completed: AtomicU64::new(0),
+            scheduler_done: AtomicBool::new(false),
         });
     }
 

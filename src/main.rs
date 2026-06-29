@@ -86,6 +86,10 @@ mod task;
 // subtree until a later stage folds async tasks and threads together.
 #[allow(dead_code)]
 mod thread;
+// Stage 16d-3: a per-CPU cooperative run queue, built on `thread`'s context switch.
+// Each woken AP schedules several kernel threads on its own queue; `sched::yield_now`
+// is the cooperative hand-off. (16d-4 will drive it from the per-core timer.)
+mod sched;
 mod fs;
 mod shell;
 mod syscall;
@@ -345,6 +349,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // `ap_entry`, which records the core online in its per-CPU block and parks. (16d puts
     // the now-idle cores to work.)
     percpu::init(&acpi::cpus());
+    // Stage 16d-3: build one cooperative run queue per core, before any AP is woken — an
+    // AP reaches for its own queue (to spawn its threads) the moment it enters the
+    // scheduler in `ap_entry`. Indexed by the dense `cpu_index` `percpu` just assigned.
+    sched::init(percpu::count());
     smp::boot_aps(&mut mapper, &mut frame_allocator, phys_mem_offset);
     serial_println!(
         "[ OK ] SMP bring-up: {}/{} application processor(s) online (every AP reached stage {}/3)",
@@ -393,20 +401,26 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     }
     println!("SMP: each AP runs its own LAPIC timer now (per-CPU tick counts on the serial log).");
 
-    // Stage 16d-2: each AP also ran one cooperative kernel thread (in `ap_entry`) before
-    // parking — a context switch on a non-boot core. Report the per-CPU work each did and
-    // that its bootstrap context resumed afterwards (so the round-trip switch completed).
-    serial_println!("[percpu] AP cooperative kernel thread (round-trip context switch):");
+    // Stage 16d-3: each AP ran several cooperative kernel threads on its *own* per-CPU run
+    // queue (in `ap_entry`) before parking — real per-core round-robin scheduling. Report,
+    // per AP, how many threads completed, the total work they did, and that the run queue
+    // drained back to its bootstrap context (so the whole rotation unwound cleanly).
+    serial_println!(
+        "[percpu] AP per-CPU run queue ({} threads x {} rounds each):",
+        smp::AP_THREADS,
+        smp::AP_THREAD_ROUNDS,
+    );
     for cpu in percpu::all().iter().filter(|c| !c.is_bsp) {
         serial_println!(
-            "[percpu]   cpu{} apic id {}: work {}, bootstrap resumed = {}",
+            "[percpu]   cpu{} apic id {}: {} thread(s) completed, work {}, scheduler done = {}",
             cpu.cpu_index,
             cpu.apic_id,
+            cpu.threads_completed(),
             cpu.work(),
-            cpu.bootstrap_resumed(),
+            cpu.scheduler_done(),
         );
     }
-    println!("SMP: each AP ran a kernel thread via a context switch (per-CPU work on the serial log).");
+    println!("SMP: each AP round-robined several kernel threads on its own run queue (serial log).");
 
     // Stage 13a: read a raw sector from disk via ATA PIO (polling, no DMA/IRQ). The
     // bootimage is attached as the primary IDE master, so sector 0 is the boot sector —

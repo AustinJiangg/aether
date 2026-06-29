@@ -601,19 +601,39 @@ fn aps_take_timer_interrupts() {
     }
 }
 
-/// Stage 16d-2: each AP ran a kernel thread via a context switch. In `ap_entry` every AP
-/// fabricates a worker stack, `context_switch`es into it (the worker bumps this core's
-/// per-CPU `work` counter), and the worker `context_switch`es back — a full round-trip on a
-/// non-boot core. By the time these tests run, every AP must have done its work *and* had
-/// its bootstrap context resume, proving both halves of the switch work off the BSP.
+/// Stage 16d-3: each AP round-robined several kernel threads on its own per-CPU run queue.
+/// In `ap_entry` every AP spawns `AP_THREADS` worker threads onto its private queue and
+/// drives them to completion cooperatively; each thread does `AP_THREAD_ROUNDS` rounds of
+/// (per-CPU work + `yield_now`) then exits. By the time these tests run, every AP must have:
+/// completed exactly `AP_THREADS` threads, accumulated exactly `AP_THREADS * AP_THREAD_ROUNDS`
+/// work (so every round of every thread ran — proof the cooperative hand-offs all happened),
+/// and returned to its bootstrap context (`scheduler_done`, so the rotation unwound cleanly).
 #[test_case]
-fn aps_run_a_thread_via_context_switch() {
-    use crate::percpu;
+fn aps_run_threads_round_robin() {
+    use crate::{percpu, smp};
+    let expected_work = smp::AP_THREADS as u64 * smp::AP_THREAD_ROUNDS;
     for cpu in percpu::all().iter().filter(|c| !c.is_bsp) {
-        assert!(cpu.work() > 0, "AP cpu{} ran no thread work", cpu.cpu_index);
+        assert_eq!(
+            cpu.threads_completed(),
+            smp::AP_THREADS as u64,
+            "AP cpu{} completed {} threads, expected {}",
+            cpu.cpu_index,
+            cpu.threads_completed(),
+            smp::AP_THREADS,
+        );
+        assert_eq!(
+            cpu.work(),
+            expected_work,
+            "AP cpu{} did {} work, expected {} ({} threads x {} rounds)",
+            cpu.cpu_index,
+            cpu.work(),
+            expected_work,
+            smp::AP_THREADS,
+            smp::AP_THREAD_ROUNDS,
+        );
         assert!(
-            cpu.bootstrap_resumed(),
-            "AP cpu{} did not resume its bootstrap after the worker (switch-back failed)",
+            cpu.scheduler_done(),
+            "AP cpu{} run queue did not drain back to its bootstrap context",
             cpu.cpu_index,
         );
     }

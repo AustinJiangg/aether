@@ -285,10 +285,26 @@ unify later.
 > — a full round-trip, exercising *both* halves of the switch off the BSP. The worker stack is freed on
 > return (it would otherwise exhaust the 100 KiB heap), and the bootstrap's resume stack pointer reaches
 > the worker through a per-CPU slot. Boot logs each AP doing `work 50000, bootstrap resumed = true`;
-> verified by 35 tests (the new `aps_run_a_thread_via_context_switch`). Next: **Stage 16d-3** — build a
-> real per-CPU run queue on this validated primitive (multiple kernel threads per core, cooperative
-> round-robin); then **16d-4** drives it from the AP timer (preemption), and **16d-5** unifies the async
-> executor with the thread scheduler.
+> verified by 35 tests (the new `aps_run_a_thread_via_context_switch`).
+>
+> **Stage 16d-3 is also done** — a real per-CPU run queue. Stage 16d-2 validated the context-switch
+> primitive on an AP with a single hand-driven worker; 16d-3 builds the actual scheduler on it. A new
+> `sched.rs` holds one cooperative round-robin **run queue per core** — the per-CPU analog of Stage 6's
+> single global `thread` scheduler: `RunQueue`/`KThread`, `spawn`, `yield_now`, and `run_to_completion`,
+> reusing `thread::context_switch` (the proven primitive) and a fabricated initial stack frame mirroring
+> Stage 6's. The queues live in a heap `Vec` leaked to a `'static` slice behind an `AtomicPtr` + length
+> (the publish scheme `percpu` uses), one per core, indexed by the running core's dense `cpu_index`. In
+> `ap_entry` each woken AP now spawns `AP_THREADS` (3) worker threads onto its own queue and
+> `run_to_completion`s them: each thread does `AP_THREAD_ROUNDS` (5) rounds of (per-CPU `work` +
+> `yield_now`), so the three interleave (A → B → C → A → …) and the core tallies exactly 15 work; when
+> all have finished, control returns to the AP's bootstrap context, which marks `scheduler_done` and
+> parks. The per-CPU block swaps 16d-2's `bootstrap_slot`/`bootstrap_resumed` scaffolding for a
+> `threads_completed` counter and a `scheduler_done` flag. Scheduling is still **cooperative** (a thread
+> runs until it yields or returns). Boot logs each AP "3 thread(s) completed, work 15, scheduler done =
+> true"; verified by 35 tests (the new `aps_run_threads_round_robin`, which replaces 16d-2's single-worker
+> test and asserts each AP completed exactly 3 threads and 15 work and drained cleanly). Next: **16d-4**
+> drives this run queue from the per-core timer (preemption), and **16d-5** unifies the async executor
+> with the thread scheduler.
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|
