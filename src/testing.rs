@@ -485,6 +485,41 @@ fn fat_traverses_subdirectory() {
     assert_eq!(fs.read("/HELLO.TXT/x"), Err(FsError::NotDir));
 }
 
+/// Stage 14d-3: write-path traversal — create, overwrite, and remove a **file inside a
+/// subdirectory**. The parent path (`/mnt/SUB`) is traversed to the subdirectory's cluster chain,
+/// then the file is written/removed there, alongside the seeded `NESTED.TXT`. Self-cleaning, and
+/// a write to a nonexistent parent must fail to resolve.
+#[test_case]
+fn fat_writes_into_subdirectory() {
+    use crate::fs;
+    use crate::fs::FsError;
+    // Must match FAT_NESTED_CONTENT in build.rs — the seeded neighbor that must survive.
+    const NESTED: &[u8] = b"Nested file inside a FAT16 subdirectory.\n";
+
+    // Create a file inside the seeded /mnt/SUB and read it back through the traversal path.
+    let data = b"written into a FAT subdirectory".to_vec();
+    fs::write("/mnt/SUB/INSUB.TXT", &data).expect("writing into a subdirectory failed");
+    assert_eq!(fs::read("/mnt/SUB/INSUB.TXT").unwrap(), data);
+
+    // It shows up listing the subdirectory, next to the seeded NESTED.TXT.
+    let entries = fs::list("/mnt/SUB").unwrap();
+    assert!(entries.iter().any(|(n, is_dir)| n.as_str() == "INSUB.TXT" && !*is_dir));
+
+    // Overwriting in place updates the contents (and frees/reallocates the chain).
+    let data2 = b"second, different contents in the subdirectory".to_vec();
+    fs::write("/mnt/SUB/INSUB.TXT", &data2).expect("overwriting in a subdirectory failed");
+    assert_eq!(fs::read("/mnt/SUB/INSUB.TXT").unwrap(), data2);
+
+    // Remove it: gone, while the seeded neighbor is untouched.
+    fs::remove("/mnt/SUB/INSUB.TXT").expect("removing from a subdirectory failed");
+    assert_eq!(fs::read("/mnt/SUB/INSUB.TXT"), Err(FsError::NotFound));
+    assert_eq!(fs::read("/mnt/SUB/NESTED.TXT").unwrap(), NESTED);
+
+    // Writing under a parent that does not resolve to a directory fails at traversal.
+    assert_eq!(fs::write("/mnt/NODIR/x.txt", b"y"), Err(FsError::NotFound));
+    assert_eq!(fs::remove("/mnt/NODIR/x.txt"), Err(FsError::NotFound));
+}
+
 /// Stage 14c-1: the FAT driver creates and overwrites a root-level file. Write a payload
 /// spanning several clusters through the global VFS (`/mnt/...`), read it back, and confirm the
 /// bytes round-trip — exercising free-cluster allocation, the cluster chain, and the directory

@@ -375,9 +375,13 @@ unify later.
     (the fixed root region *or* a subdirectory cluster chain) unifies directory scanning
     (`dir_sector_lbas`/`scan_dir`), and `resolve_dir` walks a multi-component path directory by
     directory, so `read`/`list`/`is_dir` — hence the shell's `cd`/`ls`/`cat` — work *inside* a
-    subdirectory (`build.rs` seeds the image with `SUB/NESTED.TXT` as a real target). Still to do:
-    **write-path traversal** (so `write`/`mkdir` work inside a subdirectory — which also needs a
-    directory to *grow* a cluster when its entries fill up) and removing a directory (`rmdir`).
+    subdirectory (`build.rs` seeds the image with `SUB/NESTED.TXT` as a real target). Stage 14d-3
+    extends the **file write path** the same way: `find_entry`/`find_dir_slot` walk any directory's
+    sectors (via `dir_sector_lbas`) and `write_file_in`/`remove_file_in` take a `DirLocation`, so
+    `write`/`remove` resolve the parent path and create or delete a file inside a subdirectory
+    (`write /mnt/SUB/x`). Still to do: **`mkdir` inside a subdirectory** (Stage 14d-4, with the
+    right `..` back-link), **growing a directory** past its first cluster when its entries fill up
+    (Stage 14d-5; a full directory reports `DirFull` for now), and removing a directory (`rmdir`).
   - Still open: upgrade `bootloader` 0.9 → 0.11 (framebuffer, modern boot info). (Unifying the
     async executor with the thread scheduler is already done — Stage 16d-5.)
 

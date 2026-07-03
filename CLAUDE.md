@@ -142,8 +142,9 @@ a reboot. **Stage 14c-2 is also done**: `Fat::remove_file` frees a file's cluste
 marks its directory entry deleted, wired into `FileSystem::remove` (so `rm /mnt/foo` works).
 **This completes Stage 14** — an on-disk FAT16 filesystem with read *and* write, coexisting with
 `RamFs` behind the VFS (root-level `mkdir` since Stage 14d-1; Stage 14d-2 adds read-path
-subdirectory traversal, so `cd`/`ls`/`cat` descend into subdirectories — write-path traversal and
-`rmdir` remain). **Stage 15a (hardware
+subdirectory traversal, so `cd`/`ls`/`cat` descend into subdirectories; Stage 14d-3 extends it to
+the file write path, so `write`/`rm` land inside subdirectories too — `mkdir` inside a
+subdirectory, growing a full directory, and `rmdir` remain). **Stage 15a (hardware
 track) is also done**: the Local APIC and its timer (`apic.rs`) replace the 8259 PIC's timer. It
 maps the LAPIC's MMIO page uncacheable (`NO_CACHE` — device registers must bypass the cache),
 software-enables the APIC via the spurious-vector register, and masks the 8259 PIC, so hardware
@@ -504,9 +505,14 @@ Exit QEMU: `Ctrl-A` then `X`.
   `scan_dir`), and `resolve_dir` walks a multi-component path directory by directory, descending
   from `Root` into `Sub(first_cluster)` at each subdirectory. So `read`/`list`/`is_dir` now reach
   files *inside* subdirectories (the shell's `cd`/`ls`/`cat` descend into `/mnt/SUB`, a directory
-  `build.rs` seeds on the image as `SUB/NESTED.TXT`; `list` hides the `.`/`..` links). The write
-  path (`write`/`mkdir`/`remove`) is still **root-only** — a subdirectory parent returns
-  `Unsupported` — and `rmdir` is still unsupported.
+  `build.rs` seeds on the image as `SUB/NESTED.TXT`; `list` hides the `.`/`..` links). Stage 14d-3
+  extends the **file write path** to subdirectories the same way: `find_entry`/`find_dir_slot` walk
+  a directory via `dir_sector_lbas` (not the hardcoded root region), and `write_file_in`/
+  `remove_file_in` take a `DirLocation`, so `FileSystem::write`/`remove` resolve the parent path
+  (`resolve_dir`) and create/overwrite or delete a **file** anywhere in the tree (`write /mnt/SUB/x`
+  lands in the subdirectory). Still root-only: `mkdir` inside a subdirectory (Stage 14d-4) and
+  growing a subdirectory past its first cluster (Stage 14d-5) — a full directory reports `DirFull`
+  for now — plus `rmdir`.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

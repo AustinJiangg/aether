@@ -536,45 +536,51 @@ impl From<FatError> for FsError {
 /// [`Fat`] behind the VFS [`FileSystem`] trait, so it slots in beside [`RamFs`] and the shell
 /// (or, later, system calls) can read a disk path without knowing which filesystem backs it.
 ///
-/// The **read** side now traverses subdirectories (Stage 14d-2): `read`/`list`/`is_dir` resolve a
-/// multi-component path by scanning each directory in turn (see [`Fat::resolve_dir`]). The
-/// **write** side is still root-only:
+/// Traversal now reaches both sides. The **read** side (Stage 14d-2) resolves a multi-component
+/// path by scanning each directory in turn (see [`Fat::resolve_dir`]); the **file write** side
+/// (Stage 14d-3) does the same for the parent directory before creating/deleting the file:
 /// - `read` reads a file anywhere in the tree; `list`/`is_dir` operate on any directory;
-/// - `write` creates or overwrites a **root-level** file (Stage 14c-1);
-/// - `remove` deletes a **root-level** file (Stage 14c-2);
-/// - `mkdir` creates a **root-level** subdirectory (Stage 14d-1). Writing, creating, or removing
-///   *inside* a subdirectory needs the write-side traversal a later step adds, so a path with a
-///   subdirectory parent still yields [`FsError::Unsupported`].
+/// - `write`/`remove` create/overwrite or delete a **file** anywhere in the tree — the parent path
+///   is traversed, then the file is written or removed in that directory;
+/// - `mkdir` still creates a subdirectory only in the **root** (Stage 14d-1). Creating a directory
+///   *inside* a subdirectory (Stage 14d-4) and removing one (`rmdir`) are later steps, so a nested
+///   `mkdir` (and any `rmdir`) still yields [`FsError::Unsupported`].
 impl FileSystem for Fat {
     /// Create a subdirectory. Only the root's own children are supported so far; a path with a
-    /// subdirectory *parent* (two or more components) needs the write-side traversal a later step
-    /// adds (the read side traverses since Stage 14d-2, but creating an entry inside a
-    /// subdirectory — and growing it when full — is separate).
+    /// subdirectory *parent* (two or more components) needs directory-creation traversal (Stage
+    /// 14d-4) — the read side (14d-2) and the file write side (14d-3) already traverse, but
+    /// placing a *new subdirectory* inside another, with the right `..` back-link, is separate.
     fn mkdir(&mut self, path: &str) -> Result<(), FsError> {
         let mut comps = crate::fs::components(path);
         match (comps.next(), comps.next()) {
             (None, _) => Err(FsError::Exists), // the volume root already exists
             (Some(name), None) => Ok(self.make_root_dir(name)?),
-            (Some(_), Some(_)) => Err(FsError::Unsupported), // subdirectory parents: write-side TODO
+            (Some(_), Some(_)) => Err(FsError::Unsupported), // subdirectory parents: Stage 14d-4
         }
     }
 
+    /// Create or overwrite a file anywhere in the tree: the parent path is traversed to a
+    /// directory ([`Fat::resolve_dir`]), then the file is written there (Stage 14d-3).
     fn write(&mut self, path: &str, data: &[u8]) -> Result<(), FsError> {
-        let mut comps = crate::fs::components(path);
-        match (comps.next(), comps.next()) {
-            (None, _) => Err(FsError::IsDir),                // cannot write the root itself
-            (Some(name), None) => Ok(self.write_file(name, data)?),
-            (Some(_), Some(_)) => Err(FsError::Unsupported), // no write-side traversal yet
-        }
+        let comps: Vec<&str> = crate::fs::components(path).collect();
+        let (name, parents) = match comps.split_last() {
+            None => return Err(FsError::IsDir), // cannot write the root itself
+            Some(split) => split,
+        };
+        let dir = self.resolve_dir(parents.iter().copied())?;
+        Ok(self.write_file_in(dir, name, data)?)
     }
 
+    /// Remove a file anywhere in the tree: traverse the parent path to a directory, then delete
+    /// the file there (Stage 14d-3). Removing a directory (`rmdir`) is a later step.
     fn remove(&mut self, path: &str) -> Result<(), FsError> {
-        let mut comps = crate::fs::components(path);
-        match (comps.next(), comps.next()) {
-            (None, _) => Err(FsError::IsDir),                // cannot remove the root itself
-            (Some(name), None) => Ok(self.remove_file(name)?),
-            (Some(_), Some(_)) => Err(FsError::Unsupported), // no write-side traversal yet
-        }
+        let comps: Vec<&str> = crate::fs::components(path).collect();
+        let (name, parents) = match comps.split_last() {
+            None => return Err(FsError::IsDir), // cannot remove the root itself
+            Some(split) => split,
+        };
+        let dir = self.resolve_dir(parents.iter().copied())?;
+        Ok(self.remove_file_in(dir, name)?)
     }
 
     /// Read a file anywhere in the tree. All path components but the last are traversed as
@@ -806,17 +812,16 @@ impl Fat {
         Ok(clusters[0])
     }
 
-    /// Search the root directory for an in-use entry named `short`, returning its [`DirSlot`]
-    /// (with `existing` populated) or `None` if there is none. Skips free, deleted, long-name,
-    /// and volume-label entries, and stops at the end-of-directory marker. The shared search
-    /// behind [`find_dir_slot`] (write) and [`remove_file`] (delete).
-    fn find_entry(&self, short: &[u8; 11]) -> Result<Option<DirSlot>, FatError> {
-        let start = self.bpb.root_dir_start_sector();
-        let sectors = self.bpb.root_dir_sectors();
+    /// Search directory `dir` for an in-use entry named `short`, returning its [`DirSlot`] (with
+    /// `existing` populated) or `None` if there is none. Skips free, deleted, long-name, and
+    /// volume-label entries, and stops at the end-of-directory marker. Works on the root or a
+    /// subdirectory (Stage 14d-3) by walking the directory's sectors via [`Fat::dir_sector_lbas`].
+    /// The shared search behind [`find_dir_slot`](Fat::find_dir_slot) (write) and
+    /// [`remove_file_in`](Fat::remove_file_in) (delete).
+    fn find_entry(&self, dir: DirLocation, short: &[u8; 11]) -> Result<Option<DirSlot>, FatError> {
         let mut buf = vec![0u8; SECTOR_SIZE];
 
-        for s in 0..sectors {
-            let lba = start + s;
+        for lba in self.dir_sector_lbas(dir)? {
             ata::read_sector_from(self.drive, lba, &mut buf)?;
             for i in 0..(SECTOR_SIZE / DIR_ENTRY_SIZE) {
                 let off = i * DIR_ENTRY_SIZE;
@@ -841,20 +846,19 @@ impl Fat {
         Ok(None)
     }
 
-    /// Locate the root-directory slot for `short`: the existing entry of that name (to
-    /// overwrite), or the first free slot (to create in). Errors with `DirFull` if the name is
-    /// absent and the directory has no free slot.
-    fn find_dir_slot(&self, short: &[u8; 11]) -> Result<DirSlot, FatError> {
-        if let Some(slot) = self.find_entry(short)? {
+    /// Locate the slot for `short` in directory `dir`: the existing entry of that name (to
+    /// overwrite), or the first free slot (to create in). Works on the root or a subdirectory
+    /// (Stage 14d-3). Errors with `DirFull` if the name is absent and the directory has no free
+    /// slot — a subdirectory that fills its cluster(s) is not yet grown (that is Stage 14d-5), so
+    /// it too reports `DirFull` for now.
+    fn find_dir_slot(&self, dir: DirLocation, short: &[u8; 11]) -> Result<DirSlot, FatError> {
+        if let Some(slot) = self.find_entry(dir, short)? {
             return Ok(slot); // overwrite an existing entry of the same name
         }
 
         // Not present: reuse the first free slot (a deleted 0xE5 entry, or the 0x00 end marker).
-        let start = self.bpb.root_dir_start_sector();
-        let sectors = self.bpb.root_dir_sectors();
         let mut buf = vec![0u8; SECTOR_SIZE];
-        for s in 0..sectors {
-            let lba = start + s;
+        for lba in self.dir_sector_lbas(dir)? {
             ata::read_sector_from(self.drive, lba, &mut buf)?;
             for i in 0..(SECTOR_SIZE / DIR_ENTRY_SIZE) {
                 let off = i * DIR_ENTRY_SIZE;
@@ -867,13 +871,14 @@ impl Fat {
         Err(FatError::DirFull)
     }
 
-    /// Create or overwrite the root-level file `name` with `data`. Overwriting frees the old
-    /// cluster chain first. Fails with `InvalidName` if `name` is not a valid 8.3 name, or
-    /// `IsDirectory` if `name` already names a subdirectory.
-    pub fn write_file(&self, name: &str, data: &[u8]) -> Result<(), FatError> {
+    /// Create or overwrite the file `name` with `data` inside directory `dir` — the root or, since
+    /// Stage 14d-3, a subdirectory. Overwriting frees the old cluster chain first. Fails with
+    /// `InvalidName` if `name` is not a valid 8.3 name, or `IsDirectory` if `name` already names a
+    /// subdirectory.
+    fn write_file_in(&self, dir: DirLocation, name: &str, data: &[u8]) -> Result<(), FatError> {
         let short = string_to_short_name(name).ok_or(FatError::InvalidName)?;
 
-        let slot = self.find_dir_slot(&short)?;
+        let slot = self.find_dir_slot(dir, &short)?;
         if let Some((old_first, is_dir)) = slot.existing {
             if is_dir {
                 return Err(FatError::IsDirectory);
@@ -902,12 +907,13 @@ impl Fat {
         Ok(())
     }
 
-    /// Remove the root-level file `name`: free its cluster chain, then mark its directory entry
-    /// deleted. Fails with `NotFound` if there is no such entry, or `IsDirectory` if `name`
-    /// names a subdirectory (this driver removes only files).
-    pub fn remove_file(&self, name: &str) -> Result<(), FatError> {
+    /// Remove the file `name` from directory `dir` — the root or, since Stage 14d-3, a
+    /// subdirectory: free its cluster chain, then mark its directory entry deleted. Fails with
+    /// `NotFound` if there is no such entry, or `IsDirectory` if `name` names a subdirectory (this
+    /// removes only files; `rmdir` is a later step).
+    fn remove_file_in(&self, dir: DirLocation, name: &str) -> Result<(), FatError> {
         let short = string_to_short_name(name).ok_or(FatError::InvalidName)?;
-        let slot = match self.find_entry(&short)? {
+        let slot = match self.find_entry(dir, &short)? {
             Some(slot) => slot,
             None => return Err(FatError::NotFound),
         };
@@ -986,7 +992,7 @@ impl Fat {
 
         // Reuse the file writer's slot search: it returns the existing entry if the name is taken
         // (which we reject), or the first free root slot to create in (or `DirFull`).
-        let slot = self.find_dir_slot(&short)?;
+        let slot = self.find_dir_slot(DirLocation::Root, &short)?;
         if slot.existing.is_some() {
             return Err(FatError::Exists);
         }

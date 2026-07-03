@@ -330,6 +330,21 @@ pub fn selftest() {
         dispatch(&mut cwd, command);
     }
 
+    // Stage 14d-3: the write path traverses too — create, read, and remove a file *inside* the
+    // subdirectory, exactly as at the root (proving write/rm resolve the parent directory, not
+    // just the root). Self-cleaning, so a reboot starts from the seeded state.
+    sh_println!("[shell selftest] write + remove inside the FAT subdirectory /mnt/SUB:");
+    for command in [
+        "write /mnt/SUB/HELLO2.TXT hi from inside a subdir",
+        "ls /mnt/SUB",
+        "cat /mnt/SUB/HELLO2.TXT",
+        "rm /mnt/SUB/HELLO2.TXT",
+        "ls /mnt/SUB",
+    ] {
+        sh_println!("aether:{}> {}", cwd, command);
+        dispatch(&mut cwd, command);
+    }
+
     // Exercise the interactive key path (echo, Backspace, Enter) by feeding
     // decoded keys through the same `handle_key` the live loop uses. We "type"
     // `echX`, Backspace (erasing the X), then `o hi` and Enter, so the buffer
