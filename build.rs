@@ -9,9 +9,10 @@
 //! Two disks:
 //!  - `scratch.img` (Stage 13b): a small zero-filled disk for the raw ATA sector-write
 //!    experiments. Attached as the primary IDE slave.
-//!  - `fat.img` (Stage 14b): a FAT16-formatted disk holding a known file, so the kernel's
-//!    FAT reader has a real filesystem (produced by the host's `mkfs.fat`) to parse.
-//!    Attached as the secondary IDE master.
+//!  - `fat.img` (Stage 14b): a FAT16-formatted disk holding a known file — plus, since Stage
+//!    14d-2, a subdirectory with a nested file so the kernel's traversal has a real target — so
+//!    the kernel's FAT reader has a real filesystem (produced by the host's `mkfs.fat`) to
+//!    parse. Attached as the secondary IDE master.
 //!
 //! We intentionally emit no `rerun-if-changed` directive: deleting an image then changes the
 //! package fingerprint, so Cargo re-runs this script and recreates it.
@@ -32,6 +33,12 @@ const FAT_SIZE: usize = 5 * 1024 * 1024;
 /// directory entry (`HELLO   TXT`).
 const FAT_FILE_NAME: &str = "HELLO.TXT";
 const FAT_FILE_CONTENT: &str = "Hello from a real FAT16 disk, read by Aether.\n";
+
+/// A subdirectory, and a known file inside it, seeded into the FAT image so the kernel's
+/// subdirectory *traversal* (Stage 14d-2) has a real nested target to find and read.
+const FAT_SUBDIR_NAME: &str = "SUB";
+const FAT_NESTED_NAME: &str = "NESTED.TXT";
+const FAT_NESTED_CONTENT: &str = "Nested file inside a FAT16 subdirectory.\n";
 
 fn main() {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
@@ -92,6 +99,36 @@ fn create_fat_image(path: &Path) {
             .arg(&local)
             .arg(format!("::{}", FAT_FILE_NAME)),
         "mcopy",
+    );
+
+    // Stage 14d-2: seed a subdirectory holding a known file, so the kernel's traversal has a real
+    // nested target. `mmd` makes the directory (a cluster with `.`/`..` plus a root entry); the
+    // second `mcopy` drops a file into it. The kernel reaches it as `/mnt/SUB/NESTED.TXT`.
+    let mmd = resolve_tool("mmd").unwrap_or_else(|| {
+        panic!(
+            "build.rs: `mmd` not found. Install it with `sudo apt install mtools`, or \
+             delete fat.img and rebuild after installing."
+        )
+    });
+    run(
+        Command::new(&mmd)
+            .env("MTOOLS_SKIP_CHECK", "1")
+            .arg("-i")
+            .arg(path)
+            .arg(format!("::{}", FAT_SUBDIR_NAME)),
+        "mmd",
+    );
+
+    let nested = Path::new(&out_dir).join("nested.txt");
+    std::fs::write(&nested, FAT_NESTED_CONTENT).expect("build.rs: failed to write temp nested.txt");
+    run(
+        Command::new(&mcopy)
+            .env("MTOOLS_SKIP_CHECK", "1")
+            .arg("-i")
+            .arg(path)
+            .arg(&nested)
+            .arg(format!("::{}/{}", FAT_SUBDIR_NAME, FAT_NESTED_NAME)),
+        "mcopy (nested)",
     );
 }
 

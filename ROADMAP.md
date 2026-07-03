@@ -369,10 +369,15 @@ unify later.
     bit; the heap was grown 100 KiB → 1 MiB to fit the extra page per stack. This
     immediately exposed — and fixed — a latent bug: the Stage 16d-5 threaded shell was
     overflowing its 4 KiB stack (it now runs on a 32 KiB stack via `spawn_with_stack`).
-  - **FAT `mkdir` — in progress.** Stage 14d-1 creates a *root-level* subdirectory
+  - **FAT subdirectories — in progress.** Stage 14d-1 creates a *root-level* subdirectory
     (`Fat::make_root_dir`: allocate a cluster, initialize it with `.`/`..`, add an
-    `ATTR_DIRECTORY` entry to the root). Still to do: subdirectory *traversal* (so `ls`/`cat`/
-    `write`/`mkdir` work *inside* a subdirectory) and removing a directory (`rmdir`).
+    `ATTR_DIRECTORY` entry to the root). Stage 14d-2 adds **read-path traversal**: a `DirLocation`
+    (the fixed root region *or* a subdirectory cluster chain) unifies directory scanning
+    (`dir_sector_lbas`/`scan_dir`), and `resolve_dir` walks a multi-component path directory by
+    directory, so `read`/`list`/`is_dir` — hence the shell's `cd`/`ls`/`cat` — work *inside* a
+    subdirectory (`build.rs` seeds the image with `SUB/NESTED.TXT` as a real target). Still to do:
+    **write-path traversal** (so `write`/`mkdir` work inside a subdirectory — which also needs a
+    directory to *grow* a cluster when its entries fill up) and removing a directory (`rmdir`).
   - Still open: upgrade `bootloader` 0.9 → 0.11 (framebuffer, modern boot info). (Unifying the
     async executor with the thread scheduler is already done — Stage 16d-5.)
 

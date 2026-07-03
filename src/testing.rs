@@ -454,6 +454,37 @@ fn fat_mkdir_creates_a_directory() {
     assert_eq!(volume.mkdir("/MKDIRT/child"), Err(FsError::Unsupported));
 }
 
+/// Stage 14d-2: read-path traversal into a subdirectory. `build.rs` seeds the image with
+/// `SUB/NESTED.TXT`, so resolving a multi-component path — scanning the root for `SUB`, then
+/// following that subdirectory's own cluster chain — lets `read`/`list`/`is_dir` reach the nested
+/// file, while a file mid-path and a missing directory report the right errors.
+#[test_case]
+fn fat_traverses_subdirectory() {
+    use crate::ata::Drive;
+    use crate::fat::Fat;
+    use crate::fs::{FileSystem, FsError};
+    // Must match FAT_NESTED_CONTENT in build.rs.
+    const NESTED: &[u8] = b"Nested file inside a FAT16 subdirectory.\n";
+
+    let volume = Fat::mount(Drive::SecondaryMaster).expect("mounting the FAT volume failed");
+    let fs: &dyn FileSystem = &volume;
+
+    // The seeded subdirectory is a directory, and traversal reads the nested file's bytes.
+    assert!(fs.is_dir("/SUB"));
+    assert_eq!(fs.read("/SUB/NESTED.TXT").unwrap(), NESTED);
+
+    // Listing the subdirectory shows the nested file and hides the `.`/`..` self/parent links.
+    let entries = fs.list("/SUB").unwrap();
+    assert!(entries.iter().any(|(n, is_dir)| n.as_str() == "NESTED.TXT" && !*is_dir));
+    assert!(!entries.iter().any(|(n, _)| n.as_str() == "." || n.as_str() == ".."));
+
+    // Error paths: a missing name inside the subdirectory and a missing subdirectory are both
+    // NotFound; descending into a regular file (`HELLO.TXT`) is NotDir.
+    assert_eq!(fs.read("/SUB/NOPE.TXT"), Err(FsError::NotFound));
+    assert_eq!(fs.list("/NODIR"), Err(FsError::NotFound));
+    assert_eq!(fs.read("/HELLO.TXT/x"), Err(FsError::NotDir));
+}
+
 /// Stage 14c-1: the FAT driver creates and overwrites a root-level file. Write a payload
 /// spanning several clusters through the global VFS (`/mnt/...`), read it back, and confirm the
 /// bytes round-trip — exercising free-cluster allocation, the cluster chain, and the directory

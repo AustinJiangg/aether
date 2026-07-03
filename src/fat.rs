@@ -59,6 +59,9 @@ pub enum FatError {
     NotFound,
     /// The name resolves to a subdirectory, not a file.
     IsDirectory,
+    /// A path component that must be a directory (to descend into during traversal) turned out
+    /// to be a regular file.
+    NotADirectory,
     /// The cluster chain is malformed: a free/bad cluster appears mid-file, or the chain
     /// never reaches an end-of-chain marker (so it would loop forever).
     BadChain,
@@ -257,13 +260,26 @@ fn short_name_to_string(raw: &[u8]) -> String {
 }
 
 /// The fields of a located directory entry that the reader cares about.
-struct RootEntry {
+struct EntryInfo {
     /// First cluster of the file's data (its head in the FAT chain).
     first_cluster: u16,
     /// File length in bytes, from the directory entry.
     size: u32,
     /// Whether this entry is a subdirectory rather than a regular file.
     is_dir: bool,
+}
+
+/// Which directory to scan. FAT16 keeps the **root** directory in a fixed region of its own, but
+/// a **subdirectory** lives in the data area as a cluster chain — its bytes are 32-byte directory
+/// entries instead of file data. Traversal ([`Fat::resolve_dir`]) walks a path by descending from
+/// `Root` into a `Sub` at each subdirectory component, and the directory scanners
+/// ([`Fat::scan_dir`]) treat the two uniformly.
+#[derive(Clone, Copy)]
+enum DirLocation {
+    /// The fixed-size root directory.
+    Root,
+    /// A subdirectory, named by the first cluster of its chain.
+    Sub(u16),
 }
 
 /// A mounted, read-only FAT16 volume: the drive it lives on plus its parsed geometry
@@ -308,21 +324,53 @@ impl Fat {
         Ok(read_u16(&buf, offset))
     }
 
-    /// Scan the fixed-size root directory, calling `visit` with the formatted 8.3 name and
-    /// the raw 32-byte entry of each in-use file/subdirectory entry — skipping free, deleted,
-    /// long-file-name, and volume-label entries. If `visit` returns `Some`, scanning stops
-    /// and yields that value; otherwise it runs to the end of the directory and yields `None`.
-    /// The shared core of [`find_root_entry`] (search) and [`list_root`] (collect).
-    fn scan_root<T>(
+    /// The LBAs of every sector making up directory `dir`, in order. The root directory is a
+    /// fixed region on FAT16; a subdirectory is a cluster chain in the data area (its bytes are
+    /// directory entries rather than file data), so we follow the FAT chain and gather each
+    /// cluster's sectors. Bounded against a corrupt/looping chain, like [`Fat::read_chain`].
+    fn dir_sector_lbas(&self, dir: DirLocation) -> Result<Vec<u32>, FatError> {
+        match dir {
+            DirLocation::Root => {
+                let start = self.bpb.root_dir_start_sector();
+                Ok((0..self.bpb.root_dir_sectors()).map(|s| start + s).collect())
+            }
+            DirLocation::Sub(first_cluster) => {
+                let mut lbas = Vec::new();
+                let spc = self.bpb.sectors_per_cluster as u32;
+                let max_steps = self.bpb.count_of_clusters() as usize + 2;
+                let mut cluster = first_cluster;
+                let mut steps = 0usize;
+                while is_data_cluster(cluster) {
+                    steps += 1;
+                    if steps > max_steps {
+                        return Err(FatError::BadChain);
+                    }
+                    let lba = self.cluster_lba(cluster);
+                    for s in 0..spc {
+                        lbas.push(lba + s);
+                    }
+                    cluster = self.next_cluster(cluster)?;
+                }
+                Ok(lbas)
+            }
+        }
+    }
+
+    /// Scan directory `dir` (the root or a subdirectory), calling `visit` with the formatted 8.3
+    /// name and the raw 32-byte entry of each in-use file/subdirectory entry — skipping free,
+    /// deleted, long-file-name, and volume-label entries. If `visit` returns `Some`, scanning
+    /// stops and yields that value; otherwise it runs to the end of the directory and yields
+    /// `None`. The shared core of [`find_entry_in`](Fat::find_entry_in) (search) and
+    /// [`list_dir`](Fat::list_dir) (collect).
+    fn scan_dir<T>(
         &self,
+        dir: DirLocation,
         mut visit: impl FnMut(&str, &[u8]) -> Option<T>,
     ) -> Result<Option<T>, FatError> {
-        let start = self.bpb.root_dir_start_sector();
-        let sectors = self.bpb.root_dir_sectors();
         let mut buf = vec![0u8; SECTOR_SIZE];
 
-        for s in 0..sectors {
-            ata::read_sector_from(self.drive, start + s, &mut buf)?;
+        for lba in self.dir_sector_lbas(dir)? {
+            ata::read_sector_from(self.drive, lba, &mut buf)?;
 
             for e in 0..(SECTOR_SIZE / DIR_ENTRY_SIZE) {
                 let entry = &buf[e * DIR_ENTRY_SIZE..(e + 1) * DIR_ENTRY_SIZE];
@@ -349,12 +397,13 @@ impl Fat {
         Ok(None)
     }
 
-    /// Find the root-directory entry named `name` (8.3, ASCII, case-insensitive), or `None`
-    /// if no entry matches. Returns its start cluster, size, and whether it is a subdirectory.
-    fn find_root_entry(&self, name: &str) -> Result<Option<RootEntry>, FatError> {
-        self.scan_root(|entry_name, entry| {
+    /// Find the entry named `name` (8.3, ASCII, case-insensitive) directly inside directory
+    /// `dir`, or `None` if no entry matches. Returns its start cluster, size, and whether it is
+    /// a subdirectory.
+    fn find_entry_in(&self, dir: DirLocation, name: &str) -> Result<Option<EntryInfo>, FatError> {
+        self.scan_dir(dir, |entry_name, entry| {
             if entry_name.eq_ignore_ascii_case(name) {
-                Some(RootEntry {
+                Some(EntryInfo {
                     first_cluster: read_u16(entry, ENTRY_FIRST_CLUSTER_LO_OFFSET),
                     size: read_u32(entry, ENTRY_SIZE_OFFSET),
                     is_dir: entry[ENTRY_ATTR_OFFSET] & ATTR_DIRECTORY != 0,
@@ -365,13 +414,38 @@ impl Fat {
         })
     }
 
-    /// List the root directory as `(name, is_dir)` pairs — every in-use entry it holds.
-    fn list_root(&self) -> Result<Vec<(String, bool)>, FatError> {
+    /// Resolve a sequence of path components to the directory they name, walking from the root.
+    /// This is the heart of subdirectory traversal: at each step it scans the current directory
+    /// for the named child and, if that child is a subdirectory, descends into its cluster chain.
+    /// Every component must exist ([`FatError::NotFound`]) and be a directory
+    /// ([`FatError::NotADirectory`] if a regular file appears mid-path). An empty component
+    /// sequence resolves to the root.
+    fn resolve_dir<'a>(
+        &self,
+        components: impl Iterator<Item = &'a str>,
+    ) -> Result<DirLocation, FatError> {
+        let mut dir = DirLocation::Root;
+        for component in components {
+            match self.find_entry_in(dir, component)? {
+                None => return Err(FatError::NotFound),
+                Some(entry) if entry.is_dir => dir = DirLocation::Sub(entry.first_cluster),
+                Some(_) => return Err(FatError::NotADirectory), // a file cannot be descended into
+            }
+        }
+        Ok(dir)
+    }
+
+    /// List directory `dir` as `(name, is_dir)` pairs — every in-use entry it holds, except the
+    /// `.` and `..` self/parent links (a subdirectory always carries them, but `ls` hides them,
+    /// and the root has none).
+    fn list_dir(&self, dir: DirLocation) -> Result<Vec<(String, bool)>, FatError> {
         let mut entries = Vec::new();
         // `visit` always returns `None`, so the scan runs over the whole directory.
-        self.scan_root(|name, entry| -> Option<()> {
-            let is_dir = entry[ENTRY_ATTR_OFFSET] & ATTR_DIRECTORY != 0;
-            entries.push((String::from(name), is_dir));
+        self.scan_dir(dir, |name, entry| -> Option<()> {
+            if name != "." && name != ".." {
+                let is_dir = entry[ENTRY_ATTR_OFFSET] & ATTR_DIRECTORY != 0;
+                entries.push((String::from(name), is_dir));
+            }
             None
         })?;
         Ok(entries)
@@ -424,7 +498,7 @@ impl Fat {
     /// its bytes. Fails with [`FatError::NotFound`] if there is no such entry, or
     /// [`FatError::IsDirectory`] if the name is a subdirectory rather than a file.
     pub fn read_file(&self, name: &str) -> Result<Vec<u8>, FatError> {
-        match self.find_root_entry(name)? {
+        match self.find_entry_in(DirLocation::Root, name)? {
             None => Err(FatError::NotFound),
             Some(entry) if entry.is_dir => Err(FatError::IsDirectory),
             Some(entry) => self.read_chain(entry.first_cluster, entry.size as usize),
@@ -445,6 +519,7 @@ impl From<FatError> for FsError {
         match e {
             FatError::NotFound => FsError::NotFound,
             FatError::IsDirectory => FsError::IsDir,
+            FatError::NotADirectory => FsError::NotDir,
             FatError::Exists => FsError::Exists,
             FatError::InvalidName => FsError::Unsupported,
             FatError::Io(_)
@@ -461,23 +536,26 @@ impl From<FatError> for FsError {
 /// [`Fat`] behind the VFS [`FileSystem`] trait, so it slots in beside [`RamFs`] and the shell
 /// (or, later, system calls) can read a disk path without knowing which filesystem backs it.
 ///
-/// This driver currently understands only the **root directory** (no subdirectory traversal),
-/// which shapes the implementation:
-/// - `read`/`list`/`is_dir` operate on the root and its entries;
-/// - `write` creates or overwrites a root-level file (Stage 14c-1);
-/// - `remove` deletes a root-level file (Stage 14c-2);
-/// - `mkdir` creates a root-level subdirectory (Stage 14d-1); creating one *inside* another
-///   subdirectory needs traversal this driver does not have yet, so it — like any other path
-///   that descends into a subdirectory — yields [`FsError::Unsupported`].
+/// The **read** side now traverses subdirectories (Stage 14d-2): `read`/`list`/`is_dir` resolve a
+/// multi-component path by scanning each directory in turn (see [`Fat::resolve_dir`]). The
+/// **write** side is still root-only:
+/// - `read` reads a file anywhere in the tree; `list`/`is_dir` operate on any directory;
+/// - `write` creates or overwrites a **root-level** file (Stage 14c-1);
+/// - `remove` deletes a **root-level** file (Stage 14c-2);
+/// - `mkdir` creates a **root-level** subdirectory (Stage 14d-1). Writing, creating, or removing
+///   *inside* a subdirectory needs the write-side traversal a later step adds, so a path with a
+///   subdirectory parent still yields [`FsError::Unsupported`].
 impl FileSystem for Fat {
     /// Create a subdirectory. Only the root's own children are supported so far; a path with a
-    /// subdirectory *parent* (two or more components) needs traversal (Stage 14d-2).
+    /// subdirectory *parent* (two or more components) needs the write-side traversal a later step
+    /// adds (the read side traverses since Stage 14d-2, but creating an entry inside a
+    /// subdirectory — and growing it when full — is separate).
     fn mkdir(&mut self, path: &str) -> Result<(), FsError> {
         let mut comps = crate::fs::components(path);
         match (comps.next(), comps.next()) {
             (None, _) => Err(FsError::Exists), // the volume root already exists
             (Some(name), None) => Ok(self.make_root_dir(name)?),
-            (Some(_), Some(_)) => Err(FsError::Unsupported), // subdirectory parents: Stage 14d-2
+            (Some(_), Some(_)) => Err(FsError::Unsupported), // subdirectory parents: write-side TODO
         }
     }
 
@@ -486,7 +564,7 @@ impl FileSystem for Fat {
         match (comps.next(), comps.next()) {
             (None, _) => Err(FsError::IsDir),                // cannot write the root itself
             (Some(name), None) => Ok(self.write_file(name, data)?),
-            (Some(_), Some(_)) => Err(FsError::Unsupported), // no subdirectory traversal yet
+            (Some(_), Some(_)) => Err(FsError::Unsupported), // no write-side traversal yet
         }
     }
 
@@ -495,41 +573,39 @@ impl FileSystem for Fat {
         match (comps.next(), comps.next()) {
             (None, _) => Err(FsError::IsDir),                // cannot remove the root itself
             (Some(name), None) => Ok(self.remove_file(name)?),
-            (Some(_), Some(_)) => Err(FsError::Unsupported), // no subdirectory traversal yet
+            (Some(_), Some(_)) => Err(FsError::Unsupported), // no write-side traversal yet
         }
     }
 
-    /// Read a root-level file. The root itself (`/`) is a directory, not a file; a path with
-    /// two or more components would need subdirectory traversal this driver does not do yet.
+    /// Read a file anywhere in the tree. All path components but the last are traversed as
+    /// directories ([`Fat::resolve_dir`]), then the last is looked up as a file in that
+    /// directory. The root itself (`/`) is a directory, not a file.
     fn read(&self, path: &str) -> Result<Vec<u8>, FsError> {
-        let mut comps = crate::fs::components(path);
-        match (comps.next(), comps.next()) {
-            (None, _) => Err(FsError::IsDir),            // "/" is the root directory
-            (Some(name), None) => Ok(self.read_file(name)?), // FatError -> FsError via `?`
-            (Some(_), Some(_)) => Err(FsError::Unsupported), // no subdirectory traversal yet
+        let comps: Vec<&str> = crate::fs::components(path).collect();
+        let (name, parents) = match comps.split_last() {
+            None => return Err(FsError::IsDir), // "/" is the root directory
+            Some(split) => split,
+        };
+        let dir = self.resolve_dir(parents.iter().copied())?; // FatError -> FsError via `?`
+        match self.find_entry_in(dir, name)? {
+            None => Err(FsError::NotFound),
+            Some(entry) if entry.is_dir => Err(FsError::IsDir),
+            Some(entry) => Ok(self.read_chain(entry.first_cluster, entry.size as usize)?),
         }
     }
 
-    /// List the root directory (`/`). Subdirectories are not traversed yet, so any deeper
-    /// path is reported as unsupported.
+    /// List any directory in the tree: traverse the whole path to a directory, then collect its
+    /// entries. A path that names a regular file resolves with [`FsError::NotDir`].
     fn list(&self, path: &str) -> Result<Vec<(String, bool)>, FsError> {
-        if crate::fs::components(path).next().is_none() {
-            Ok(self.list_root()?)
-        } else {
-            Err(FsError::Unsupported)
-        }
+        let dir = self.resolve_dir(crate::fs::components(path))?;
+        Ok(self.list_dir(dir)?)
     }
 
-    /// Whether `path` names a directory: the root always is; a single root-level component is
-    /// iff its entry is flagged a directory; a deeper path cannot be resolved, so it is not.
+    /// Whether `path` names a directory: it does iff the whole path resolves to one (the root, or
+    /// a subdirectory reached by traversal). Any lookup error — a missing component, or a regular
+    /// file where a directory was expected — reads as "not a directory".
     fn is_dir(&self, path: &str) -> bool {
-        let mut comps = crate::fs::components(path);
-        match (comps.next(), comps.next()) {
-            (None, _) => true, // the root directory
-            // A lookup error (or a missing entry) reads as "not a directory".
-            (Some(name), None) => matches!(self.find_root_entry(name), Ok(Some(e)) if e.is_dir),
-            (Some(_), Some(_)) => false,
-        }
+        self.resolve_dir(crate::fs::components(path)).is_ok()
     }
 }
 

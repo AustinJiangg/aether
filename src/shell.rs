@@ -312,6 +312,24 @@ pub fn selftest() {
         dispatch(&mut cwd, command);
     }
 
+    // Stage 14d-2: the FAT read path now traverses subdirectories, so cd/ls/cat descend into a
+    // nested directory (SUB/NESTED.TXT, seeded on the disk image by build.rs) exactly as they do
+    // in the root — proving the driver walks a subdirectory's cluster chain, not just the fixed
+    // root region.
+    sh_println!("[shell selftest] subdirectory traversal on the FAT disk under /mnt/SUB:");
+    for command in [
+        "ls /mnt/SUB",
+        "cat /mnt/SUB/NESTED.TXT",
+        "cd /mnt/SUB",
+        "pwd",
+        "ls",
+        "cat NESTED.TXT",
+        "cd /",
+    ] {
+        sh_println!("aether:{}> {}", cwd, command);
+        dispatch(&mut cwd, command);
+    }
+
     // Exercise the interactive key path (echo, Backspace, Enter) by feeding
     // decoded keys through the same `handle_key` the live loop uses. We "type"
     // `echX`, Backspace (erasing the X), then `o hi` and Enter, so the buffer

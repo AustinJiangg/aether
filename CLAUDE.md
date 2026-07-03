@@ -141,7 +141,9 @@ copy), wired into `FileSystem::write` so the shell's `write /mnt/foo` lands on d
 a reboot. **Stage 14c-2 is also done**: `Fat::remove_file` frees a file's cluster chain and
 marks its directory entry deleted, wired into `FileSystem::remove` (so `rm /mnt/foo` works).
 **This completes Stage 14** — an on-disk FAT16 filesystem with read *and* write, coexisting with
-`RamFs` behind the VFS (`mkdir`/subdirectory traversal remain unsupported). **Stage 15a (hardware
+`RamFs` behind the VFS (root-level `mkdir` since Stage 14d-1; Stage 14d-2 adds read-path
+subdirectory traversal, so `cd`/`ls`/`cat` descend into subdirectories — write-path traversal and
+`rmdir` remain). **Stage 15a (hardware
 track) is also done**: the Local APIC and its timer (`apic.rs`) replace the 8259 PIC's timer. It
 maps the LAPIC's MMIO page uncacheable (`NO_CACHE` — device registers must bypass the cache),
 software-enables the APIC via the spurious-vector register, and masks the 8259 PIC, so hardware
@@ -495,9 +497,16 @@ Exit QEMU: `Ctrl-A` then `X`.
   shared `find_entry` backs both lookups. Stage 14d-1 adds `mkdir` at the **root level**:
   `make_root_dir` allocates a cluster, `init_dir_cluster` writes the `.`/`..` entries into it
   (a shared `fill_dir_entry` builds every 32-byte directory entry), and it adds an
-  `ATTR_DIRECTORY` entry to the root — wired into `FileSystem::mkdir` (a nested path, needing
-  traversal, still returns `Unsupported`). Subdirectory *traversal* and removing a directory
-  (`rmdir`) are still `Unsupported`.
+  `ATTR_DIRECTORY` entry to the root — wired into `FileSystem::mkdir`. Stage 14d-2 adds
+  **read-path subdirectory traversal**: a `DirLocation` (the fixed root region *or* a
+  subdirectory cluster chain) unifies directory scanning (`dir_sector_lbas` enumerates a
+  directory's sectors — the root region, or a chain walked via the FAT — feeding a shared
+  `scan_dir`), and `resolve_dir` walks a multi-component path directory by directory, descending
+  from `Root` into `Sub(first_cluster)` at each subdirectory. So `read`/`list`/`is_dir` now reach
+  files *inside* subdirectories (the shell's `cd`/`ls`/`cat` descend into `/mnt/SUB`, a directory
+  `build.rs` seeds on the image as `SUB/NESTED.TXT`; `list` hides the `.`/`..` links). The write
+  path (`write`/`mkdir`/`remove`) is still **root-only** — a subdirectory parent returns
+  `Unsupported` — and `rmdir` is still unsupported.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

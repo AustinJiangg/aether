@@ -582,6 +582,27 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     Err(e) => serial_println!("[fat] VFS list of root failed: {:?}", e),
                 }
 
+                // Stage 14d-2: the read path now traverses subdirectories. `build.rs` seeds the
+                // image with SUB/NESTED.TXT, so resolving that two-component path — scanning the
+                // root for SUB, then walking SUB's own cluster chain — reads the nested file, the
+                // same read a subdirectory `ls`/`cat` performs.
+                match vfs.read("/SUB/NESTED.TXT") {
+                    Ok(bytes) => {
+                        serial_println!(
+                            "[fat] traversed /SUB, read NESTED.TXT ({} bytes):",
+                            bytes.len()
+                        );
+                        if let Ok(text) = core::str::from_utf8(&bytes) {
+                            serial_print!("{}", text);
+                        }
+                        println!("FAT16 subdirectory traversal: read /mnt/SUB/NESTED.TXT off disk");
+                    }
+                    Err(e) => {
+                        serial_println!("[fat] traversing /SUB/NESTED.TXT failed: {:?}", e);
+                        println!("FAT16 subdirectory traversal FAILED: {:?}", e);
+                    }
+                }
+
                 // Stage 14b-3: mount the FAT volume into the VFS at /mnt, so the interactive
                 // shell's `ls`/`cat` reach disk files through the same `fs::*` API as the
                 // in-memory tree. From here `/mnt/HELLO.TXT` reads this disk live.
