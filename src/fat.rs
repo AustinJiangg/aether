@@ -66,6 +66,8 @@ pub enum FatError {
     NoSpace,
     /// The root directory has no free entry left for a new file.
     DirFull,
+    /// Tried to create a directory (or file) at a name that already exists.
+    Exists,
     /// The requested name does not fit FAT's 8.3 short-name form (empty, an over-long base or
     /// extension, more than one `.`, or a disallowed character).
     InvalidName,
@@ -443,6 +445,7 @@ impl From<FatError> for FsError {
         match e {
             FatError::NotFound => FsError::NotFound,
             FatError::IsDirectory => FsError::IsDir,
+            FatError::Exists => FsError::Exists,
             FatError::InvalidName => FsError::Unsupported,
             FatError::Io(_)
             | FatError::BadSignature
@@ -463,11 +466,19 @@ impl From<FatError> for FsError {
 /// - `read`/`list`/`is_dir` operate on the root and its entries;
 /// - `write` creates or overwrites a root-level file (Stage 14c-1);
 /// - `remove` deletes a root-level file (Stage 14c-2);
-/// - `mkdir` is not supported, and a path that descends into a subdirectory yields
-///   [`FsError::Unsupported`].
+/// - `mkdir` creates a root-level subdirectory (Stage 14d-1); creating one *inside* another
+///   subdirectory needs traversal this driver does not have yet, so it — like any other path
+///   that descends into a subdirectory — yields [`FsError::Unsupported`].
 impl FileSystem for Fat {
-    fn mkdir(&mut self, _path: &str) -> Result<(), FsError> {
-        Err(FsError::Unsupported) // creating subdirectories is not supported
+    /// Create a subdirectory. Only the root's own children are supported so far; a path with a
+    /// subdirectory *parent* (two or more components) needs traversal (Stage 14d-2).
+    fn mkdir(&mut self, path: &str) -> Result<(), FsError> {
+        let mut comps = crate::fs::components(path);
+        match (comps.next(), comps.next()) {
+            (None, _) => Err(FsError::Exists), // the volume root already exists
+            (Some(name), None) => Ok(self.make_root_dir(name)?),
+            (Some(_), Some(_)) => Err(FsError::Unsupported), // subdirectory parents: Stage 14d-2
+        }
     }
 
     fn write(&mut self, path: &str, data: &[u8]) -> Result<(), FsError> {
@@ -567,6 +578,21 @@ fn string_to_short_name(name: &str) -> Option<[u8; 11]> {
         short[8 + i] = short_name_byte(b)?;
     }
     Some(short)
+}
+
+/// Fill a 32-byte directory-entry `slot` from scratch: clear it, then set the 11-byte 8.3
+/// `name`, the attribute byte, the first cluster (low word), and the size. The high cluster
+/// word (FAT16 never uses it) and the date/time fields (this driver does not maintain them)
+/// are left zero. Shared by the file writer and the directory creator.
+fn fill_dir_entry(slot: &mut [u8], name: &[u8; 11], attr: u8, first_cluster: u16, size: u32) {
+    for b in slot.iter_mut() {
+        *b = 0;
+    }
+    slot[0..11].copy_from_slice(name);
+    slot[ENTRY_ATTR_OFFSET] = attr;
+    slot[ENTRY_FIRST_CLUSTER_LO_OFFSET] = (first_cluster & 0xFF) as u8;
+    slot[ENTRY_FIRST_CLUSTER_LO_OFFSET + 1] = (first_cluster >> 8) as u8;
+    slot[ENTRY_SIZE_OFFSET..ENTRY_SIZE_OFFSET + 4].copy_from_slice(&size.to_le_bytes());
 }
 
 /// A located root-directory slot: where a file's 32-byte entry lives, or where a new one goes.
@@ -784,19 +810,17 @@ impl Fat {
         // Write the data as a fresh cluster chain (first cluster 0 for an empty file).
         let first = self.write_chain(data)?;
 
-        // Build the 32-byte directory entry from scratch and write its sector back.
+        // Build the 32-byte directory entry (a regular file) and write its sector back.
         let mut buf = vec![0u8; SECTOR_SIZE];
         ata::read_sector_from(self.drive, slot.lba, &mut buf)?;
         let e = slot.offset;
-        for b in &mut buf[e..e + DIR_ENTRY_SIZE] {
-            *b = 0; // clear the slot: name, dates, attributes, the cluster-high word, etc.
-        }
-        buf[e..e + 11].copy_from_slice(&short);
-        buf[e + ENTRY_ATTR_OFFSET] = ATTR_ARCHIVE;
-        buf[e + ENTRY_FIRST_CLUSTER_LO_OFFSET] = (first & 0xFF) as u8;
-        buf[e + ENTRY_FIRST_CLUSTER_LO_OFFSET + 1] = (first >> 8) as u8;
-        buf[e + ENTRY_SIZE_OFFSET..e + ENTRY_SIZE_OFFSET + 4]
-            .copy_from_slice(&(data.len() as u32).to_le_bytes());
+        fill_dir_entry(
+            &mut buf[e..e + DIR_ENTRY_SIZE],
+            &short,
+            ATTR_ARCHIVE,
+            first,
+            data.len() as u32,
+        );
         ata::write_sector(self.drive, slot.lba, &buf)?;
 
         Ok(())
@@ -823,6 +847,85 @@ impl Fat {
         let mut buf = vec![0u8; SECTOR_SIZE];
         ata::read_sector_from(self.drive, slot.lba, &mut buf)?;
         buf[slot.offset] = NAME_DELETED;
+        ata::write_sector(self.drive, slot.lba, &buf)?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 14d-1: creating directories (mkdir), at the root level.
+//
+// A subdirectory is not stored like the root: it lives in the *data region* as a
+// cluster chain, exactly like a file, but its bytes are an array of 32-byte
+// directory entries. Its first two entries are always `.` (a link to itself) and
+// `..` (a link to its parent), so the tree can be walked in both directions. So
+// "make a directory" is: allocate a cluster, write `.`/`..` into it (the rest zero,
+// i.e. empty), and add a directory entry — with the `ATTR_DIRECTORY` bit set — for it
+// in the parent. This step creates directories only in the *root*; creating one
+// inside another subdirectory needs the traversal that Stage 14d-2 adds.
+// ---------------------------------------------------------------------------
+
+impl Fat {
+    /// Initialize a freshly allocated `cluster` as an empty subdirectory: its first two entries
+    /// are `.` (pointing at itself) and `..` (pointing at the parent — cluster 0 when the parent
+    /// is the root, as FAT records it), and every other byte is zero (a `0x00` first byte is the
+    /// end-of-directory marker), so the directory reads as containing only `.` and `..`.
+    fn init_dir_cluster(&self, cluster: u16, parent_first_cluster: u16) -> Result<(), FatError> {
+        // The `.` and `..` names are `.`/`..` left-justified in the 11-byte 8.3 field, the rest
+        // spaces — the exact bytes a real FAT tool writes.
+        let mut dot = [b' '; 11];
+        dot[0] = b'.';
+        let mut dotdot = [b' '; 11];
+        dotdot[0] = b'.';
+        dotdot[1] = b'.';
+
+        let mut buf = vec![0u8; SECTOR_SIZE];
+        fill_dir_entry(&mut buf[0..DIR_ENTRY_SIZE], &dot, ATTR_DIRECTORY, cluster, 0);
+        fill_dir_entry(
+            &mut buf[DIR_ENTRY_SIZE..2 * DIR_ENTRY_SIZE],
+            &dotdot,
+            ATTR_DIRECTORY,
+            parent_first_cluster,
+            0,
+        );
+
+        let lba = self.cluster_lba(cluster);
+        ata::write_sector(self.drive, lba, &buf)?;
+
+        // Zero any remaining sectors of the cluster (when a cluster is more than one sector), so
+        // every entry beyond `.`/`..` reads as free.
+        let zero = vec![0u8; SECTOR_SIZE];
+        for s in 1..self.bpb.sectors_per_cluster as u32 {
+            ata::write_sector(self.drive, lba + s, &zero)?;
+        }
+        Ok(())
+    }
+
+    /// Create an empty subdirectory named `name` in the **root** directory. Allocates a cluster,
+    /// initializes it with `.`/`..`, then adds a directory entry (with `ATTR_DIRECTORY`) for it in
+    /// the root. Fails with `InvalidName` (not a valid 8.3 name), `Exists` (the name is taken),
+    /// `DirFull` (the root directory has no free slot), or `NoSpace` (the disk is full).
+    pub fn make_root_dir(&self, name: &str) -> Result<(), FatError> {
+        let short = string_to_short_name(name).ok_or(FatError::InvalidName)?;
+
+        // Reuse the file writer's slot search: it returns the existing entry if the name is taken
+        // (which we reject), or the first free root slot to create in (or `DirFull`).
+        let slot = self.find_dir_slot(&short)?;
+        if slot.existing.is_some() {
+            return Err(FatError::Exists);
+        }
+
+        // Give the directory its own cluster and lay down `.`/`..`. The parent is the root, which
+        // FAT records in `..` as cluster 0. (A cluster orphaned by a later I/O error is a benign
+        // leak on this simple driver, as elsewhere in the write path.)
+        let cluster = self.alloc_cluster()?.ok_or(FatError::NoSpace)?;
+        self.init_dir_cluster(cluster, 0)?;
+
+        // Add the directory's entry to the root and write that sector back.
+        let mut buf = vec![0u8; SECTOR_SIZE];
+        ata::read_sector_from(self.drive, slot.lba, &mut buf)?;
+        let e = slot.offset;
+        fill_dir_entry(&mut buf[e..e + DIR_ENTRY_SIZE], &short, ATTR_DIRECTORY, cluster, 0);
         ata::write_sector(self.drive, slot.lba, &buf)?;
         Ok(())
     }

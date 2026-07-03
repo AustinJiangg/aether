@@ -411,8 +411,47 @@ fn fat_satisfies_vfs_trait() {
     assert_eq!(fs.read("/"), Err(FsError::IsDir));
     assert_eq!(fs.read("/NOPE.TXT"), Err(FsError::NotFound));
 
-    // Creating a subdirectory is unsupported (this driver writes only root-level files).
-    assert_eq!(fs.mkdir("/x"), Err(FsError::Unsupported));
+    // Root-level mkdir now works (Stage 14d-1, covered by `fat_mkdir_creates_a_directory`), but
+    // creating a directory *inside* a subdirectory needs traversal we do not have yet.
+    assert_eq!(fs.mkdir("/sub/child"), Err(FsError::Unsupported));
+}
+
+/// Stage 14d-1: the FAT driver creates a subdirectory in the root. `mkdir` allocates a cluster,
+/// writes `.`/`..` into it, and adds an `ATTR_DIRECTORY` entry to the root — so the directory then
+/// shows up in the root listing, `is_dir` agrees, and reading it as a file fails. Uses a fixed
+/// name and tolerates a directory left by a previous run (removing directories is a later step);
+/// a nested directory (subdirectory parent) is still unsupported.
+#[test_case]
+fn fat_mkdir_creates_a_directory() {
+    use crate::ata::Drive;
+    use crate::fat::Fat;
+    use crate::fs::{FileSystem, FsError};
+
+    let mut volume = Fat::mount(Drive::SecondaryMaster).expect("mounting the FAT volume failed");
+
+    // Create the directory, tolerating one persisted by an earlier run.
+    match volume.mkdir("/MKDIRT") {
+        Ok(()) | Err(FsError::Exists) => {}
+        Err(e) => panic!("root-level mkdir failed: {:?}", e),
+    }
+
+    // It appears in the root listing, flagged as a directory...
+    let entries = volume.list("/").unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|(name, is_dir)| name.as_str() == "MKDIRT" && *is_dir),
+        "created directory not found in the root listing"
+    );
+    // ...`is_dir` agrees, and reading it as a file reports it is a directory.
+    assert!(volume.is_dir("/MKDIRT"));
+    assert_eq!(volume.read("/MKDIRT"), Err(FsError::IsDir));
+
+    // Creating it again reports that it already exists.
+    assert_eq!(volume.mkdir("/MKDIRT"), Err(FsError::Exists));
+
+    // A nested directory (a subdirectory parent) is not supported yet (Stage 14d-2).
+    assert_eq!(volume.mkdir("/MKDIRT/child"), Err(FsError::Unsupported));
 }
 
 /// Stage 14c-1: the FAT driver creates and overwrites a root-level file. Write a payload

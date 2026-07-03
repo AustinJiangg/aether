@@ -547,6 +547,21 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     }
                 }
 
+                // Stage 14d-1: mkdir on the FAT disk — create a real subdirectory (a cluster
+                // holding `.`/`..` plus an ATTR_DIRECTORY entry in the root), tolerating one left
+                // by a previous boot (removing a directory comes in a later step), so the listing
+                // below shows it alongside HELLO.TXT.
+                match volume.make_root_dir("BOOTDIR") {
+                    Ok(()) => {
+                        serial_println!("[fat] mkdir /mnt/BOOTDIR: created a subdirectory on disk")
+                    }
+                    Err(fat::FatError::Exists) => {
+                        serial_println!("[fat] mkdir /mnt/BOOTDIR: already exists (previous boot)")
+                    }
+                    Err(e) => serial_println!("[fat] mkdir /mnt/BOOTDIR failed: {:?}", e),
+                }
+                println!("FAT mkdir: created /mnt/BOOTDIR on disk (try 'ls /mnt').");
+
                 // Stage 14b-2b: the FAT volume also implements the VFS `FileSystem` trait, so
                 // it can be driven through a trait object — the very interface `RamFs` uses.
                 // List the root directory through `&dyn FileSystem` to show the dispatch.

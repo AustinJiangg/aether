@@ -492,7 +492,12 @@ Exit QEMU: `Ctrl-A` then `X`.
   `alloc_cluster`/`write_chain`/`write_file` create or overwrite a root-level file (updating
   every FAT copy via `ata::write_sector`), wired into `FileSystem::write`. Stage 14c-2 adds
   `remove_file` (free the chain, mark the entry `0xE5`), wired into `FileSystem::remove`; a
-  shared `find_entry` backs both lookups. `mkdir` and subdirectory traversal stay `Unsupported`.
+  shared `find_entry` backs both lookups. Stage 14d-1 adds `mkdir` at the **root level**:
+  `make_root_dir` allocates a cluster, `init_dir_cluster` writes the `.`/`..` entries into it
+  (a shared `fill_dir_entry` builds every 32-byte directory entry), and it adds an
+  `ATTR_DIRECTORY` entry to the root — wired into `FileSystem::mkdir` (a nested path, needing
+  traversal, still returns `Unsupported`). Subdirectory *traversal* and removing a directory
+  (`rmdir`) are still `Unsupported`.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

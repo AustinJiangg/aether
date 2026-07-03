@@ -369,9 +369,12 @@ unify later.
     bit; the heap was grown 100 KiB → 1 MiB to fit the extra page per stack. This
     immediately exposed — and fixed — a latent bug: the Stage 16d-5 threaded shell was
     overflowing its 4 KiB stack (it now runs on a 32 KiB stack via `spawn_with_stack`).
-  - Still open: upgrade `bootloader` 0.9 → 0.11 (framebuffer, modern boot info); give
-    the FAT driver `mkdir` / subdirectory support. (Unifying the async executor with the
-    thread scheduler is already done — Stage 16d-5.)
+  - **FAT `mkdir` — in progress.** Stage 14d-1 creates a *root-level* subdirectory
+    (`Fat::make_root_dir`: allocate a cluster, initialize it with `.`/`..`, add an
+    `ATTR_DIRECTORY` entry to the root). Still to do: subdirectory *traversal* (so `ls`/`cat`/
+    `write`/`mkdir` work *inside* a subdirectory) and removing a directory (`rmdir`).
+  - Still open: upgrade `bootloader` 0.9 → 0.11 (framebuffer, modern boot info). (Unifying the
+    async executor with the thread scheduler is already done — Stage 16d-5.)
 
 ## References
 
