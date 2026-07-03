@@ -360,9 +360,18 @@ unify later.
 - **Version caveats**: the `x86_64` crate's TSS / MSR APIs, ATA's QEMU wiring, and
   ELF-crate choices have all shifted across versions — verify against current docs
   rather than assuming from memory.
-- Optional, non-blocking refinements: upgrade `bootloader` 0.9 → 0.11 (framebuffer,
-  modern boot info), give kernel thread stacks a guard page, and eventually unify
-  the async executor with the thread scheduler.
+- Optional, non-blocking refinements:
+  - **Guard-paged kernel thread stacks — done.** Each `sched` thread's stack now
+    carries an unmapped guard page just below its usable region (`memory::GuardedStack`),
+    so a stack overflow raises a page fault on the guard page instead of silently
+    corrupting adjacent heap data. Carved out of the heap (the frame allocator cannot
+    reclaim, so a dedicated stack area would leak frames) by toggling only the PRESENT
+    bit; the heap was grown 100 KiB → 1 MiB to fit the extra page per stack. This
+    immediately exposed — and fixed — a latent bug: the Stage 16d-5 threaded shell was
+    overflowing its 4 KiB stack (it now runs on a 32 KiB stack via `spawn_with_stack`).
+  - Still open: upgrade `bootloader` 0.9 → 0.11 (framebuffer, modern boot info); give
+    the FAT driver `mkdir` / subdirectory support. (Unifying the async executor with the
+    thread scheduler is already done — Stage 16d-5.)
 
 ## References
 

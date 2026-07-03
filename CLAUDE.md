@@ -351,11 +351,17 @@ Exit QEMU: `Ctrl-A` then `X`.
   (`install_kernel_allocator`/`with_kernel_frame_allocator`), so the `spawn` syscall can
   load an ELF from inside the trap handler (which cannot borrow `kernel_main`'s locals). Stage 16b-2b
   adds `ensure_identity_mapped`, which maps a low frame to itself (no-op if already mapped) so an AP's
-  trampoline page survives the AP enabling paging.
+  trampoline page survives the AP enabling paging. A later refinement stores the physical-memory offset
+  globally in `init` (so page-table walks work from early boot) and adds guard-paged kernel stacks:
+  `set_page_present`/`page_is_present` (raw-walk the active tables to a leaf PTE and toggle/read its
+  PRESENT bit, TLB-flushing locally, serialized by a lock and with interrupts off) and a `GuardedStack`
+  type — a page-aligned heap allocation whose lowest page is marked not-present as a guard, restored on
+  `Drop` before the memory is freed. `demo_guard_page`/`guard_page_ok` verify it at boot.
 - `src/allocator.rs`: the kernel heap — maps a fixed virtual range to frames and
   registers a `#[global_allocator]` (a hand-written fixed-size block allocator
   over a linked-list fallback), so the `alloc` crate's `Box`/`Vec`/`Rc`/`String`
-  become usable.
+  become usable. `HEAP_SIZE` was grown 100 KiB → 1 MiB to fit the extra guard page
+  each kernel thread stack now carries (`memory::GuardedStack`).
 - `src/task/`: Stage 5 cooperative multitasking — `mod.rs` (`Task` and the unique
   `TaskId`), `simple_executor.rs` (a naive busy-polling executor, kept for
   reference), `keyboard.rs` (the async keyboard: a lock-free scancode queue filled
@@ -381,7 +387,9 @@ Exit QEMU: `Ctrl-A` then `X`.
   length) and indexed by the running core's dense `cpu_index` (`percpu`). `init(n_cpus)` builds one empty
   queue per core (on the BSP, before any AP is woken); `spawn(entry)` fabricates a stack (mirroring Stage
   6's `prepare_stack`, return address = `thread_trampoline`) and enqueues a `Ready` thread on *this*
-  core's queue; the shared `switch_to_next` round-robins to the next ready thread (interrupts off around
+  core's queue — on a `memory::GuardedStack` (an unmapped guard page below the usable stack, so an
+  overflow faults instead of corrupting the heap); `spawn_with_stack` takes an explicit size for a
+  thread with a deep call chain (the shell executor). The shared `switch_to_next` round-robins to the next ready thread (interrupts off around
   the `thread::context_switch`), reached either cooperatively via `yield_now` (the now-`dead_code` API) or
   — Stage 16d-4 — preemptively via `preempt`, which the AP's timer (`interrupts::timer_dispatch`) calls
   each tick (a `try_lock` so a tick during a queue update simply skips). `run_to_completion` registers the
@@ -397,7 +405,9 @@ Exit QEMU: `Ctrl-A` then `X`.
   profiles, so `cargo test` covers it — spawns an async-executor thread (a bounded async task) and a plain
   kernel thread on the BSP run queue and lets the timer preempt them to completion, recording `async_work`/
   `kernel_work` (and BSP `preemptions` via `percpu`). `run_shell_threaded` (non-test) runs the interactive
-  shell as a scheduled thread alongside a coexisting heartbeat thread, forever. Concurrent printing from
+  shell as a scheduled thread alongside a coexisting heartbeat thread, forever — on a 32 KiB stack via
+  `sched::spawn_with_stack` (the deep executor+shell+FAT call chain overflows the default 4 KiB; the
+  guard-page refinement exposed this as a clean fault). Concurrent printing from
   these BSP threads is safe because the VGA/serial writers lock inside `without_interrupts`.
 - `src/shell.rs`: Stage 7-8 interactive shell — an async task that reads decoded
   keystrokes from the keyboard `ScancodeStream`, buffers a line (with Backspace)

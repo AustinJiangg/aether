@@ -312,6 +312,19 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_println!("[ OK ] heap works; Box / Vec / Rc are usable");
     println!("Heap is live; Box / Vec / Rc all work (details on the serial log).");
 
+    // Refinement: guard-paged kernel stacks. Each scheduled kernel thread's stack
+    // now carries an unmapped page just below it, so an overflow faults on the guard
+    // page (a clean #PF that names the address) instead of silently corrupting the
+    // heap. Prove the mechanism here — allocate a guarded stack, confirm the guard
+    // page is unmapped while the usable region is mapped, then free it and confirm
+    // the guard is restored — before the scheduler hands these stacks to real threads.
+    memory::demo_guard_page();
+    serial_println!(
+        "[ OK ] guard-paged kernel stacks verified = {}",
+        memory::guard_page_ok()
+    );
+    println!("Kernel thread stacks now have guard pages (overflow -> page fault).");
+
     // Stage 16a: discover the machine's CPUs via ACPI. So far only the BSP (this
     // core) is running; the others (APs) are halted, waiting for the INIT-SIPI-SIPI
     // wake-up Stage 16b will send. To wake them we need their Local APIC ids, which

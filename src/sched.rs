@@ -29,8 +29,11 @@
 //! need only swap stacks; when the thread is resumed, the stub's epilogue restores that
 //! `TrapFrame` and `iretq`s back to the exact instruction the tick interrupted. (Stage 16d-5
 //! folds the async executor in.)
+//!
+//! Each thread's stack is a [`crate::memory::GuardedStack`]: the usable region with an
+//! unmapped guard page just below it, so a stack overflow raises a page fault on the guard
+//! page instead of silently corrupting adjacent heap data.
 
-use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
@@ -38,18 +41,21 @@ use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use spin::{Mutex, MutexGuard};
 use x86_64::instructions::interrupts;
 
+use crate::memory::GuardedStack;
 use crate::percpu;
 use crate::thread::context_switch;
 
-/// Size of each scheduled thread's stack, in bytes (4 KiB).
+/// Size of each scheduled thread's *usable* stack, in bytes (4 KiB); below it
+/// [`GuardedStack`] adds one unmapped guard page, so each stack occupies 8 KiB of
+/// heap.
 ///
 /// Deliberately small: these threads do trivial work and a 4 KiB stack absorbs a
 /// timer-interrupt frame comfortably (a kernel thread runs with interrupts on).
 /// The budget matters because every woken AP may run its run queue *concurrently*
 /// — `smp::boot_aps` lets an AP start as soon as it reports online, before the next
 /// is woken — so the worst case is every core's threads alive at once. With 4 CPUs,
-/// `AP_THREADS` threads each, on the small (100 KiB) kernel heap, 4 KiB keeps the
-/// peak well under budget. Stacks are freed when [`run_to_completion`] returns.
+/// `AP_THREADS` threads each at 8 KiB, the 1 MiB kernel heap keeps the peak well
+/// under budget. Stacks are freed when [`run_to_completion`] returns.
 const THREAD_STACK_SIZE: usize = 4 * 1024;
 
 /// A globally-unique thread id, handed out by an atomic counter. Unlike Stage 6's
@@ -75,11 +81,13 @@ enum State {
 /// stack, the saved stack pointer to resume it from, and the function it runs.
 struct KThread {
     state: State,
-    /// Backing memory for the stack. Held only to *own* the allocation for the
-    /// thread's lifetime (and free it on `Drop` when reaped). Empty for the
-    /// bootstrap thread, which runs on the core's existing stack.
+    /// Backing memory for the stack, with an unmapped guard page below its usable
+    /// region (see [`GuardedStack`]) so an overflow faults instead of corrupting the
+    /// heap. Held only to *own* the allocation for the thread's lifetime; its `Drop`
+    /// restores the guard page and frees the memory when the thread is reaped.
+    /// `None` for the bootstrap thread, which runs on the core's existing stack.
     #[allow(dead_code)]
-    stack: Box<[u8]>,
+    stack: Option<GuardedStack>,
     /// The thread's stack pointer while it is *not* running. `context_switch`
     /// writes it on the way out and reads it on the way back in.
     stack_pointer: u64,
@@ -167,24 +175,39 @@ fn this_queue_opt() -> Option<&'static Mutex<RunQueue>> {
     queues().get(index)
 }
 
-/// Spawn a kernel thread that will run `entry` on the **current** core's run queue.
-///
-/// Allocates a stack, fabricates an initial frame on it (see [`prepare_stack`]) so
-/// the first switch into the thread lands in [`thread_trampoline`], then registers
-/// it as `Ready`. Call on the core that should run it (e.g. from `ap_entry`).
+/// Spawn a kernel thread that will run `entry` on the **current** core's run queue,
+/// with the default stack size ([`THREAD_STACK_SIZE`]). For a thread with a deep call
+/// chain, use [`spawn_with_stack`].
 pub fn spawn(entry: fn()) {
+    spawn_with_stack(entry, THREAD_STACK_SIZE);
+}
+
+/// Spawn a kernel thread with an explicit `usable_size` stack (a positive multiple of
+/// the page size), below which a guard page is still added.
+///
+/// Allocates the stack, fabricates an initial frame on it (see [`prepare_stack`]) so
+/// the first switch into the thread lands in [`thread_trampoline`], then registers it
+/// as `Ready`. Call on the core that should run it (e.g. from `ap_entry`).
+///
+/// Use a larger stack for a thread that runs a deep call chain — notably the shell's
+/// async-executor thread, which polls the interactive shell and its filesystem commands
+/// and needs far more room than the tiny AP demo threads.
+pub fn spawn_with_stack(entry: fn(), usable_size: usize) {
     let id = next_id();
-    let mut stack = alloc::vec![0u8; THREAD_STACK_SIZE].into_boxed_slice();
-    // SAFETY: `stack` is freshly allocated, writable, and far larger than the small
-    // fabricated frame `prepare_stack` writes.
-    let stack_pointer = unsafe { prepare_stack(&mut stack) };
+    // A guard-paged stack: `usable_size` usable bytes with an unmapped page just below
+    // them, so an overflow faults on the guard page instead of silently corrupting
+    // adjacent heap data.
+    let mut stack = GuardedStack::new(usable_size);
+    // SAFETY: `usable_mut()` is the freshly allocated, writable usable region (above
+    // the guard page), far larger than the small frame `prepare_stack` writes.
+    let stack_pointer = unsafe { prepare_stack(stack.usable_mut()) };
 
     let mut q = this_queue().lock();
     q.threads.insert(
         id,
         KThread {
             state: State::Ready,
-            stack,
+            stack: Some(stack),
             stack_pointer,
             entry: Some(entry),
             is_bootstrap: false,
@@ -216,7 +239,7 @@ pub fn run_to_completion() {
             bootstrap_id,
             KThread {
                 state: State::Running,
-                stack: Vec::new().into_boxed_slice(),
+                stack: None,
                 stack_pointer: 0,
                 entry: None,
                 is_bootstrap: true,

@@ -24,10 +24,12 @@
 //! to translate addresses. Creating *new* mappings additionally needs a supply of
 //! free physical frames (a frame allocator), which is the next sub-stage (4b).
 
+use alloc::alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bootloader::bootinfo::{MemoryMap, MemoryRegionType};
 use spin::Mutex;
+use x86_64::instructions::tlb;
 use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::structures::paging::{
     FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB,
@@ -52,6 +54,13 @@ use crate::serial_println;
 /// **once**: it produces a `&mut` to the live level-4 table, and a second call
 /// would alias that `&mut`, which is undefined behavior.
 pub unsafe fn init(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
+    // Record the physical-memory-window base globally now, at the very start of
+    // boot, so code far from `kernel_main` (an AP spawning guard-paged stacks, the
+    // guard-page helpers below) can walk the page tables without threading the
+    // offset through by hand. `install_kernel_allocator` stores the same value
+    // again later; doing it here just makes it available from early boot on.
+    PHYSICAL_MEMORY_OFFSET.store(physical_memory_offset.as_u64(), Ordering::SeqCst);
+
     let level_4_table = active_level_4_table(physical_memory_offset);
     // SAFETY: `level_4_table` is the active L4 table we just read from CR3, and
     // (per this function's contract) every physical frame is mapped at
@@ -243,6 +252,282 @@ pub fn create_example_mapping(
     // from `frame_allocator`, which yields exclusively unused frames.
     let map_result = unsafe { mapper.map_to(page, frame, flags, frame_allocator) };
     map_result.expect("map_to failed").flush();
+}
+
+// ---------------------------------------------------------------------------
+// Guard-paged kernel stacks (a refinement over the Stage 6 / 16d heap stacks).
+// ---------------------------------------------------------------------------
+//
+// Kernel-thread stacks (`sched.rs`, and the dormant `thread`) are plain heap
+// allocations. Nothing sits below them but *other heap data*, so a thread that
+// overflows its stack silently scribbles over some unrelated allocation — a
+// corruption that surfaces far away and long after, as an impossible-looking bug.
+//
+// A *guard page* turns that silent corruption into an immediate, precise fault. We
+// allocate one extra page *below* the usable stack and clear its PRESENT bit, so
+// the first push past the end of the stack touches an unmapped page and raises a
+// page fault (#PF) — whose handler prints the faulting address (CR2), pointing
+// straight at the overflow. The stack grows downward, so the guard is the lowest
+// page of the allocation.
+//
+// We carve the guard out of the heap allocation itself, rather than mapping a
+// dedicated stack area, for one concrete reason: `BootInfoFrameAllocator` cannot
+// free frames, so a stack area backed by fresh frames would leak a frame on every
+// thread exit. The heap *can* reclaim, so the guard page is simply a heap page we
+// mark not-present while the stack is alive and restore before freeing it. And
+// because we only ever toggle the PRESENT bit (never the frame), a stale TLB entry
+// on another core is harmless: the mapping still points at the same frame, and no
+// core but the stack's owner ever touches that virtual address.
+
+/// x86-64 base page size (the granularity of a guard page).
+const PAGE_SIZE: usize = 4096;
+/// Bit 7 of a page-table entry: at L3/L2 it marks a huge (1 GiB / 2 MiB) page, so
+/// the walk stops rather than mistaking it for a pointer to the next-level table.
+const ENTRY_HUGE_PAGE: u64 = 1 << 7;
+/// Bits 12..52 of a page-table entry hold the physical address of the next-level
+/// table (or the mapped frame); the remaining bits are flags.
+const ENTRY_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
+
+/// Serializes the read-modify-write of a leaf page-table entry across cores. Each
+/// guard page is a distinct entry, so edits never actually collide; this is cheap
+/// insurance that a page-table write is atomic with respect to any other. Never
+/// taken from an interrupt handler, and never held across a heap-allocator call, so
+/// it cannot deadlock against the timer or the heap lock.
+static PT_EDIT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Walk the active page tables to the *leaf* (L1) entry mapping `virt`, and return a
+/// raw pointer to that 8-byte entry — regardless of whether the leaf itself is
+/// present, so the caller can toggle its PRESENT bit either way. Returns `None` if
+/// an intermediate level is missing or is a huge page (neither happens for a 4 KiB
+/// heap mapping).
+///
+/// Uses raw `u64` reads through the physical-memory window — never a `&PageTable` —
+/// on purpose: `init` already handed out the one `&mut` to the active L4, so any
+/// reference here would alias it (undefined behavior). This mirrors
+/// [`AddressSpace::new_cloning_kernel`].
+///
+/// # Safety
+///
+/// The physical-memory offset must be installed (true after [`init`]) and all of
+/// physical memory mapped at it, so each table frame is readable at `offset + phys`.
+unsafe fn leaf_pte_ptr(virt: VirtAddr) -> Option<*mut u64> {
+    let offset = physical_memory_offset().as_u64();
+    let va = virt.as_u64();
+    // The four 9-bit table indices packed into the virtual address.
+    let index = [
+        ((va >> 39) & 0x1FF) as usize, // L4 (PML4)
+        ((va >> 30) & 0x1FF) as usize, // L3 (PDPT)
+        ((va >> 21) & 0x1FF) as usize, // L2 (PD)
+        ((va >> 12) & 0x1FF) as usize, // L1 (PT)
+    ];
+
+    // Start at the active L4 frame (from CR3) and descend three levels to the L1.
+    let (l4_frame, _) = Cr3::read();
+    let mut table_phys = l4_frame.start_address().as_u64();
+    for level in 0..3 {
+        let table = (offset + table_phys) as *const u64;
+        // SAFETY: `table` addresses a page-table frame through the physical-memory
+        // window, so all 512 entries are readable; we only read.
+        let entry = table.add(index[level]).read();
+        if entry & ENTRY_PRESENT == 0 || entry & ENTRY_HUGE_PAGE != 0 {
+            return None;
+        }
+        table_phys = entry & ENTRY_ADDR_MASK;
+    }
+    // `table_phys` now names the L1 table; return a pointer to its leaf entry.
+    let l1 = (offset + table_phys) as *mut u64;
+    Some(l1.add(index[3]))
+}
+
+/// Set or clear the PRESENT bit on the 4 KiB page containing `virt`, in the active
+/// address space, and flush this core's TLB for it. Used to punch a guard page out
+/// of a stack allocation (clear) and to restore it before the memory is freed (set).
+///
+/// # Safety
+///
+/// `virt` must lie in a 4 KiB mapping of the active space (a heap page here), and
+/// clearing PRESENT is only sound if nothing accesses the page while it is cleared
+/// — which holds for a guard page (the usable stack begins one page above it).
+pub unsafe fn set_page_present(virt: VirtAddr, present: bool) {
+    // Disable this core's interrupts for the whole edit (so the timer cannot preempt
+    // us while we hold the lock) and serialize across cores with `PT_EDIT_LOCK`.
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let _guard = PT_EDIT_LOCK.lock();
+        // SAFETY: the caller guarantees `virt` is a 4 KiB mapping of the active space
+        // and the physical-memory window is installed.
+        let pte = unsafe { leaf_pte_ptr(virt) }
+            .expect("set_page_present: address is not a 4 KiB mapping");
+        // SAFETY: `pte` points at a live leaf page-table entry (see `leaf_pte_ptr`).
+        let mut entry = unsafe { pte.read() };
+        if present {
+            entry |= ENTRY_PRESENT;
+        } else {
+            entry &= !ENTRY_PRESENT;
+        }
+        // SAFETY: we write back a valid entry — only the PRESENT bit changed, the
+        // frame address and other flags are untouched.
+        unsafe { pte.write(entry) };
+        // The CPU may have cached the old translation; flush this page so the change
+        // takes effect on the running core. Other cores never touch a guard page and
+        // the frame is unchanged, so no cross-core TLB shootdown is needed.
+        tlb::flush(virt);
+    });
+}
+
+/// Whether the 4 KiB page containing `virt` is currently present in the active
+/// space. Reads the leaf entry directly (not the TLB), so it reflects the true
+/// mapping. For the guard-page demo and test.
+pub fn page_is_present(virt: VirtAddr) -> bool {
+    // SAFETY: after `init` the physical-memory window is mapped, so the walk is
+    // sound; we only read the entry.
+    match unsafe { leaf_pte_ptr(virt) } {
+        Some(pte) => {
+            let entry = unsafe { pte.read() };
+            entry & ENTRY_PRESENT != 0
+        }
+        None => false,
+    }
+}
+
+/// A kernel-thread stack with an unmapped **guard page** just below its usable
+/// region, so a stack overflow faults immediately instead of corrupting the heap.
+///
+/// Layout (low → high address):
+///
+/// ```text
+/// [ guard page (unmapped) ][ usable stack (mapped) ]
+/// ^base                    ^base + PAGE_SIZE        ^base + PAGE_SIZE + usable_size
+/// ```
+///
+/// The stack pointer starts near the high end and grows downward; crossing below
+/// `base + PAGE_SIZE` lands in the guard page and raises #PF. The whole thing is one
+/// page-aligned heap allocation; [`Drop`] restores the guard page's mapping and
+/// returns the memory to the heap.
+pub struct GuardedStack {
+    /// Base (lowest address) of the allocation — the guard page. Page-aligned.
+    base: *mut u8,
+    /// The exact layout `base` was allocated with (needed to free it).
+    layout: Layout,
+    /// Usable bytes above the guard page.
+    usable_size: usize,
+}
+
+// SAFETY: a `GuardedStack` uniquely owns its heap allocation and the page-table
+// state of its guard page; the raw `base` pointer is just that owned allocation.
+// Moving it between threads (it lives in a per-CPU run queue behind a lock) transfers
+// that sole ownership, so sending it across threads is sound.
+unsafe impl Send for GuardedStack {}
+
+impl GuardedStack {
+    /// Allocate a stack with `usable_size` usable bytes (a positive multiple of the
+    /// page size) plus one guard page below it. Aborts via `handle_alloc_error` if
+    /// the heap is exhausted.
+    pub fn new(usable_size: usize) -> GuardedStack {
+        assert!(
+            usable_size > 0 && usable_size % PAGE_SIZE == 0,
+            "guarded stack size must be a positive multiple of the page size"
+        );
+        let total = usable_size + PAGE_SIZE; // one guard page below the usable stack
+        let layout =
+            Layout::from_size_align(total, PAGE_SIZE).expect("guarded stack layout is valid");
+
+        // SAFETY: `layout` has nonzero size. `alloc_zeroed` returns a page-aligned
+        // block of mapped, writable heap memory (align == PAGE_SIZE forces the
+        // linked-list fallback, which honors alignment) or null on OOM.
+        let base = unsafe { alloc_zeroed(layout) };
+        if base.is_null() {
+            handle_alloc_error(layout);
+        }
+
+        // Punch out the guard page: clear PRESENT on the lowest page. An overflow
+        // that runs off the bottom of the usable stack now faults here.
+        // SAFETY: `base` is page-aligned and was just mapped by the allocator; we
+        // toggle only its PRESENT bit and never touch the page while it is cleared
+        // (the usable stack begins one page above). Restored in `Drop` before free.
+        unsafe {
+            set_page_present(VirtAddr::new(base as u64), false);
+        }
+
+        GuardedStack {
+            base,
+            layout,
+            usable_size,
+        }
+    }
+
+    /// The usable stack region (above the guard page) as a writable slice, for
+    /// fabricating the initial thread frame into its top.
+    pub fn usable_mut(&mut self) -> &mut [u8] {
+        // SAFETY: `[base + PAGE_SIZE, base + PAGE_SIZE + usable_size)` is mapped,
+        // owned by this `GuardedStack`, and unaliased while `&mut self` is held.
+        unsafe { core::slice::from_raw_parts_mut(self.base.add(PAGE_SIZE), self.usable_size) }
+    }
+
+    /// Virtual address of the guard page (the lowest, unmapped page).
+    pub fn guard_page(&self) -> VirtAddr {
+        VirtAddr::new(self.base as u64)
+    }
+
+    /// Lowest *usable* stack address (one page above the guard page).
+    pub fn usable_bottom(&self) -> VirtAddr {
+        VirtAddr::new(self.base as u64 + PAGE_SIZE as u64)
+    }
+}
+
+impl Drop for GuardedStack {
+    fn drop(&mut self) {
+        // Restore the guard page's mapping *before* freeing: the allocator writes its
+        // free-list bookkeeping across the whole region, including this page.
+        // SAFETY: we cleared PRESENT on this same page in `new`; setting it again
+        // restores the original mapping (the frame was never changed).
+        unsafe {
+            set_page_present(self.guard_page(), true);
+        }
+        // SAFETY: `base`/`layout` are exactly what `alloc_zeroed` returned in `new`,
+        // and the whole region is mapped again, so the allocator may reuse it.
+        unsafe {
+            dealloc(self.base, self.layout);
+        }
+    }
+}
+
+/// Set once [`demo_guard_page`] has confirmed a guarded stack is fault-armed: its
+/// guard page is unmapped, its usable region is mapped, and the guard page is
+/// remapped after the stack is freed. Read by the guard-page test.
+static GUARD_PAGE_OK: AtomicBool = AtomicBool::new(false);
+
+/// Whether the boot-time guard-page check passed.
+pub fn guard_page_ok() -> bool {
+    GUARD_PAGE_OK.load(Ordering::SeqCst)
+}
+
+/// Guard-page demonstration: allocate a guarded stack, verify the page below the
+/// usable region is unmapped (so an overflow would fault) while the usable region is
+/// mapped, then free it and verify the guard page is restored (so the heap can
+/// safely reuse the memory). Records the outcome for [`guard_page_ok`].
+///
+/// Call after the heap is up and the physical-memory offset is installed.
+pub fn demo_guard_page() {
+    let stack = GuardedStack::new(PAGE_SIZE); // one usable page + one guard page
+    let guard = stack.guard_page();
+    let usable = stack.usable_bottom();
+
+    let guard_unmapped = !page_is_present(guard);
+    let usable_mapped = page_is_present(usable);
+
+    drop(stack); // frees the allocation; `Drop` remaps the guard page first
+    let guard_restored = page_is_present(guard);
+
+    let ok = guard_unmapped && usable_mapped && guard_restored;
+    GUARD_PAGE_OK.store(ok, Ordering::SeqCst);
+    serial_println!(
+        "[stack] guard page @ {:?} unmapped = {}, usable @ {:?} mapped = {}, restored on free = {}",
+        guard,
+        guard_unmapped,
+        usable,
+        usable_mapped,
+        guard_restored,
+    );
 }
 
 // ---------------------------------------------------------------------------

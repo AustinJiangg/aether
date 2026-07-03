@@ -550,6 +550,35 @@ fn ap_comes_online() {
     assert!(crate::smp::aps_online() >= 1);
 }
 
+/// Refinement: guard-paged kernel stacks. A scheduled kernel thread's stack has an
+/// unmapped guard page just below its usable region, so an overflow raises a page fault
+/// instead of silently corrupting the heap. This checks the mechanism directly — a fresh
+/// `GuardedStack` has its guard page unmapped and its usable region mapped, and freeing it
+/// restores the guard page's mapping (so the heap can safely reuse the memory) — and also
+/// confirms the boot-time `demo_guard_page` check passed.
+#[test_case]
+fn thread_stack_has_guard_page() {
+    use crate::memory::{self, GuardedStack};
+
+    // The boot demo (run before the tests, from `kernel_main`) confirmed the whole
+    // allocate / unmap / restore cycle end to end.
+    assert!(memory::guard_page_ok(), "boot-time guard-page check failed");
+
+    // And check it directly on a fresh stack: guard page unmapped, usable mapped.
+    let stack = GuardedStack::new(4096);
+    let guard = stack.guard_page();
+    let usable = stack.usable_bottom();
+    assert!(!memory::page_is_present(guard), "guard page should be unmapped");
+    assert!(memory::page_is_present(usable), "usable stack should be mapped");
+
+    // Freeing the stack restores the guard page's mapping.
+    drop(stack);
+    assert!(
+        memory::page_is_present(guard),
+        "guard page should be remapped after the stack is freed"
+    );
+}
+
 /// Stage 16c: every application processor was woken — not just one — and each has its
 /// own per-CPU data block. Boot calls `percpu::init` for all four cores, then
 /// `smp::boot_aps` wakes all three APs; each AP enters `ap_entry`, finds its own block by

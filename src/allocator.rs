@@ -35,8 +35,12 @@ use x86_64::VirtAddr;
 /// arbitrary; it only has to be unused and clear of everything the bootloader
 /// mapped (and of the demo mapping from Stage 4b).
 pub const HEAP_START: usize = 0x_4444_4444_0000;
-/// How big the heap is: 100 KiB, plenty for early experiments.
-pub const HEAP_SIZE: usize = 100 * 1024;
+/// How big the heap is: 1 MiB. It started at 100 KiB, but guard-paged kernel
+/// thread stacks (see [`crate::memory::GuardedStack`]) cost an extra page each, and
+/// every core may run a few threads at once, so the heap was grown to keep a
+/// comfortable margin. Backed by 256 physical frames at boot — trivial for the
+/// machine's RAM.
+pub const HEAP_SIZE: usize = 1024 * 1024;
 
 /// The global allocator instance. `#[global_allocator]` wires it into `alloc`:
 /// every `Box::new`, `Vec::push`, etc. ultimately calls this value's

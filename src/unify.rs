@@ -113,6 +113,15 @@ pub fn demo() {
     );
 }
 
+/// Usable stack for the shell's async-executor thread. The shell polls a deep chain
+/// (the async executor, line editing, and filesystem/FAT commands), so it needs far
+/// more room than the tiny AP/demo threads' default 4 KiB — it overflows that. (Before
+/// guard pages existed, that overflow silently corrupted the heap and then crashed at a
+/// garbage address; now [`crate::memory::GuardedStack`] would fault cleanly on the guard
+/// page, which is how this was found.) 32 KiB gives ample margin for a singleton thread.
+#[cfg(not(test))]
+const SHELL_STACK_SIZE: usize = 32 * 1024;
+
 /// Run the interactive shell as a scheduled kernel thread, forever (non-test).
 ///
 /// This is the real unification: instead of the executor `run()`ing as a separate
@@ -121,9 +130,11 @@ pub fn demo() {
 #[cfg(not(test))]
 pub fn run_shell_threaded() -> ! {
     // Spawn with interrupts off (atomic w.r.t. the timer); `run_to_completion` enables
-    // them. `shell_thread` never finishes, so `run_to_completion` never returns.
+    // them. `shell_thread` never finishes, so `run_to_completion` never returns. The
+    // shell executor gets a large stack (see `SHELL_STACK_SIZE`); the heartbeat thread
+    // does trivial work, so the default stack is plenty.
     int::disable();
-    sched::spawn(shell_thread);
+    sched::spawn_with_stack(shell_thread, SHELL_STACK_SIZE);
     sched::spawn(heartbeat_thread);
     sched::run_to_completion();
     crate::hlt_loop(); // unreachable: shell_thread runs forever
