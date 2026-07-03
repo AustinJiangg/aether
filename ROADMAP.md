@@ -379,9 +379,11 @@ unify later.
     extends the **file write path** the same way: `find_entry`/`find_dir_slot` walk any directory's
     sectors (via `dir_sector_lbas`) and `write_file_in`/`remove_file_in` take a `DirLocation`, so
     `write`/`remove` resolve the parent path and create or delete a file inside a subdirectory
-    (`write /mnt/SUB/x`). Still to do: **`mkdir` inside a subdirectory** (Stage 14d-4, with the
-    right `..` back-link), **growing a directory** past its first cluster when its entries fill up
-    (Stage 14d-5; a full directory reports `DirFull` for now), and removing a directory (`rmdir`).
+    (`write /mnt/SUB/x`). Stage 14d-4 does the same for `mkdir`: `make_dir_in(parent, name)` sets
+    the new directory's `..` back-link to the parent's first cluster (0 for the root), so
+    `mkdir /mnt/SUB/CHILD` — and then `write /mnt/SUB/CHILD/DEEP.TXT` — works. Still to do:
+    **growing a directory** past its first cluster when its entries fill up (Stage 14d-5; a full
+    directory reports `DirFull` for now), and removing a directory (`rmdir`).
   - Still open: upgrade `bootloader` 0.9 → 0.11 (framebuffer, modern boot info). (Unifying the
     async executor with the thread scheduler is already done — Stage 16d-5.)
 

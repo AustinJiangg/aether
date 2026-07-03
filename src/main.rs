@@ -609,6 +609,20 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 fs::mount(Box::new(volume));
                 serial_println!("[fat] mounted the FAT volume at /mnt");
                 println!("FAT volume mounted at /mnt (try: ls /mnt, cat /mnt/HELLO.TXT)");
+
+                // Stage 14d-4: mkdir traverses too — create a directory *inside* the mounted
+                // /mnt/SUB (its `..` pointing back at SUB), tolerating one from a previous boot
+                // since rmdir is a later step.
+                match fs::mkdir("/mnt/SUB/CHILD") {
+                    Ok(()) => {
+                        serial_println!("[fat] mkdir /mnt/SUB/CHILD: created a nested directory on disk")
+                    }
+                    Err(fs::FsError::Exists) => {
+                        serial_println!("[fat] mkdir /mnt/SUB/CHILD: already exists (previous boot)")
+                    }
+                    Err(e) => serial_println!("[fat] mkdir /mnt/SUB/CHILD failed: {:?}", e),
+                }
+                println!("FAT mkdir: created /mnt/SUB/CHILD, a nested directory (try 'ls /mnt/SUB').");
             }
             Err(e) => {
                 serial_println!("[fat] mount failed: {:?}", e);

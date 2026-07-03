@@ -382,8 +382,8 @@ fn fat_reads_known_file() {
 
 /// Stage 14b-2b: the FAT volume implements the `FileSystem` VFS trait, so it can be driven
 /// through a trait object — the same seam `RamFs` slots into (see `ramfs_satisfies_vfs_trait`).
-/// Exercises read/list/is_dir over the root, the FatError -> FsError mapping, and that creating
-/// a subdirectory is unsupported (writing files is covered by `fat_writes_a_file`).
+/// Exercises read/list/is_dir over the root and the FatError -> FsError mapping (writing files is
+/// covered by `fat_writes_a_file`, and subdirectory traversal by `fat_traverses_subdirectory`).
 #[test_case]
 fn fat_satisfies_vfs_trait() {
     use crate::ata::Drive;
@@ -411,9 +411,10 @@ fn fat_satisfies_vfs_trait() {
     assert_eq!(fs.read("/"), Err(FsError::IsDir));
     assert_eq!(fs.read("/NOPE.TXT"), Err(FsError::NotFound));
 
-    // Root-level mkdir now works (Stage 14d-1, covered by `fat_mkdir_creates_a_directory`), but
-    // creating a directory *inside* a subdirectory needs traversal we do not have yet.
-    assert_eq!(fs.mkdir("/sub/child"), Err(FsError::Unsupported));
+    // Root-level mkdir works (Stage 14d-1); nested mkdir now traverses (Stage 14d-4), so a parent
+    // that does not exist resolves to NotFound rather than being rejected as unsupported. (Use a
+    // name that is genuinely absent — `/sub` would case-insensitively match the seeded `SUB`.)
+    assert_eq!(fs.mkdir("/ABSENT/child"), Err(FsError::NotFound));
 }
 
 /// Stage 14d-1: the FAT driver creates a subdirectory in the root. `mkdir` allocates a cluster,
@@ -450,8 +451,9 @@ fn fat_mkdir_creates_a_directory() {
     // Creating it again reports that it already exists.
     assert_eq!(volume.mkdir("/MKDIRT"), Err(FsError::Exists));
 
-    // A nested directory (a subdirectory parent) is not supported yet (Stage 14d-2).
-    assert_eq!(volume.mkdir("/MKDIRT/child"), Err(FsError::Unsupported));
+    // Nested mkdir now traverses (Stage 14d-4, covered by `fat_mkdir_in_subdirectory`); a parent
+    // that does not exist resolves to NotFound.
+    assert_eq!(volume.mkdir("/NOSUCHDIR/child"), Err(FsError::NotFound));
 }
 
 /// Stage 14d-2: read-path traversal into a subdirectory. `build.rs` seeds the image with
@@ -518,6 +520,41 @@ fn fat_writes_into_subdirectory() {
     // Writing under a parent that does not resolve to a directory fails at traversal.
     assert_eq!(fs::write("/mnt/NODIR/x.txt", b"y"), Err(FsError::NotFound));
     assert_eq!(fs::remove("/mnt/NODIR/x.txt"), Err(FsError::NotFound));
+}
+
+/// Stage 14d-4: `mkdir` inside a subdirectory. Create a directory in the seeded `/mnt/SUB`, then
+/// prove it is real and usable: it traverses as a directory, lists in its parent, and the write
+/// path reaches two levels deep (`/mnt/SUB/CHILD/DEEP.TXT`) — which also exercises three-component
+/// traversal (SUB -> CHILD -> file). Tolerates a `CHILD` left by a previous run (rmdir is a later
+/// step) and cleans up the inner file.
+#[test_case]
+fn fat_mkdir_in_subdirectory() {
+    use crate::fs;
+    use crate::fs::FsError;
+
+    match fs::mkdir("/mnt/SUB/CHILD") {
+        Ok(()) | Err(FsError::Exists) => {}
+        Err(e) => panic!("mkdir inside a subdirectory failed: {:?}", e),
+    }
+    // It traverses as a directory and shows up in the parent listing, flagged as one.
+    assert!(fs::is_dir("/mnt/SUB/CHILD"));
+    assert!(!fs::is_dir("/mnt/SUB/NOPE"));
+    let entries = fs::list("/mnt/SUB").unwrap();
+    assert!(entries.iter().any(|(n, is_dir)| n.as_str() == "CHILD" && *is_dir));
+
+    // The write path reaches into the nested directory: create a file two levels down and read it
+    // back, proving the new directory is a genuine, usable subdirectory.
+    let data = b"two levels down".to_vec();
+    fs::write("/mnt/SUB/CHILD/DEEP.TXT", &data).expect("writing into a nested directory failed");
+    assert_eq!(fs::read("/mnt/SUB/CHILD/DEEP.TXT").unwrap(), data);
+    let deep = fs::list("/mnt/SUB/CHILD").unwrap();
+    assert!(deep.iter().any(|(n, is_dir)| n.as_str() == "DEEP.TXT" && !*is_dir));
+
+    // Clean up the file (leaving CHILD, since rmdir is a later step); re-creating CHILD reports it
+    // already exists, and mkdir under an unresolvable parent fails at traversal.
+    fs::remove("/mnt/SUB/CHILD/DEEP.TXT").expect("removing the nested file failed");
+    assert_eq!(fs::mkdir("/mnt/SUB/CHILD"), Err(FsError::Exists));
+    assert_eq!(fs::mkdir("/mnt/NODIR/x"), Err(FsError::NotFound));
 }
 
 /// Stage 14c-1: the FAT driver creates and overwrites a root-level file. Write a payload

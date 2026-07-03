@@ -536,27 +536,27 @@ impl From<FatError> for FsError {
 /// [`Fat`] behind the VFS [`FileSystem`] trait, so it slots in beside [`RamFs`] and the shell
 /// (or, later, system calls) can read a disk path without knowing which filesystem backs it.
 ///
-/// Traversal now reaches both sides. The **read** side (Stage 14d-2) resolves a multi-component
-/// path by scanning each directory in turn (see [`Fat::resolve_dir`]); the **file write** side
-/// (Stage 14d-3) does the same for the parent directory before creating/deleting the file:
+/// Traversal now reaches every operation. The **read** side (Stage 14d-2) resolves a
+/// multi-component path by scanning each directory in turn (see [`Fat::resolve_dir`]); the **write**
+/// side does the same for the parent directory before creating a file (14d-3) or subdirectory
+/// (14d-4):
 /// - `read` reads a file anywhere in the tree; `list`/`is_dir` operate on any directory;
-/// - `write`/`remove` create/overwrite or delete a **file** anywhere in the tree — the parent path
-///   is traversed, then the file is written or removed in that directory;
-/// - `mkdir` still creates a subdirectory only in the **root** (Stage 14d-1). Creating a directory
-///   *inside* a subdirectory (Stage 14d-4) and removing one (`rmdir`) are later steps, so a nested
-///   `mkdir` (and any `rmdir`) still yields [`FsError::Unsupported`].
+/// - `write`/`remove` create/overwrite or delete a **file** anywhere in the tree;
+/// - `mkdir` creates a **subdirectory** anywhere in the tree (its `..` pointing back at the parent).
+///   Removing a directory (`rmdir`) is still a later step, and a directory that fills its first
+///   cluster is not yet grown (Stage 14d-5), so it reports [`FsError::Io`] (`DirFull`).
 impl FileSystem for Fat {
-    /// Create a subdirectory. Only the root's own children are supported so far; a path with a
-    /// subdirectory *parent* (two or more components) needs directory-creation traversal (Stage
-    /// 14d-4) — the read side (14d-2) and the file write side (14d-3) already traverse, but
-    /// placing a *new subdirectory* inside another, with the right `..` back-link, is separate.
+    /// Create a subdirectory anywhere in the tree: the parent path is traversed to a directory
+    /// ([`Fat::resolve_dir`]), then a new subdirectory is created there (Stage 14d-4). Creating the
+    /// volume root itself is [`FsError::Exists`].
     fn mkdir(&mut self, path: &str) -> Result<(), FsError> {
-        let mut comps = crate::fs::components(path);
-        match (comps.next(), comps.next()) {
-            (None, _) => Err(FsError::Exists), // the volume root already exists
-            (Some(name), None) => Ok(self.make_root_dir(name)?),
-            (Some(_), Some(_)) => Err(FsError::Unsupported), // subdirectory parents: Stage 14d-4
-        }
+        let comps: Vec<&str> = crate::fs::components(path).collect();
+        let (name, parents) = match comps.split_last() {
+            None => return Err(FsError::Exists), // the volume root already exists
+            Some(split) => split,
+        };
+        let dir = self.resolve_dir(parents.iter().copied())?;
+        Ok(self.make_dir_in(dir, name)?)
     }
 
     /// Create or overwrite a file anywhere in the tree: the parent path is traversed to a
@@ -935,7 +935,7 @@ impl Fat {
 }
 
 // ---------------------------------------------------------------------------
-// Stage 14d-1: creating directories (mkdir), at the root level.
+// Stage 14d-1 / 14d-4: creating directories (mkdir).
 //
 // A subdirectory is not stored like the root: it lives in the *data region* as a
 // cluster chain, exactly like a file, but its bytes are an array of 32-byte
@@ -943,8 +943,11 @@ impl Fat {
 // `..` (a link to its parent), so the tree can be walked in both directions. So
 // "make a directory" is: allocate a cluster, write `.`/`..` into it (the rest zero,
 // i.e. empty), and add a directory entry — with the `ATTR_DIRECTORY` bit set — for it
-// in the parent. This step creates directories only in the *root*; creating one
-// inside another subdirectory needs the traversal that Stage 14d-2 adds.
+// in the parent. Stage 14d-1 created directories only in the root; Stage 14d-4
+// generalizes this to any parent directory (`make_dir_in`), the crucial detail being
+// that the new directory's `..` must point at the parent's first cluster (0 for the
+// root). `FileSystem::mkdir` resolves the parent path (14d-2's `resolve_dir`) and
+// creates the directory there.
 // ---------------------------------------------------------------------------
 
 impl Fat {
@@ -983,32 +986,45 @@ impl Fat {
         Ok(())
     }
 
-    /// Create an empty subdirectory named `name` in the **root** directory. Allocates a cluster,
-    /// initializes it with `.`/`..`, then adds a directory entry (with `ATTR_DIRECTORY`) for it in
-    /// the root. Fails with `InvalidName` (not a valid 8.3 name), `Exists` (the name is taken),
-    /// `DirFull` (the root directory has no free slot), or `NoSpace` (the disk is full).
-    pub fn make_root_dir(&self, name: &str) -> Result<(), FatError> {
+    /// Create an empty subdirectory named `name` inside directory `parent` — the root or, since
+    /// Stage 14d-4, another subdirectory. Allocates a cluster, initializes it with `.`/`..` (the
+    /// `..` pointing back at `parent`), then adds a directory entry (with `ATTR_DIRECTORY`) for it
+    /// in `parent`. Fails with `InvalidName` (not a valid 8.3 name), `Exists` (the name is taken),
+    /// `DirFull` (the parent has no free slot — a full subdirectory is not grown until Stage
+    /// 14d-5), or `NoSpace` (the disk is full).
+    fn make_dir_in(&self, parent: DirLocation, name: &str) -> Result<(), FatError> {
         let short = string_to_short_name(name).ok_or(FatError::InvalidName)?;
 
         // Reuse the file writer's slot search: it returns the existing entry if the name is taken
-        // (which we reject), or the first free root slot to create in (or `DirFull`).
-        let slot = self.find_dir_slot(DirLocation::Root, &short)?;
+        // (which we reject), or the first free slot in `parent` to create in (or `DirFull`).
+        let slot = self.find_dir_slot(parent, &short)?;
         if slot.existing.is_some() {
             return Err(FatError::Exists);
         }
 
-        // Give the directory its own cluster and lay down `.`/`..`. The parent is the root, which
-        // FAT records in `..` as cluster 0. (A cluster orphaned by a later I/O error is a benign
-        // leak on this simple driver, as elsewhere in the write path.)
+        // Give the directory its own cluster and lay down `.`/`..`. The `..` back-link is the
+        // parent's first cluster — cluster 0 when the parent is the root, as FAT records it. (A
+        // cluster orphaned by a later I/O error is a benign leak on this simple driver, as
+        // elsewhere in the write path.)
         let cluster = self.alloc_cluster()?.ok_or(FatError::NoSpace)?;
-        self.init_dir_cluster(cluster, 0)?;
+        let parent_first = match parent {
+            DirLocation::Root => 0,
+            DirLocation::Sub(first) => first,
+        };
+        self.init_dir_cluster(cluster, parent_first)?;
 
-        // Add the directory's entry to the root and write that sector back.
+        // Add the directory's entry to `parent` and write that sector back.
         let mut buf = vec![0u8; SECTOR_SIZE];
         ata::read_sector_from(self.drive, slot.lba, &mut buf)?;
         let e = slot.offset;
         fill_dir_entry(&mut buf[e..e + DIR_ENTRY_SIZE], &short, ATTR_DIRECTORY, cluster, 0);
         ata::write_sector(self.drive, slot.lba, &buf)?;
         Ok(())
+    }
+
+    /// Create an empty subdirectory named `name` in the **root** directory — the Stage 14d-1 entry
+    /// point, now a thin wrapper over [`Fat::make_dir_in`]. Used by the boot demo.
+    pub fn make_root_dir(&self, name: &str) -> Result<(), FatError> {
+        self.make_dir_in(DirLocation::Root, name)
     }
 }
