@@ -71,6 +71,30 @@
 //! receiver is enabled the card fills buffers silently and advances RDH on its own. This sub-step
 //! builds the ring and verifies it by reading the ring registers back off the card; consuming
 //! received frames comes next.
+//!
+//! ## 17b-4: the transmit (TX) descriptor ring
+//!
+//! Transmission mirrors reception: a **descriptor ring** shared with the card, driven by a head/tail
+//! register pair. The difference is who produces and who consumes — for TX the *driver* fills
+//! descriptors (a frame to send) and the *card* drains them:
+//!
+//! - Each **transmit descriptor** (16 bytes) holds the physical address of a buffer holding a frame,
+//!   its length, and a **command** byte. The driver sets **EOP** (this descriptor ends the frame),
+//!   **IFCS** (have the card append the 4-byte Ethernet CRC), and **RS** (report status — so the
+//!   card writes back a Descriptor-Done (DD) bit we can poll).
+//! - **TDH** (head) is advanced by the card as it transmits descriptors; **TDT** (tail) is advanced
+//!   by the driver to hand new descriptors over. To send: fill the descriptor, then bump TDT past
+//!   it. The card transmits everything in `[TDH, TDT)`, then advances TDH to meet TDT.
+//! - **TDBAL/TDBAH/TDLEN** locate and size the ring; **TCTL** enables the transmitter and sets *pad
+//!   short packets* (so a sub-60-byte frame is padded to the Ethernet minimum) and the collision
+//!   parameters; **TIPG** sets the inter-packet gap.
+//!
+//! Verifying transmission needs no incoming traffic: after we bump TDT the card processes the
+//! descriptor and — because we set RS — writes back its DD bit. Polling DD confirms the frame was
+//! sent, entirely locally. (Under QEMU's SLIRP the frame reaches the host network stack, which drops
+//! our experimental broadcast; nothing comes back until we speak a real protocol, in Stage 18.) The
+//! demo transmits one minimum-length raw Ethernet frame and checks DD; consuming *received* frames
+//! is the next sub-step.
 
 use spin::Mutex;
 use x86_64::{
@@ -125,6 +149,23 @@ const REG_RDLEN: u64 = 0x2808;
 const REG_RDH: u64 = 0x2810;
 /// Receive Descriptor Tail — one past the last descriptor the driver has handed the card.
 const REG_RDT: u64 = 0x2818;
+
+// --- Transmit-path registers (Stage 17b-4) ---
+
+/// Transmit Control: enable the transmitter, pad short packets, and set collision parameters.
+const REG_TCTL: u64 = 0x0400;
+/// Transmit Inter-Packet Gap timing.
+const REG_TIPG: u64 = 0x0410;
+/// Transmit Descriptor Base Address Low — low 32 bits of the ring's physical address.
+const REG_TDBAL: u64 = 0x3800;
+/// Transmit Descriptor Base Address High — high 32 bits of the ring's physical address.
+const REG_TDBAH: u64 = 0x3804;
+/// Transmit Descriptor Length — the ring's size in bytes (a multiple of 128).
+const REG_TDLEN: u64 = 0x3808;
+/// Transmit Descriptor Head — the descriptor the card transmits next (the card advances it).
+const REG_TDH: u64 = 0x3810;
+/// Transmit Descriptor Tail — one past the last descriptor the driver has handed the card.
+const REG_TDT: u64 = 0x3818;
 
 // --- CTRL (Device Control) bits ---
 
@@ -197,6 +238,63 @@ struct RxDesc {
     special: u16,
 }
 
+// --- TCTL (Transmit Control) bits, and TX descriptor command/status bits (Stage 17b-4) ---
+
+/// Transmitter Enable.
+const TCTL_EN: u32 = 1 << 1;
+/// Pad Short Packets — the card pads a frame below 60 bytes up to the Ethernet minimum.
+const TCTL_PSP: u32 = 1 << 3;
+/// Collision Threshold occupies TCTL bits 4-11; Collision Distance bits 12-21.
+const TCTL_CT_SHIFT: u32 = 4;
+const TCTL_COLD_SHIFT: u32 = 12;
+/// Collision Threshold: the manual's recommended value.
+const TCTL_CT: u32 = 0x0F;
+/// Collision Distance: the recommended full-duplex value (QEMU's model ignores it).
+const TCTL_COLD: u32 = 0x40;
+/// Transmit Inter-Packet Gap: the 82540EM's recommended IPGT=10, IPGR1=8, IPGR2=6
+/// (10 | 8<<10 | 6<<20).
+const TIPG_DEFAULT: u32 = 0x0060_200A;
+
+/// TX command bit: End Of Packet — this descriptor is the last of the frame.
+const TXD_CMD_EOP: u8 = 1 << 0;
+/// TX command bit: Insert FCS — the card appends the 4-byte Ethernet CRC.
+const TXD_CMD_IFCS: u8 = 1 << 1;
+/// TX command bit: Report Status — the card writes back the Descriptor-Done bit when finished.
+const TXD_CMD_RS: u8 = 1 << 3;
+/// TX status bit: Descriptor Done — the card has transmitted this descriptor.
+const TXD_STAT_DD: u8 = 1 << 0;
+
+/// Number of transmit descriptors in the ring. 8 x 16 B = 128 B — exactly the minimum TDLEN
+/// alignment, and it fits in a single 4 KiB frame.
+const TX_DESC_COUNT: usize = 8;
+/// Bytes in each transmit buffer — large enough for a full 1518-byte Ethernet frame; one per frame.
+const TX_BUFFER_SIZE: usize = 2048;
+
+/// A legacy transmit descriptor: 16 bytes the driver fills to hand the card a frame to send.
+///
+/// The driver writes `addr` (the physical address of a frame buffer), `length`, and `cmd`
+/// (EOP | IFCS | RS) and clears `status`; the card writes back `status`'s Descriptor-Done (DD) bit
+/// when it has transmitted the frame. `#[repr(C)]` pins the exact 16-byte layout (8 + 2 + 1 + 1 + 1
+/// + 1 + 2 = 16, no padding).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TxDesc {
+    /// Physical address of this descriptor's frame buffer (the card's DMA source).
+    addr: u64,
+    /// Length of the frame to send (without the CRC the card appends).
+    length: u16,
+    /// Checksum offset (unused here).
+    cso: u8,
+    /// Command bits: EOP | IFCS | RS.
+    cmd: u8,
+    /// Status bits (bit 0 = Descriptor Done), written by the card.
+    status: u8,
+    /// Checksum start (unused here).
+    css: u8,
+    /// VLAN / special field (unused here).
+    special: u16,
+}
+
 /// The initialized card, once [`init`] has mapped its registers, reset it, and read its identity.
 /// Stored behind a global so later sub-steps (and the tests) can reach the one card without
 /// threading a handle through boot. The fields are plain data, so this is safe to move into a
@@ -219,6 +317,11 @@ pub struct E1000 {
     rx_ring: u64,
     /// Physical address of the receive descriptor ring — the value programmed into RDBAL/RDBAH.
     rx_ring_phys: u64,
+    /// Virtual address (through the physical-memory window) of the transmit descriptor ring. Zero
+    /// until [`setup_tx`](Self::setup_tx) runs.
+    tx_ring: u64,
+    /// Physical address of the transmit descriptor ring — the value programmed into TDBAL/TDBAH.
+    tx_ring_phys: u64,
 }
 
 impl E1000 {
@@ -463,6 +566,161 @@ impl E1000 {
             && self.rx_descriptor_len() as usize == RX_DESC_COUNT * 16
             && self.receiver_enabled()
     }
+
+    /// Stage 17b-4: build the transmit descriptor ring and enable the transmitter.
+    ///
+    /// Allocates one frame for the ring and one per transmit buffer, pre-fills each descriptor with
+    /// its buffer's physical address (idle — command/status zero), programs the ring's
+    /// base/length/head/tail, and enables the transmitter in TCTL. Like the RX ring, the ring and
+    /// buffers are normal cacheable RAM reached through the physical-memory window (x86 DMA is
+    /// cache-coherent), and the frames are never freed.
+    ///
+    /// # Safety
+    ///
+    /// The MMIO block must be mapped and the physical-memory offset installed (true after
+    /// `memory::init`). Runs during bring-up, before any concurrent transmit.
+    unsafe fn setup_tx(&mut self, frame_allocator: &mut impl FrameAllocator<Size4KiB>) {
+        let phys_offset = crate::memory::physical_memory_offset().as_u64();
+
+        // One frame for the descriptor ring (128 B of descriptors).
+        let ring_frame = frame_allocator
+            .allocate_frame()
+            .expect("no free frame for the e1000 TX descriptor ring");
+        self.tx_ring_phys = ring_frame.start_address().as_u64();
+        self.tx_ring = phys_offset + self.tx_ring_phys;
+
+        // Give each descriptor its own buffer and leave it idle (command/status zero, so head==tail
+        // means the ring is empty and the card transmits nothing yet).
+        for i in 0..TX_DESC_COUNT {
+            let buf = frame_allocator
+                .allocate_frame()
+                .expect("no free frame for an e1000 TX buffer");
+            let desc = TxDesc {
+                addr: buf.start_address().as_u64(),
+                length: 0,
+                cso: 0,
+                cmd: 0,
+                status: 0,
+                css: 0,
+                special: 0,
+            };
+            // SAFETY: `tx_ring + i*16` is the i-th 16-byte descriptor slot of the ring frame, inside
+            // the physical-memory window and 8-byte aligned; the write is volatile.
+            ((self.tx_ring + (i * 16) as u64) as *mut TxDesc).write_volatile(desc);
+        }
+
+        // Point the card at the ring, size it, and start head/tail at 0 (empty ring).
+        self.write_reg(REG_TDBAL, self.tx_ring_phys as u32);
+        self.write_reg(REG_TDBAH, (self.tx_ring_phys >> 32) as u32);
+        self.write_reg(REG_TDLEN, (TX_DESC_COUNT * 16) as u32);
+        self.write_reg(REG_TDH, 0);
+        self.write_reg(REG_TDT, 0);
+
+        // Inter-packet gap, then enable the transmitter: pad short packets to the Ethernet minimum,
+        // and set the recommended collision threshold/distance (QEMU's model ignores the latter).
+        self.write_reg(REG_TIPG, TIPG_DEFAULT);
+        let tctl = TCTL_EN | TCTL_PSP | (TCTL_CT << TCTL_CT_SHIFT) | (TCTL_COLD << TCTL_COLD_SHIFT);
+        self.write_reg(REG_TCTL, tctl);
+    }
+
+    /// Transmit one Ethernet frame and wait (bounded) for the card to confirm it. Copies `frame`
+    /// into the tail descriptor's buffer, sets the descriptor (EOP | IFCS | RS), advances TDT to
+    /// hand it to the card, then polls the Descriptor-Done bit. Returns whether DD was set within
+    /// the timeout. The card appends the CRC (IFCS) and pads short frames (TCTL.PSP).
+    ///
+    /// # Safety
+    ///
+    /// The MMIO block must be mapped and [`setup_tx`](Self::setup_tx) must have run. `frame` must fit
+    /// in a transmit buffer.
+    unsafe fn transmit(&mut self, frame: &[u8]) -> bool {
+        assert!(frame.len() <= TX_BUFFER_SIZE, "frame too large for an e1000 TX buffer");
+        let phys_offset = crate::memory::physical_memory_offset().as_u64();
+
+        // Use the descriptor the tail currently points at.
+        let tail = self.read_reg(REG_TDT) as usize;
+        let desc_ptr = (self.tx_ring + (tail * 16) as u64) as *mut TxDesc;
+
+        // The descriptor's buffer, pre-assigned in `setup_tx`. The card preserves `addr` on
+        // writeback (it only writes the status byte), so reading it back is valid.
+        let buf_phys = (desc_ptr as *const TxDesc).read_volatile().addr;
+        let buf_virt = (phys_offset + buf_phys) as *mut u8;
+        // Copy the frame into the buffer (source and destination never overlap).
+        core::ptr::copy_nonoverlapping(frame.as_ptr(), buf_virt, frame.len());
+
+        // Fill the descriptor: length, command (end-of-packet, insert CRC, report status), DD clear.
+        let desc = TxDesc {
+            addr: buf_phys,
+            length: frame.len() as u16,
+            cso: 0,
+            cmd: TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS,
+            status: 0,
+            css: 0,
+            special: 0,
+        };
+        desc_ptr.write_volatile(desc);
+
+        // Advance the tail (wrapping) to hand the descriptor to the card. The volatile descriptor
+        // write above is ordered before this on x86 (TSO), so the card sees a complete descriptor.
+        let next = ((tail + 1) % TX_DESC_COUNT) as u32;
+        self.write_reg(REG_TDT, next);
+
+        // Poll the Descriptor-Done bit (bounded, ~10 ms) so a stuck card cannot hang the caller.
+        for _ in 0..1000 {
+            if (desc_ptr as *const TxDesc).read_volatile().status & TXD_STAT_DD != 0 {
+                return true;
+            }
+            apic::pit_sleep_us(10);
+        }
+        false
+    }
+
+    /// Physical address of the transmit descriptor ring (what we programmed into TDBAL/TDBAH).
+    pub fn tx_ring_phys(&self) -> u64 {
+        self.tx_ring_phys
+    }
+
+    /// Number of descriptors in the transmit ring.
+    pub fn tx_count(&self) -> usize {
+        TX_DESC_COUNT
+    }
+
+    /// Transmit Descriptor Base Address read back off the card (TDBAH:TDBAL).
+    pub fn tx_descriptor_base(&self) -> u64 {
+        // SAFETY: `init` mapped the MMIO block; TDBAL/TDBAH are valid registers within it.
+        unsafe { (u64::from(self.read_reg(REG_TDBAH)) << 32) | u64::from(self.read_reg(REG_TDBAL)) }
+    }
+
+    /// Transmit Descriptor Length in bytes, read back off the card (TDLEN).
+    pub fn tx_descriptor_len(&self) -> u32 {
+        // SAFETY: `init` mapped the MMIO block; TDLEN is a valid register within it.
+        unsafe { self.read_reg(REG_TDLEN) }
+    }
+
+    /// Transmit Descriptor Head index, read live (the card advances it as it transmits).
+    pub fn tx_head(&self) -> u32 {
+        // SAFETY: `init` mapped the MMIO block; TDH is a valid register within it.
+        unsafe { self.read_reg(REG_TDH) }
+    }
+
+    /// Transmit Descriptor Tail index, read live.
+    pub fn tx_tail(&self) -> u32 {
+        // SAFETY: `init` mapped the MMIO block; TDT is a valid register within it.
+        unsafe { self.read_reg(REG_TDT) }
+    }
+
+    /// Whether the transmitter is enabled (TCTL.EN), read live from the card.
+    pub fn transmitter_enabled(&self) -> bool {
+        // SAFETY: `init` mapped the MMIO block; TCTL is a valid register within it.
+        unsafe { self.read_reg(REG_TCTL) & TCTL_EN != 0 }
+    }
+
+    /// Whether the TX ring is correctly installed: the card's descriptor base and length read back as
+    /// what we programmed, and the transmitter is enabled. One read-back check for the log and test.
+    pub fn tx_ring_installed(&self) -> bool {
+        self.tx_descriptor_base() == self.tx_ring_phys
+            && self.tx_descriptor_len() as usize == TX_DESC_COUNT * 16
+            && self.transmitter_enabled()
+    }
 }
 
 /// Map the e1000's 128 KiB MMIO register block at [`E1000_VIRT_BASE`], uncacheable.
@@ -516,8 +774,21 @@ pub fn init(
     let phys_base = nic.mmio_bar(0)?;
     map_mmio(phys_base, mapper, frame_allocator);
 
-    let mut dev =
-        E1000 { mmio_base: E1000_VIRT_BASE, mac: [0; 6], reset_ok: false, rx_ring: 0, rx_ring_phys: 0 };
+    // Enable PCI bus mastering before any DMA: the descriptor rings and packet buffers are all DMA,
+    // and the card cannot touch host memory until this is set (the command register resets to 0 at
+    // power-on). Without it the card silently reads/writes zeros — descriptors look processed but
+    // nothing is transmitted and no Done status is written back.
+    nic.enable_bus_mastering();
+
+    let mut dev = E1000 {
+        mmio_base: E1000_VIRT_BASE,
+        mac: [0; 6],
+        reset_ok: false,
+        rx_ring: 0,
+        rx_ring_phys: 0,
+        tx_ring: 0,
+        tx_ring_phys: 0,
+    };
 
     // Stage 17b-2: reset the card to a known state, then apply general configuration.
     // SAFETY: `map_mmio` just mapped the register block, so these register accesses are valid, and
@@ -533,6 +804,11 @@ pub fn init(
     // buffers come from the kernel frame allocator and are reached through the physical-memory
     // window, and the physical-memory offset is installed by this point in boot.
     unsafe { dev.setup_rx(frame_allocator) };
+
+    // Stage 17b-4: build the transmit descriptor ring and enable the transmitter.
+    // SAFETY: same conditions as `setup_rx` — the MMIO block is mapped and the frame allocator and
+    // physical-memory window are available.
+    unsafe { dev.setup_tx(frame_allocator) };
 
     let ctrl = dev.control();
     let status = dev.status();
@@ -568,6 +844,16 @@ pub fn init(
         dev.rx_tail(),
         if dev.receiver_enabled() { "enabled" } else { "DISABLED" },
     );
+    serial_println!(
+        "[e1000] TX ring: {} descriptors @ phys {:#x} (TDBA {:#x}, TDLEN {}, TDH {}, TDT {}), transmitter {}",
+        dev.tx_count(),
+        dev.tx_ring_phys(),
+        dev.tx_descriptor_base(),
+        dev.tx_descriptor_len(),
+        dev.tx_head(),
+        dev.tx_tail(),
+        if dev.transmitter_enabled() { "enabled" } else { "DISABLED" },
+    );
 
     *DEVICE.lock() = Some(dev);
     Some(dev)
@@ -581,4 +867,37 @@ pub fn device() -> Option<E1000> {
 /// Whether the e1000 has been brought up.
 pub fn present() -> bool {
     DEVICE.lock().is_some()
+}
+
+/// Stage 17b-4: transmit one raw Ethernet frame through the e1000, if it is up. Returns whether the
+/// card confirmed the transmit (set the descriptor's Done bit) within the timeout.
+pub fn transmit(frame: &[u8]) -> bool {
+    let mut guard = DEVICE.lock();
+    match guard.as_mut() {
+        // SAFETY: the device is initialized, so its MMIO block and TX ring are set up; `transmit`
+        // copies the frame into a TX buffer and hands the descriptor to the card. Interrupts are
+        // masked at the card and a syscall/boot context holds no other e1000 lock, so this cannot
+        // deadlock against a handler.
+        Some(dev) => unsafe { dev.transmit(frame) },
+        None => false,
+    }
+}
+
+/// Stage 17b-4 boot demo / test helper: build a canonical raw Ethernet frame — broadcast
+/// destination, our own MAC as source, an experimental ethertype, and an ASCII payload — and
+/// transmit it. Returns whether the card confirmed the transmit.
+pub fn transmit_test_frame() -> bool {
+    let mac = match device() {
+        Some(dev) => dev.mac,
+        None => return false,
+    };
+    // A minimum-length (60-byte) Ethernet frame; the card appends the 4-byte CRC (IFCS) itself.
+    let mut frame = [0u8; 60];
+    frame[0..6].copy_from_slice(&[0xFF; 6]); // destination: broadcast
+    frame[6..12].copy_from_slice(&mac); // source: our MAC
+    frame[12] = 0x88; // ethertype 0x88B5 (IEEE 802 local-experimental), big-endian
+    frame[13] = 0xB5;
+    let msg = b"aether e1000 raw tx test";
+    frame[14..14 + msg.len()].copy_from_slice(msg);
+    transmit(&frame)
 }

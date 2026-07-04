@@ -395,8 +395,31 @@ unify later.
 > stay masked (no RX handler yet), so the card fills buffers silently and advances RDH on its own. Boot
 > logs "RX ring: 32 descriptors @ phys 0x390000 (RDBA 0x390000, RDLEN 512, RDH 0, RDT 31), receiver
 > enabled". Verified by 47 tests (the new `e1000_sets_up_rx_ring`, which reads RDBAL/RDBAH/RDLEN/RDT/
-> RCTL back off the card and confirms they match the ring we installed). Next (17b-4): consuming
-> received frames (poll RDH / the descriptor Done bit), then the TX ring and the RX interrupt.
+> RCTL back off the card and confirms they match the ring we installed).
+>
+> **Stage 17b-4 is also done** — the transmit (TX) descriptor ring, so the card can *send* a raw
+> Ethernet frame. (The sub-step order was flipped from "consume RX" to "TX first": under QEMU's SLIRP
+> nothing arrives until we send, so TX is the natural, externally-independent next step — DD is a
+> purely local completion signal.) TX mirrors RX: `e1000.rs`'s `setup_tx` allocates a ring and
+> per-descriptor buffers, programs **TDBAL/TDBAH/TDLEN/TDH/TDT**, sets **TIPG** and enables the
+> transmitter in **TCTL** (enable + pad-short-packets + collision params). `transmit(frame)` copies
+> the frame into the tail descriptor's buffer, sets the descriptor command (**EOP | IFCS | RS** — end
+> of packet, let the card append the CRC, report status), advances TDT to ring the doorbell, and polls
+> the descriptor's **Descriptor-Done (DD)** bit. The boot demo/test sends a 60-byte broadcast frame and
+> confirms DD.
+>
+> **The bug that took the most digging: PCI bus mastering was never enabled.** `pci.rs` only ever
+> *read* config space; a NIC's rings and buffers are all DMA, and QEMU's `pci_dma_*` silently
+> reads/writes **zeros** when the device's bus-master bit (PCI command register, offset `0x04`, bit 2)
+> is clear — which it is at power-on. The symptom was maddening: the card advanced TDH and set TXQE
+> (so the descriptor "processed"), but read a *zeroed* descriptor (no RS/EOP), so it never transmitted
+> and never wrote DD. MMIO register access worked throughout because that is Memory-Space Enable, not
+> bus mastering. Fixed by adding `pci::write_config_u32` + `Device::enable_bus_mastering` and calling
+> it in `e1000::init` before any ring setup. (The RX ring had the same latent defect — its test only
+> checks register read-backs, not live DMA.) Verified by 48 tests (the new `e1000_transmits_a_frame`,
+> which sends a frame and asserts DD is set and the ring drains). Next (17b-5): consuming *received*
+> frames — via the card's loopback, or after Stage 18 speaks a protocol SLIRP answers — and the RX
+> interrupt.
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

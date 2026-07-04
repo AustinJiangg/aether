@@ -744,6 +744,41 @@ fn e1000_sets_up_rx_ring() {
     assert!(dev.rx_ring_installed(), "RX ring not installed per the read-back check");
 }
 
+/// Stage 17b-4: the e1000 driver built the transmit descriptor ring and can send a frame. `e1000::init`
+/// (at boot) allocates the TX ring and buffers, programs TDBAL/TDBAH/TDLEN/TDH/TDT, and enables the
+/// transmitter (TCTL). We confirm the ring reads back as installed, then transmit a raw Ethernet frame
+/// and require the card to confirm it — set the descriptor's Done bit and drain the ring (head catches
+/// tail). This needs no incoming traffic: DD is a purely local completion signal.
+#[test_case]
+fn e1000_transmits_a_frame() {
+    use crate::e1000;
+
+    let dev = e1000::device().expect("e1000 not initialized");
+
+    // The TX ring is installed: base and length read back as programmed, transmitter enabled.
+    assert_ne!(dev.tx_ring_phys(), 0, "e1000 TX ring physical address is zero");
+    assert_eq!(
+        dev.tx_descriptor_base(),
+        dev.tx_ring_phys(),
+        "TDBAH:TDBAL does not point at our TX ring"
+    );
+    assert_eq!(
+        dev.tx_descriptor_len() as usize,
+        dev.tx_count() * 16,
+        "TDLEN does not match the ring size in bytes"
+    );
+    assert!(dev.transmitter_enabled(), "transmitter (TCTL.EN) is not enabled");
+    assert!(dev.tx_ring_installed(), "TX ring not installed per the read-back check");
+
+    // Transmit a raw frame; the card must confirm it (Descriptor Done) within the timeout.
+    let sent = e1000::transmit_test_frame();
+    assert!(sent, "card did not set the transmit descriptor Done bit");
+
+    // After transmit the card has drained the ring: head has caught up to tail.
+    let dev = e1000::device().expect("e1000 device handle missing");
+    assert_eq!(dev.tx_head(), dev.tx_tail(), "TX ring not drained after transmit");
+}
+
 /// Stage 14c-1: the FAT driver creates and overwrites a root-level file. Write a payload
 /// spanning several clusters through the global VFS (`/mnt/...`), read it back, and confirm the
 /// bytes round-trip — exercising free-cluster allocation, the cluster chain, and the directory

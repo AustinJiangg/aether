@@ -709,6 +709,24 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                         dev.rx_count(),
                         dev.receiver_enabled(),
                     );
+                    // Stage 17b-4: the transmit ring is armed. Send a raw Ethernet frame and let the
+                    // card confirm it (the transmit descriptor's Done bit) — proof the TX DMA path
+                    // works, with no incoming traffic needed.
+                    serial_println!(
+                        "[ OK ] e1000 TX ring installed = {}, transmitter enabled = {} ({} descriptors)",
+                        dev.tx_ring_installed(),
+                        dev.transmitter_enabled(),
+                        dev.tx_count(),
+                    );
+                    let sent = e1000::transmit_test_frame();
+                    serial_println!(
+                        "[ OK ] e1000 transmitted a raw frame, card confirmed (DD) = {}",
+                        sent,
+                    );
+                    println!(
+                        "Network: e1000 transmitted a raw Ethernet frame (card confirmed = {}).",
+                        sent,
+                    );
                 }
             } else {
                 println!("Network: e1000 found but BAR0 was not a memory BAR (unexpected).");

@@ -209,9 +209,19 @@ broadcast, strip the Ethernet CRC, 2048-byte buffers; unicast to our MAC via Rec
 ring and buffers are **normal cacheable RAM** reached through the physical-memory window (x86 DMA is
 cache-coherent, so only the MMIO registers need the uncacheable mapping); interrupts stay masked (no
 RX handler yet), so the card fills buffers silently. Boot reports "RX ring: 32 descriptors ...
-receiver enabled". `ROADMAP.md` carries the forward plan (stages 9-18): the user-space main line
-(system calls, per-process address spaces + ELF, multiprocessing), plus persistence, APIC/SMP, and
-networking tracks.
+receiver enabled". **Stage 17b-4 is now also done**: the transmit (TX) descriptor ring, so the card
+can *send* a raw Ethernet frame. `e1000.rs`'s `setup_tx` mirrors `setup_rx` (ring + per-descriptor
+buffers, `TDBAL/TDBAH/TDLEN/TDH/TDT`, `TCTL` enable + pad-short-packets); `transmit(frame)` copies the
+frame into the tail descriptor's buffer, sets the command (`EOP | IFCS | RS`), advances TDT to ring
+the doorbell, and polls the Descriptor-Done (DD) bit; the boot demo sends a 60-byte broadcast frame.
+This surfaced a bug latent since 17b-3: **PCI bus mastering was never enabled** — `pci.rs` only read
+config space, and QEMU's `pci_dma_*` silently reads/writes zeros while the device's bus-master bit
+(command register, offset `0x04`, bit 2) is clear, so the card processed a zeroed descriptor (TDH
+advanced, TXQE set) but never transmitted or wrote DD (MMIO worked because that is Memory-Space
+Enable, not bus mastering). Fixed with `pci::write_config_u32` + `Device::enable_bus_mastering`,
+called in `e1000::init` before any ring setup (RX needed it too). `ROADMAP.md` carries the forward
+plan (stages 9-18): the user-space main line (system calls, per-process address spaces + ELF,
+multiprocessing), plus persistence, APIC/SMP, and networking tracks.
 
 ## Language and writing conventions
 
@@ -558,8 +568,10 @@ Exit QEMU: `Ctrl-A` then `X`.
   each `Device` carrying its vendor/device id, class/subclass, prog-IF, and header type; `Device::bar`/
   `mmio_bar` decode a Base Address Register (32- or 64-bit memory BAR) and `interrupt_line` reads the
   assigned IRQ. `find_e1000` locates QEMU's `-device e1000` (vendor `0x8086`, device `0x100E`); boot lists
-  every bus-0 function and reports the NIC's MMIO BAR0 + IRQ, the register block Stage 17b maps. Pure
-  read-only config-space reads, like the ACPI table walk; needs the heap (returns a `Vec`).
+  every bus-0 function and reports the NIC's MMIO BAR0 + IRQ, the register block Stage 17b maps. Stage
+  17b-4 adds config-space *writes*: `write_config_u32` (the mirror of `read_config_u32`) and
+  `Device::enable_bus_mastering`, which sets the PCI command register's (offset `0x04`) Memory-Space +
+  Bus-Master bits so the card may DMA — without it the e1000's rings/buffers silently read/write zeros.
 - `src/e1000.rs`: Stage 17b Intel e1000 (82540EM) NIC driver — the second step of the networking track,
   where the kernel starts *driving* the card 17a found. Stage 17b-1: `init` takes the `pci::Device`,
   maps its 128 KiB BAR0 MMIO register block (32 pages) into the kernel address space **uncacheable**
@@ -586,8 +598,16 @@ Exit QEMU: `Ctrl-A` then `X`.
   so the compiler cannot reorder them past the RDT store; the ring/buffer frames are never freed (they
   belong to the NIC). Read-back accessors (`rx_descriptor_base`/`rx_descriptor_len`/`rx_head`/`rx_tail`/
   `receiver_enabled`/`rx_ring_installed`) confirm the card's own view of the ring for the boot log and
-  test. Interrupts stay masked (no RX IRQ handler yet), so the card fills buffers silently. Consuming
-  received frames (the DD bit), the TX ring, and the IRQ come in later sub-steps (17b-4+).
+  test. Interrupts stay masked (no RX IRQ handler yet), so the card fills buffers silently. Stage 17b-4:
+  `setup_tx` builds the transmit (TX) ring the same way (8-entry ring of `TxDesc`s + per-descriptor
+  buffers, `REG_TDBAL/TDBAH/TDLEN/TDH/TDT`, `REG_TIPG`, enabled in `REG_TCTL` with pad-short-packets),
+  and `transmit(frame)` copies a frame into the tail descriptor's buffer, sets the command
+  (`TXD_CMD_EOP | IFCS | RS`), advances TDT to ring the doorbell, and polls the Descriptor-Done (`DD`)
+  bit (bounded); module-level `transmit`/`transmit_test_frame` drive it (the latter builds a 60-byte
+  broadcast raw frame). Crucially, `init` now calls `nic.enable_bus_mastering()` **before** any ring
+  setup — DMA is dead without it (see `pci.rs`). TX read-back accessors mirror the RX ones
+  (`tx_descriptor_base`/`tx_head`/`tx_tail`/`transmitter_enabled`/`tx_ring_installed`). Consuming
+  *received* frames (the RX DD bit) and the IRQ come in later sub-steps (17b-5+).
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

@@ -82,6 +82,24 @@ pub fn read_config_u32(addr: Address, offset: u8) -> u32 {
     }
 }
 
+/// Write one 32-bit dword to `addr`'s configuration space at `offset` (dword-aligned).
+///
+/// The mirror of [`read_config_u32`]: write the encoded address to `CONFIG_ADDRESS`, then the value
+/// to `CONFIG_DATA`. Stage 17b uses this to set the e1000's PCI **command register** (offset `0x04`),
+/// enabling bus mastering so the card may DMA to and from host memory.
+pub fn write_config_u32(addr: Address, offset: u8, value: u32) {
+    let _guard = CONFIG_LOCK.lock();
+    let mut address_port = Port::<u32>::new(CONFIG_ADDRESS);
+    let mut data_port = Port::<u32>::new(CONFIG_DATA);
+    // SAFETY: same architected access mechanism #1 as `read_config_u32`, in the write direction. It
+    // touches only 0xCF8/0xCFC. The caller is responsible for `offset`/`value` naming a writable
+    // configuration register (here, the command register of a real device).
+    unsafe {
+        address_port.write(addr.encode(offset));
+        data_port.write(value);
+    }
+}
+
 /// A discovered PCI function: where it lives, plus the identity fields Stage 17 needs.
 #[derive(Debug, Clone, Copy)]
 pub struct Device {
@@ -148,6 +166,23 @@ impl Device {
     /// The interrupt line (legacy IRQ number) the firmware assigned, from config offset `0x3C`.
     pub fn interrupt_line(&self) -> u8 {
         read_config_u32(self.address, 0x3C) as u8
+    }
+
+    /// Enable **bus mastering** (and memory-space access) in this device's PCI command register
+    /// (config offset `0x04`), so the device may act as a DMA master — reading and writing host
+    /// memory on its own. A NIC's descriptor rings and packet buffers are all DMA, so without this
+    /// the e1000 silently reads/writes zeros (QEMU's `pci_dma_*` returns zeros when the bus-master
+    /// bit is clear): descriptors appear processed but nothing is transmitted and no status is
+    /// written back. The command register resets to 0 at power-on, so the driver must set this.
+    ///
+    /// The low 16 bits of the dword at `0x04` are the command register (bit 1 = Memory Space Enable,
+    /// bit 2 = Bus Master Enable); the high 16 bits are the read-mostly status register, which we
+    /// write back unchanged.
+    pub fn enable_bus_mastering(&self) {
+        const CMD_MEMORY_SPACE: u32 = 1 << 1;
+        const CMD_BUS_MASTER: u32 = 1 << 2;
+        let command = read_config_u32(self.address, 0x04);
+        write_config_u32(self.address, 0x04, command | CMD_MEMORY_SPACE | CMD_BUS_MASTER);
     }
 }
 
