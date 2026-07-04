@@ -42,6 +42,35 @@
 //!
 //! The reset reloads the Receive Address registers from the card's EEPROM, so we (re-)read the MAC
 //! out of Receive Address entry 0 afterward, and read CTRL back to confirm SLU stuck.
+//!
+//! ## 17b-3: the receive (RX) descriptor ring
+//!
+//! Now the card can actually *receive*. A NIC does not interrupt the CPU for every byte; it moves
+//! whole frames into main memory by **DMA**, coordinated through a **descriptor ring** — a circular
+//! array of small records in RAM, shared between driver and card:
+//!
+//! - Each **receive descriptor** (16 bytes) holds the physical address of a **receive buffer** and a
+//!   status byte. The driver fills in the buffer address and clears the status; when a frame arrives
+//!   the card DMAs it into that buffer and writes the length plus a Descriptor-Done (DD) status bit.
+//! - Two registers form a producer/consumer pair over the ring: **RDH** (head, advanced by the card
+//!   as it fills descriptors) and **RDT** (tail, advanced by the driver as it recycles buffers). The
+//!   card owns the descriptors in `[RDH, RDT)`; the driver owns the rest. We start the tail at the
+//!   last descriptor, handing the card the whole ring to fill.
+//! - **RDBAL/RDBAH** give the card the ring's physical base, **RDLEN** its size in bytes, and
+//!   **RCTL** enables the receiver and sets the filters (accept broadcast, strip the Ethernet CRC)
+//!   and the 2048-byte buffer size.
+//!
+//! The ring and buffers are ordinary RAM, not device registers, so — unlike the MMIO block — they
+//! are reached through the kernel's normal **cacheable** physical-memory window. x86 DMA is
+//! cache-coherent (the hardware snoops the caches), so the card and CPU see each other's writes with
+//! no manual cache management; we still use `volatile` descriptor accesses so the *compiler* cannot
+//! cache or reorder them. The buffer addresses we hand the card are raw *physical* addresses (DMA
+//! speaks physical), which is exactly what the frame allocator returns.
+//!
+//! Interrupts stay masked — there is no RX interrupt handler yet (a later sub-step) — so once the
+//! receiver is enabled the card fills buffers silently and advances RDH on its own. This sub-step
+//! builds the ring and verifies it by reading the ring registers back off the card; consuming
+//! received frames comes next.
 
 use spin::Mutex;
 use x86_64::{
@@ -82,6 +111,21 @@ const REG_RAL0: u64 = 0x5400;
 /// Receive Address High, entry 0: the high 2 bytes of the MAC, plus the Address Valid bit.
 const REG_RAH0: u64 = 0x5404;
 
+// --- Receive-path registers (Stage 17b-3) ---
+
+/// Receive Control: enable the receiver and set its filters and buffer size.
+const REG_RCTL: u64 = 0x0100;
+/// Receive Descriptor Base Address Low — low 32 bits of the ring's physical address.
+const REG_RDBAL: u64 = 0x2800;
+/// Receive Descriptor Base Address High — high 32 bits of the ring's physical address.
+const REG_RDBAH: u64 = 0x2804;
+/// Receive Descriptor Length — the ring's size in bytes (must be a multiple of 128).
+const REG_RDLEN: u64 = 0x2808;
+/// Receive Descriptor Head — index the card fills next (the card advances it).
+const REG_RDH: u64 = 0x2810;
+/// Receive Descriptor Tail — one past the last descriptor the driver has handed the card.
+const REG_RDT: u64 = 0x2818;
+
 // --- CTRL (Device Control) bits ---
 
 /// Link Reset.
@@ -108,6 +152,51 @@ const STATUS_FD: u32 = 1 << 0;
 /// RAH bit 31: Address Valid — the MAC in RAL/RAH is populated and usable.
 const RAH_AV: u32 = 1 << 31;
 
+// --- RCTL (Receive Control) bits ---
+
+/// Receiver Enable.
+const RCTL_EN: u32 = 1 << 1;
+/// Broadcast Accept Mode — receive broadcast frames (needed for ARP later).
+const RCTL_BAM: u32 = 1 << 15;
+/// Strip the Ethernet CRC (the 4-byte frame check sequence) from received frames.
+const RCTL_SECRC: u32 = 1 << 26;
+// Receive buffer size lives in RCTL bits 16-17 with the BSEX extender in bit 25; the all-zero
+// encoding (which we use) selects 2048-byte buffers, so we leave those bits clear.
+
+// --- Receive descriptor ring geometry (Stage 17b-3) ---
+
+/// Number of receive descriptors in the ring. 32 x 16 B = 512 B — a multiple of 128 (as RDLEN
+/// requires) that fits in a single 4 KiB frame (which holds 256 descriptors), so the ring is
+/// physically contiguous by construction.
+const RX_DESC_COUNT: usize = 32;
+/// Bytes in each receive buffer, matching RCTL's 2048-byte setting. We give each descriptor its own
+/// frame and use the low 2048 bytes — simple, and a frame is contiguous, which DMA requires.
+#[allow(dead_code)]
+const RX_BUFFER_SIZE: usize = 2048;
+
+/// A legacy receive descriptor: 16 bytes the card DMAs into as it fills a buffer.
+///
+/// The driver writes `addr` (the physical address of a receive buffer) and clears `status`; the card
+/// writes `length`/`checksum`/`status`/`errors` when a frame lands in the buffer, setting `status`'s
+/// Descriptor-Done (DD) bit. `#[repr(C)]` pins the exact field order and 16-byte layout the hardware
+/// reads — no padding (8 + 2 + 2 + 1 + 1 + 2 = 16, all naturally aligned).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RxDesc {
+    /// Physical address of this descriptor's receive buffer (the card's DMA target).
+    addr: u64,
+    /// Length of the received frame, written by the card.
+    length: u16,
+    /// Packet checksum, written by the card.
+    checksum: u16,
+    /// Status bits (bit 0 = Descriptor Done), written by the card.
+    status: u8,
+    /// Error bits, written by the card.
+    errors: u8,
+    /// VLAN / special field, written by the card.
+    special: u16,
+}
+
 /// The initialized card, once [`init`] has mapped its registers, reset it, and read its identity.
 /// Stored behind a global so later sub-steps (and the tests) can reach the one card without
 /// threading a handle through boot. The fields are plain data, so this is safe to move into a
@@ -125,6 +214,11 @@ pub struct E1000 {
     mac: [u8; 6],
     /// Whether the Stage 17b-2 global reset self-cleared within the timeout.
     reset_ok: bool,
+    /// Virtual address (through the physical-memory window) of the receive descriptor ring, so the
+    /// CPU can read/write descriptors. Zero until [`setup_rx`](Self::setup_rx) runs.
+    rx_ring: u64,
+    /// Physical address of the receive descriptor ring — the value programmed into RDBAL/RDBAH.
+    rx_ring_phys: u64,
 }
 
 impl E1000 {
@@ -259,6 +353,116 @@ impl E1000 {
     pub fn full_duplex(&self) -> bool {
         self.status() & STATUS_FD != 0
     }
+
+    /// Stage 17b-3: build the receive descriptor ring and enable the receiver.
+    ///
+    /// Allocates one frame for the ring and one per receive buffer, points each descriptor at its
+    /// buffer and clears its status, programs the ring's base/length/head/tail registers, then
+    /// enables reception. The ring and buffers are normal cacheable RAM reached through the
+    /// physical-memory window (x86 DMA is cache-coherent, so only the *registers* need the
+    /// uncacheable MMIO mapping). The frames are never freed — they belong to the NIC for the life
+    /// of the kernel, like the address-space L4 frames.
+    ///
+    /// # Safety
+    ///
+    /// The MMIO block must be mapped and the card reset/configured (so the receive-address filter is
+    /// live). The physical-memory offset must be installed (true after `memory::init`).
+    unsafe fn setup_rx(&mut self, frame_allocator: &mut impl FrameAllocator<Size4KiB>) {
+        let phys_offset = crate::memory::physical_memory_offset().as_u64();
+
+        // One frame for the descriptor ring (512 B of descriptors, with room to spare).
+        let ring_frame = frame_allocator
+            .allocate_frame()
+            .expect("no free frame for the e1000 RX descriptor ring");
+        self.rx_ring_phys = ring_frame.start_address().as_u64();
+        self.rx_ring = phys_offset + self.rx_ring_phys;
+
+        // Give each descriptor a fresh receive buffer and clear its status, so the card sees the
+        // whole ring as available (DD clear) and knows where to DMA each frame.
+        for i in 0..RX_DESC_COUNT {
+            let buf = frame_allocator
+                .allocate_frame()
+                .expect("no free frame for an e1000 RX buffer");
+            let desc = RxDesc {
+                addr: buf.start_address().as_u64(),
+                length: 0,
+                checksum: 0,
+                status: 0,
+                errors: 0,
+                special: 0,
+            };
+            // SAFETY: `rx_ring + i*16` is the i-th 16-byte descriptor slot of the ring frame, which
+            // lies fully inside the physical-memory window and is 8-byte aligned (a multiple of 16
+            // from a page-aligned base). The write is `volatile` so the compiler cannot reorder it
+            // past the RDT store below that hands the ring to the card; x86's store ordering (TSO)
+            // makes it visible to the card's DMA engine without an explicit fence.
+            ((self.rx_ring + (i * 16) as u64) as *mut RxDesc).write_volatile(desc);
+        }
+
+        // Point the card at the ring and tell it the ring's size in bytes.
+        self.write_reg(REG_RDBAL, self.rx_ring_phys as u32);
+        self.write_reg(REG_RDBAH, (self.rx_ring_phys >> 32) as u32);
+        self.write_reg(REG_RDLEN, (RX_DESC_COUNT * 16) as u32);
+
+        // Head at 0, tail at the last descriptor. The card owns `[head, tail)` — every descriptor
+        // but the one the tail rests on — and fills them as frames arrive, advancing the head.
+        self.write_reg(REG_RDH, 0);
+        self.write_reg(REG_RDT, (RX_DESC_COUNT - 1) as u32);
+
+        // Enable the receiver: accept broadcast (for ARP later), strip the Ethernet CRC, 2048-byte
+        // buffers (the BSIZE/BSEX bits stay clear). Unicast to our own MAC is accepted via Receive
+        // Address 0 (its Address-Valid bit is set after the reset). Interrupts remain masked (no RX
+        // IRQ handler yet), so the card just fills buffers silently.
+        self.write_reg(REG_RCTL, RCTL_EN | RCTL_BAM | RCTL_SECRC);
+    }
+
+    /// Physical address of the receive descriptor ring (what we programmed into RDBAL/RDBAH).
+    pub fn rx_ring_phys(&self) -> u64 {
+        self.rx_ring_phys
+    }
+
+    /// Number of descriptors in the receive ring.
+    pub fn rx_count(&self) -> usize {
+        RX_DESC_COUNT
+    }
+
+    /// Receive Descriptor Base Address read back off the card (RDBAH:RDBAL).
+    pub fn rx_descriptor_base(&self) -> u64 {
+        // SAFETY: `init` mapped the MMIO block; RDBAL/RDBAH are valid registers within it.
+        unsafe { (u64::from(self.read_reg(REG_RDBAH)) << 32) | u64::from(self.read_reg(REG_RDBAL)) }
+    }
+
+    /// Receive Descriptor Length in bytes, read back off the card (RDLEN).
+    pub fn rx_descriptor_len(&self) -> u32 {
+        // SAFETY: `init` mapped the MMIO block; RDLEN is a valid register within it.
+        unsafe { self.read_reg(REG_RDLEN) }
+    }
+
+    /// Receive Descriptor Head index, read live (the card advances it as it fills descriptors).
+    pub fn rx_head(&self) -> u32 {
+        // SAFETY: `init` mapped the MMIO block; RDH is a valid register within it.
+        unsafe { self.read_reg(REG_RDH) }
+    }
+
+    /// Receive Descriptor Tail index, read live.
+    pub fn rx_tail(&self) -> u32 {
+        // SAFETY: `init` mapped the MMIO block; RDT is a valid register within it.
+        unsafe { self.read_reg(REG_RDT) }
+    }
+
+    /// Whether the receiver is enabled (RCTL.EN), read live from the card.
+    pub fn receiver_enabled(&self) -> bool {
+        // SAFETY: `init` mapped the MMIO block; RCTL is a valid register within it.
+        unsafe { self.read_reg(REG_RCTL) & RCTL_EN != 0 }
+    }
+
+    /// Whether the RX ring is correctly installed: the card's descriptor base and length read back as
+    /// what we programmed, and the receiver is enabled. One read-back check for the boot log and test.
+    pub fn rx_ring_installed(&self) -> bool {
+        self.rx_descriptor_base() == self.rx_ring_phys
+            && self.rx_descriptor_len() as usize == RX_DESC_COUNT * 16
+            && self.receiver_enabled()
+    }
 }
 
 /// Map the e1000's 128 KiB MMIO register block at [`E1000_VIRT_BASE`], uncacheable.
@@ -312,7 +516,8 @@ pub fn init(
     let phys_base = nic.mmio_bar(0)?;
     map_mmio(phys_base, mapper, frame_allocator);
 
-    let mut dev = E1000 { mmio_base: E1000_VIRT_BASE, mac: [0; 6], reset_ok: false };
+    let mut dev =
+        E1000 { mmio_base: E1000_VIRT_BASE, mac: [0; 6], reset_ok: false, rx_ring: 0, rx_ring_phys: 0 };
 
     // Stage 17b-2: reset the card to a known state, then apply general configuration.
     // SAFETY: `map_mmio` just mapped the register block, so these register accesses are valid, and
@@ -322,6 +527,12 @@ pub fn init(
 
     // Read the MAC out of Receive Address entry 0 (the reset reloaded it from the EEPROM).
     let rah = dev.load_mac();
+
+    // Stage 17b-3: build the receive descriptor ring and enable the receiver.
+    // SAFETY: the MMIO block is mapped and the card was just reset and configured; the ring and
+    // buffers come from the kernel frame allocator and are reached through the physical-memory
+    // window, and the physical-memory offset is installed by this point in boot.
+    unsafe { dev.setup_rx(frame_allocator) };
 
     let ctrl = dev.control();
     let status = dev.status();
@@ -346,6 +557,16 @@ pub fn init(
         status,
         if status & STATUS_LU != 0 { "up" } else { "down" },
         if status & STATUS_FD != 0 { "full" } else { "half" },
+    );
+    serial_println!(
+        "[e1000] RX ring: {} descriptors @ phys {:#x} (RDBA {:#x}, RDLEN {}, RDH {}, RDT {}), receiver {}",
+        dev.rx_count(),
+        dev.rx_ring_phys(),
+        dev.rx_descriptor_base(),
+        dev.rx_descriptor_len(),
+        dev.rx_head(),
+        dev.rx_tail(),
+        if dev.receiver_enabled() { "enabled" } else { "DISABLED" },
     );
 
     *DEVICE.lock() = Some(dev);

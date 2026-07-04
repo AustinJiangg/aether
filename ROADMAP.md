@@ -377,7 +377,26 @@ unify later.
 > default). The reset reloads Receive Address entry 0 from the EEPROM, so the MAC is re-read after
 > it. Boot logs "reset completed (CTRL 0x00140260, SLU true)" and the surviving MAC. Verified by 46
 > tests (the new `e1000_reset_and_configure`: reset completed, the MAC survived, and a live CTRL
-> read-back confirms SLU stuck). Next (17b-3): the receive (RX) descriptor ring and buffers.
+> read-back confirms SLU stuck).
+>
+> **Stage 17b-3 is also done** — the receive (RX) descriptor ring, so the card can receive frames by
+> DMA. A NIC moves whole frames into RAM through a **descriptor ring**: a circular array of 16-byte
+> descriptors (each pointing at a receive buffer plus a status byte) shared with the card, driven by
+> a head/tail register pair — **RDH** (head, advanced by the card as it fills descriptors) and **RDT**
+> (tail, advanced by the driver as it recycles them); the card owns `[RDH, RDT)`. `e1000.rs`'s
+> `setup_rx` allocates one frame for the ring and one per receive buffer (from the kernel frame
+> allocator), points each descriptor at its buffer, programs the ring base/length
+> (**RDBAL/RDBAH/RDLEN**) and head/tail (RDH = 0, RDT = last), then enables the receiver in **RCTL**
+> (accept broadcast, strip the Ethernet CRC, 2048-byte buffers; unicast to our own MAC is accepted via
+> Receive Address 0). The crucial distinction from the MMIO registers: the ring and buffers are
+> **normal cacheable RAM** reached through the physical-memory window — x86 DMA is cache-coherent, so
+> only the *registers* need the uncacheable mapping — and the buffer addresses handed to the card are
+> raw *physical* addresses (DMA speaks physical), exactly what the frame allocator returns. Interrupts
+> stay masked (no RX handler yet), so the card fills buffers silently and advances RDH on its own. Boot
+> logs "RX ring: 32 descriptors @ phys 0x390000 (RDBA 0x390000, RDLEN 512, RDH 0, RDT 31), receiver
+> enabled". Verified by 47 tests (the new `e1000_sets_up_rx_ring`, which reads RDBAL/RDBAH/RDLEN/RDT/
+> RCTL back off the card and confirms they match the ring we installed). Next (17b-4): consuming
+> received frames (poll RDH / the descriptor Done bit), then the TX ring and the RX interrupt.
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

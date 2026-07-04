@@ -697,6 +697,18 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                         dev.reset_succeeded(),
                         dev.link_requested(),
                     );
+                    // Stage 17b-3: the receive descriptor ring is armed and the receiver enabled.
+                    serial_println!(
+                        "[ OK ] e1000 RX ring installed = {}, receiver enabled = {} ({} descriptors)",
+                        dev.rx_ring_installed(),
+                        dev.receiver_enabled(),
+                        dev.rx_count(),
+                    );
+                    println!(
+                        "Network: e1000 RX ring armed with {} buffers; receiver enabled = {}.",
+                        dev.rx_count(),
+                        dev.receiver_enabled(),
+                    );
                 }
             } else {
                 println!("Network: e1000 found but BAR0 was not a memory BAR (unexpected).");

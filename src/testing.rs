@@ -707,6 +707,43 @@ fn e1000_reset_and_configure() {
     assert!(dev.link_requested(), "CTRL.SLU not set after configure");
 }
 
+/// Stage 17b-3: the e1000 driver built the receive descriptor ring and enabled the receiver.
+/// `e1000::init` (at boot) allocates the ring and its buffers, points each descriptor at a buffer,
+/// programs RDBAL/RDBAH/RDLEN/RDH/RDT, and sets RCTL.EN. We read those registers back off the card
+/// to confirm the ring is installed exactly as we set it — the card's own view of the ring.
+#[test_case]
+fn e1000_sets_up_rx_ring() {
+    use crate::e1000;
+
+    let dev = e1000::device().expect("e1000 not initialized");
+
+    // The card's descriptor-base register must point at the ring we allocated (and it must be a real,
+    // non-zero physical address), and the length must equal the ring size in bytes.
+    assert_ne!(dev.rx_ring_phys(), 0, "e1000 RX ring physical address is zero");
+    assert_eq!(
+        dev.rx_descriptor_base(),
+        dev.rx_ring_phys(),
+        "RDBAH:RDBAL does not point at our RX ring"
+    );
+    assert_eq!(
+        dev.rx_descriptor_len() as usize,
+        dev.rx_count() * 16,
+        "RDLEN does not match the ring size in bytes"
+    );
+
+    // The tail rests on the last descriptor (the whole ring handed to the card), and the receiver is
+    // enabled.
+    assert_eq!(
+        dev.rx_tail(),
+        (dev.rx_count() - 1) as u32,
+        "RDT is not at the last descriptor"
+    );
+    assert!(dev.receiver_enabled(), "receiver (RCTL.EN) is not enabled");
+
+    // The one-shot read-back check agrees.
+    assert!(dev.rx_ring_installed(), "RX ring not installed per the read-back check");
+}
+
 /// Stage 14c-1: the FAT driver creates and overwrites a root-level file. Write a payload
 /// spanning several clusters through the global VFS (`/mnt/...`), read it back, and confirm the
 /// bytes round-trip — exercising free-cluster allocation, the cluster chain, and the directory

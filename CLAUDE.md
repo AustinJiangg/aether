@@ -200,9 +200,18 @@ stashed in a global for later sub-steps. **Stage 17b-2 is now also done**: `init
 card (mask all interrupts via IMC, set the self-clearing `CTRL.RST` and poll until it clears, drain
 ICR) and *configures* it (set `CTRL.SLU`/`ASDE`, clear the reset/loss-of-signal/VLAN bits, zero the
 128-entry multicast table) — the standard "put the device in a known state" opening move — then
-re-reads the EEPROM-reloaded MAC; boot reports "reset completed". `ROADMAP.md` carries the forward
-plan (stages 9-18): the user-space main line (system calls, per-process address spaces +
-ELF, multiprocessing), plus persistence, APIC/SMP, and networking tracks.
+re-reads the EEPROM-reloaded MAC; boot reports "reset completed". **Stage 17b-3 is now also done**:
+the receive (RX) descriptor ring, so the card can receive frames by DMA. `e1000.rs`'s `setup_rx`
+allocates one frame for a 32-entry descriptor ring and one per receive buffer (from the kernel frame
+allocator), points each 16-byte descriptor at its buffer's *physical* address, programs the ring
+base/length/head/tail (`RDBAL/RDBAH/RDLEN/RDH/RDT`), and enables the receiver in `RCTL` (accept
+broadcast, strip the Ethernet CRC, 2048-byte buffers; unicast to our MAC via Receive Address 0). The
+ring and buffers are **normal cacheable RAM** reached through the physical-memory window (x86 DMA is
+cache-coherent, so only the MMIO registers need the uncacheable mapping); interrupts stay masked (no
+RX handler yet), so the card fills buffers silently. Boot reports "RX ring: 32 descriptors ...
+receiver enabled". `ROADMAP.md` carries the forward plan (stages 9-18): the user-space main line
+(system calls, per-process address spaces + ELF, multiprocessing), plus persistence, APIC/SMP, and
+networking tracks.
 
 ## Language and writing conventions
 
@@ -566,8 +575,19 @@ Exit QEMU: `Ctrl-A` then `X`.
   6-byte MAC + a `reset_ok` flag) is stored in a global `Mutex<Option<E1000>>` (`device()`/`present()`)
   for later sub-steps; `control()`/`status()` are live register reads, `reset_succeeded()`/
   `link_requested()` (CTRL.SLU)/`link_up()`/`full_duplex()` decode them. The MMIO block is mapped at
-  `E1000_VIRT_BASE` (L4 slot 101, one slot above the APIC's). Descriptor rings, TX/RX, and the IRQ come
-  in later sub-steps (17b-3+).
+  `E1000_VIRT_BASE` (L4 slot 101, one slot above the APIC's). Stage 17b-3: `setup_rx` builds the
+  receive (RX) **descriptor ring** so the card can receive frames by DMA — it allocates one frame for a
+  32-entry ring of 16-byte `RxDesc`s and one frame per receive buffer (from the passed frame
+  allocator), writes each descriptor's buffer *physical* address (DMA speaks physical), programs the
+  ring base/length/head/tail (`REG_RDBAL/RDBAH/RDLEN/RDH/RDT`, RDH=0, RDT=last), and enables the
+  receiver in `REG_RCTL` (`RCTL_EN | RCTL_BAM | RCTL_SECRC`, 2048-byte buffers). Unlike the MMIO
+  registers, the ring/buffers are **normal cacheable RAM** reached through the physical-memory window
+  (`memory::physical_memory_offset()`) — x86 DMA is cache-coherent — with `volatile` descriptor writes
+  so the compiler cannot reorder them past the RDT store; the ring/buffer frames are never freed (they
+  belong to the NIC). Read-back accessors (`rx_descriptor_base`/`rx_descriptor_len`/`rx_head`/`rx_tail`/
+  `receiver_enabled`/`rx_ring_installed`) confirm the card's own view of the ring for the boot log and
+  test. Interrupts stay masked (no RX IRQ handler yet), so the card fills buffers silently. Consuming
+  received frames (the DD bit), the TX ring, and the IRQ come in later sub-steps (17b-4+).
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run
