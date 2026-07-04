@@ -78,6 +78,7 @@ mod memory;
 mod allocator;
 mod ata;
 mod fat;
+mod pci;
 mod task;
 // The Stage 6 thread scheduler is dormant during Stage 7: the kernel runs the
 // async executor (the shell) instead, so the scheduler's spawn/run/yield sit
@@ -628,6 +629,54 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 serial_println!("[fat] mount failed: {:?}", e);
                 println!("FAT16 mount FAILED: {:?}", e);
             }
+        }
+    }
+
+    // Stage 17a (networking): enumerate the PCI bus and locate the e1000 NIC. Before the kernel
+    // can touch the card's registers (Stage 17b), it has to *find* the card: every PCI device
+    // advertises its identity and the physical address of its register block (a BAR) in
+    // configuration space, reached through the 0xCF8/0xCFC ports. QEMU puts `-device e1000` on the
+    // bus. This is pure discovery — read-only config-space reads, like the ACPI table walk.
+    let pci_devices = pci::enumerate();
+    serial_println!("[pci] {} function(s) on the PCI bus:", pci_devices.len());
+    for d in &pci_devices {
+        let tag = if d.class == pci::CLASS_NETWORK && d.subclass == pci::SUBCLASS_ETHERNET {
+            "  <- Ethernet controller"
+        } else {
+            ""
+        };
+        serial_println!(
+            "[pci]   {:02x}:{:02x}.{}  {:04x}:{:04x}  class {:02x}.{:02x}.{:02x}{}",
+            d.address.bus,
+            d.address.device,
+            d.address.function,
+            d.vendor_id,
+            d.device_id,
+            d.class,
+            d.subclass,
+            d.prog_if,
+            tag,
+        );
+    }
+    match pci::find_e1000() {
+        Some(nic) => {
+            let bar0 = nic.mmio_bar(0).unwrap_or(0);
+            serial_println!(
+                "[ OK ] e1000 NIC at {:02x}:{:02x}.{}: MMIO BAR0 {:#x}, IRQ {}",
+                nic.address.bus,
+                nic.address.device,
+                nic.address.function,
+                bar0,
+                nic.interrupt_line(),
+            );
+            println!(
+                "Network: found Intel e1000 NIC (MMIO at {:#x}); driver bring-up is next.",
+                bar0
+            );
+        }
+        None => {
+            serial_println!("[pci] no e1000 NIC found (is QEMU started with -device e1000?)");
+            println!("Network: no e1000 NIC found on the PCI bus.");
         }
     }
 

@@ -642,6 +642,25 @@ fn fat_removes_a_directory() {
     assert!(!root.iter().any(|(n, _)| n.as_str() == "RMTEST"));
 }
 
+/// Stage 17a: the PCI bus is enumerated and the e1000 NIC is discovered. QEMU attaches
+/// `-device e1000` on the bus (see Cargo.toml test-args), so enumeration must find it by its
+/// identity (vendor 0x8086, device 0x100E) and recognize it as an Ethernet network controller.
+/// Its BAR0 must decode to a non-zero memory-mapped base — the register block Stage 17b maps.
+#[test_case]
+fn pci_finds_the_e1000_nic() {
+    use crate::pci;
+
+    let nic = pci::find_e1000().expect("e1000 NIC not found on the PCI bus");
+    assert_eq!(nic.vendor_id, pci::INTEL_VENDOR_ID);
+    assert_eq!(nic.device_id, pci::E1000_DEVICE_ID);
+    assert_eq!(nic.class, pci::CLASS_NETWORK);
+    assert_eq!(nic.subclass, pci::SUBCLASS_ETHERNET);
+
+    // BAR0 is a memory BAR (bit 0 clear), and QEMU maps it at a real, non-zero address.
+    let mmio = nic.mmio_bar(0).expect("e1000 BAR0 should be a memory BAR");
+    assert!(mmio != 0, "e1000 BAR0 (MMIO base) should be non-zero");
+}
+
 /// Stage 14c-1: the FAT driver creates and overwrites a root-level file. Write a payload
 /// spanning several clusters through the global VFS (`/mnt/...`), read it back, and confirm the
 /// bytes round-trip — exercising free-cluster allocation, the cluster chain, and the directory

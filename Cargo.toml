@@ -77,6 +77,12 @@ run-args = [
     # Stage 14b: attach the FAT16 test disk as the secondary IDE *master* (index 2). The
     # FAT reader parses this real, host-formatted filesystem. build.rs creates it via mkfs.fat.
     "-drive", "format=raw,file=fat.img,if=ide,index=2,media=disk",
+    # Stage 17 (networking): attach an Intel e1000 NIC on the PCI bus, backed by QEMU's userspace
+    # network stack (SLIRP). "user" needs no host privileges (works in WSL2); the driver we build
+    # enumerates the card over PCI (17a) and then drives it. The netdev must precede the device
+    # that references it by id.
+    "-netdev", "user,id=net0",
+    "-device", "e1000,netdev=net0",
 ]
 
 # `cargo test` runs each test binary through these args instead of `run-args`.
@@ -97,6 +103,9 @@ test-args = [
     # Stage 14b: the same FAT16 test disk as run-args, so the BPB-parse test has a real
     # filesystem to read (the secondary master).
     "-drive", "format=raw,file=fat.img,if=ide,index=2,media=disk",
+    # Stage 17 (networking): the same e1000 NIC as run-args, so the PCI-enumeration test finds it.
+    "-netdev", "user,id=net0",
+    "-device", "e1000,netdev=net0",
 ]
 # When the tests pass, the kernel calls exit_qemu(Success), so QEMU exits with
 # (0x10 << 1) | 1 = 33. Tell bootimage to treat exit code 33 as a passing run

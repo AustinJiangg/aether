@@ -182,7 +182,15 @@ to a Rust `ap_entry`, which bumps an `AP_ONLINE` atomic the BSP polls, then park
 runs real kernel Rust ("AP apic id 1 is online"), and boot continues to the shell. (Two subtleties
 fixed: the AP stack must be heap, not a large `static`, since the 0.9 bootloader leaves `.bss` past the
 file image unmapped; and the trampoline must set `EFER.NXE` as well as `LME`, or the AP reserved-bit-
-faults reading any NX page.) `ROADMAP.md` carries the forward
+faults reading any NX page.) **Stage 17a (networking track) is now also done**: PCI bus enumeration
+(`pci.rs`). Before the kernel can drive the Intel e1000 NIC it must *find* it, so `enumerate` scans
+every PCI function's configuration space through the legacy `0xCF8`/`0xCFC` ports (write a
+bus/device/function/offset address to CONFIG_ADDRESS, read the dword at CONFIG_DATA), reading each
+device's vendor/device id, class code, header type, and BARs; `find_e1000` locates the card (vendor
+`0x8086`, device `0x100E`), and `Device::mmio_bar`/`interrupt_line` decode its MMIO register base
+and IRQ. QEMU now attaches `-device e1000,netdev=net0 -netdev user,id=net0` (SLIRP, no host
+privileges), and boot reports the six bus-0 functions and the e1000 (`00:03.0`, BAR0 `0xfeb80000`,
+IRQ 11). `ROADMAP.md` carries the forward
 plan (stages 9-18): the user-space main line (system calls, per-process address spaces +
 ELF, multiprocessing), plus persistence, APIC/SMP, and networking tracks.
 
@@ -524,6 +532,15 @@ Exit QEMU: `Ctrl-A` then `X`.
   which (via `dir_is_empty`) removes an *empty* directory — freeing its cluster chain and deleting
   its parent entry — and refuses a non-empty one with `NotEmpty`/`FsError::DirNotEmpty` (no recursive
   delete, unlike `RamFs`). This completes the FAT subdirectory work.
+- `src/pci.rs`: Stage 17a PCI bus enumeration — the first step of the networking track. `read_config_u32`
+  reads a device's configuration space through the legacy access mechanism #1 (write a bus/device/
+  function/offset address to `CONFIG_ADDRESS` = `0xCF8`, read the dword at `CONFIG_DATA` = `0xCFC`,
+  serialized by a lock). `enumerate` brute-scans all 256 buses (multifunction-aware) into a `Vec<Device>`,
+  each `Device` carrying its vendor/device id, class/subclass, prog-IF, and header type; `Device::bar`/
+  `mmio_bar` decode a Base Address Register (32- or 64-bit memory BAR) and `interrupt_line` reads the
+  assigned IRQ. `find_e1000` locates QEMU's `-device e1000` (vendor `0x8086`, device `0x100E`); boot lists
+  every bus-0 function and reports the NIC's MMIO BAR0 + IRQ, the register block Stage 17b maps. Pure
+  read-only config-space reads, like the ACPI table walk; needs the heap (returns a `Vec`).
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

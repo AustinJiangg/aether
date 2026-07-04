@@ -339,6 +339,19 @@ unify later.
 > by 36 tests (the new `bsp_unifies_executor_and_threads`) and a headless run. **This completes Stage 16
 > (SMP): all cores discovered, woken, and running an interrupt-driven preemptive scheduler over a unified
 > task/thread model.**
+>
+> **Stage 17a is also done** — PCI bus enumeration (the networking track begins). The chosen NIC is the
+> Intel **e1000** (QEMU's `-device e1000`), which uses MMIO registers and TX/RX descriptor rings — the
+> "DMA, ring buffers" this stage is about. But first the kernel must *find* the card: it is a PCI device,
+> so a new `pci.rs` enumerates the bus. `read_config_u32` reaches a function's 256-byte configuration
+> space through the legacy access mechanism #1 (write a bus/device/function/offset to `CONFIG_ADDRESS`
+> `0xCF8`, read the dword at `CONFIG_DATA` `0xCFC`); `enumerate` brute-scans all 256 buses
+> (multifunction-aware) into a `Vec<Device>` of vendor/device id, class code, and header type;
+> `Device::mmio_bar`/`interrupt_line` decode a BAR (32-/64-bit memory) and the assigned IRQ. `find_e1000`
+> locates the card (vendor `0x8086`, device `0x100E`). QEMU now attaches `-device e1000,netdev=net0
+> -netdev user,id=net0` (SLIRP — no host privileges, works in WSL2). Boot lists the six bus-0 functions
+> and reports the e1000 at `00:03.0` with MMIO BAR0 `0xfeb80000`, IRQ 11 — the register block Stage 17b
+> maps. Verified by 44 tests (the new `pci_finds_the_e1000_nic`).
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|
