@@ -219,9 +219,16 @@ config space, and QEMU's `pci_dma_*` silently reads/writes zeros while the devic
 (command register, offset `0x04`, bit 2) is clear, so the card processed a zeroed descriptor (TDH
 advanced, TXQE set) but never transmitted or wrote DD (MMIO worked because that is Memory-Space
 Enable, not bus mastering). Fixed with `pci::write_config_u32` + `Device::enable_bus_mastering`,
-called in `e1000::init` before any ring setup (RX needed it too). `ROADMAP.md` carries the forward
-plan (stages 9-18): the user-space main line (system calls, per-process address spaces + ELF,
-multiprocessing), plus persistence, APIC/SMP, and networking tracks.
+called in `e1000::init` before any ring setup (RX needed it too). **Stage 17b-5 is now also done**:
+consuming a *received* frame via PHY loopback. SLIRP sends us nothing until Stage 18 speaks a protocol,
+so the RX path is exercised with the card's own loopback (in QEMU 8.2 triggered by the PHY BMCR
+loopback bit, reached through the `MDIC` register since the PHY is not memory-mapped): `e1000.rs`'s
+`loopback_selftest` enables loopback, sends a 60-byte frame to our own MAC, and `receive()` polls the
+RX descriptor's Done bit and reads the frame back. Two QEMU behaviors had to be handled: a looped
+frame is dropped while the receiver is not ready, and the e1000 link is not ready to receive until
+~0.9 s into boot — so the selftest resends (watching RDH) until it comes back, bounded. `ROADMAP.md`
+carries the forward plan (stages 9-18): the user-space main line (system calls, per-process address
+spaces + ELF, multiprocessing), plus persistence, APIC/SMP, and networking tracks.
 
 ## Language and writing conventions
 
@@ -606,8 +613,16 @@ Exit QEMU: `Ctrl-A` then `X`.
   bit (bounded); module-level `transmit`/`transmit_test_frame` drive it (the latter builds a 60-byte
   broadcast raw frame). Crucially, `init` now calls `nic.enable_bus_mastering()` **before** any ring
   setup — DMA is dead without it (see `pci.rs`). TX read-back accessors mirror the RX ones
-  (`tx_descriptor_base`/`tx_head`/`tx_tail`/`transmitter_enabled`/`tx_ring_installed`). Consuming
-  *received* frames (the RX DD bit) and the IRQ come in later sub-steps (17b-5+).
+  (`tx_descriptor_base`/`tx_head`/`tx_tail`/`transmitter_enabled`/`tx_ring_installed`). Stage 17b-5:
+  the receive path, exercised via PHY loopback (no external traffic). The PHY is reached through the
+  `MDIC` register — `phy_read`/`phy_write` (opcode + PHY address 1 + register, poll Ready) and
+  `set_loopback` (RMW the BMCR loopback bit; QEMU 8.2 triggers loopback off the PHY BMCR, not RCTL.LBM).
+  `receive(buf)` polls the current RX descriptor's `RXD_STAT_DD`, copies the frame out of its DMA
+  buffer, recycles the descriptor (clear status, move RDT onto it, advance the `rx_cur` cursor), and
+  returns the length. `loopback_selftest` enables loopback, sends a 60-byte frame to our own MAC
+  (accepted via Receive Address 0), and receives it — resending while watching RDH because QEMU drops a
+  looped frame until the link settles (~0.9 s into boot). The RX interrupt (IRQ 11 via the IO-APIC)
+  comes in a later sub-step (17b-6).
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

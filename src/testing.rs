@@ -731,12 +731,11 @@ fn e1000_sets_up_rx_ring() {
         "RDLEN does not match the ring size in bytes"
     );
 
-    // The tail rests on the last descriptor (the whole ring handed to the card), and the receiver is
-    // enabled.
-    assert_eq!(
-        dev.rx_tail(),
-        (dev.rx_count() - 1) as u32,
-        "RDT is not at the last descriptor"
+    // The tail is a valid descriptor index (it starts at the last descriptor, but moves as frames
+    // are received and recycled, so we only require it stay in range).
+    assert!(
+        dev.rx_tail() < dev.rx_count() as u32,
+        "RDT is out of range"
     );
     assert!(dev.receiver_enabled(), "receiver (RCTL.EN) is not enabled");
 
@@ -777,6 +776,22 @@ fn e1000_transmits_a_frame() {
     // After transmit the card has drained the ring: head has caught up to tail.
     let dev = e1000::device().expect("e1000 device handle missing");
     assert_eq!(dev.tx_head(), dev.tx_tail(), "TX ring not drained after transmit");
+}
+
+/// Stage 17b-5: the e1000 driver can receive a frame. With no external traffic under QEMU's SLIRP,
+/// we prove the RX path via PHY loopback: enable loopback (transmitted frames loop straight back into
+/// the receiver), send a frame addressed to our own MAC, receive it off the RX ring, and confirm the
+/// bytes round-trip. This exercises the whole receive path — descriptor Done polling, the buffer DMA,
+/// and descriptor recycling — end to end.
+#[test_case]
+fn e1000_receives_via_loopback() {
+    use crate::e1000;
+
+    assert!(e1000::present(), "e1000 not initialized");
+    assert!(
+        e1000::loopback_selftest(),
+        "e1000 loopback receive round-trip failed (frame did not come back intact)"
+    );
 }
 
 /// Stage 14c-1: the FAT driver creates and overwrites a root-level file. Write a payload

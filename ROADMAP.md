@@ -417,9 +417,25 @@ unify later.
 > bus mastering. Fixed by adding `pci::write_config_u32` + `Device::enable_bus_mastering` and calling
 > it in `e1000::init` before any ring setup. (The RX ring had the same latent defect — its test only
 > checks register read-backs, not live DMA.) Verified by 48 tests (the new `e1000_transmits_a_frame`,
-> which sends a frame and asserts DD is set and the ring drains). Next (17b-5): consuming *received*
-> frames — via the card's loopback, or after Stage 18 speaks a protocol SLIRP answers — and the RX
-> interrupt.
+> which sends a frame and asserts DD is set and the ring drains).
+>
+> **Stage 17b-5 is also done** — consuming a *received* frame, via PHY loopback. SLIRP is passive
+> (nothing arrives until we speak a protocol, which is Stage 18), so to exercise the RX path now we use
+> the card's own **loopback**: a transmitted frame is looped straight back into the receiver. In QEMU
+> 8.2 loopback is triggered by the **PHY BMCR loopback bit**, not the RCTL.LBM bits — and the PHY is
+> not memory-mapped, so `e1000.rs` gains MDIO access through the **MDIC** register (`phy_read`/
+> `phy_write`: opcode + PHY address 1 + register + data, poll the Ready bit) and `set_loopback`
+> (read-modify-write the BMCR). `receive(buf)` polls the current RX descriptor's Descriptor-Done bit,
+> copies the frame out of its DMA buffer, recycles the descriptor (clear status, move RDT onto it,
+> advance a software cursor), and returns the length. `loopback_selftest` enables loopback, sends a
+> 60-byte frame to our own MAC (accepted by the receive filter via Receive Address 0), receives it, and
+> checks the bytes round-trip. Two QEMU behaviors had to be handled, each found by instrumenting the
+> descriptor/registers: (1) `qemu_receive_packet` **drops** a looped frame (rather than queuing it)
+> while the receiver is not ready, and QEMU's e1000 link is not ready to receive until it has settled
+> **~0.9 s** into boot — so the selftest resends, watching RDH advance as the readiness check, bounded
+> so a dead link cannot hang boot; (2) once ready, delivery is synchronous, so RDH moves the instant we
+> transmit. Verified by 49 tests (the new `e1000_receives_via_loopback`). Next (17b-6): the RX
+> interrupt (route IRQ 11 through the IO-APIC and drive receive from the handler instead of polling).
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

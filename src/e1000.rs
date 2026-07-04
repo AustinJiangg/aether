@@ -167,6 +167,13 @@ const REG_TDH: u64 = 0x3810;
 /// Transmit Descriptor Tail — one past the last descriptor the driver has handed the card.
 const REG_TDT: u64 = 0x3818;
 
+// --- PHY access via MDIC (Stage 17b-5) ---
+
+/// MDI Control — reads/writes the internal PHY's MII registers indirectly (the PHY is not itself
+/// memory-mapped): write an opcode + PHY address + register address (+ data), then poll the Ready
+/// bit; a read leaves the value in the low 16 bits.
+const REG_MDIC: u64 = 0x0020;
+
 // --- CTRL (Device Control) bits ---
 
 /// Link Reset.
@@ -295,6 +302,27 @@ struct TxDesc {
     special: u16,
 }
 
+// --- MDIC fields, PHY registers, and RX descriptor status bits (Stage 17b-5) ---
+
+/// MDIC opcode: write the addressed PHY register.
+const MDIC_OP_WRITE: u32 = 0x0400_0000;
+/// MDIC opcode: read the addressed PHY register.
+const MDIC_OP_READ: u32 = 0x0800_0000;
+/// MDIC Ready bit — the card sets it when the PHY access completes.
+const MDIC_READY: u32 = 0x1000_0000;
+/// MDIC PHY-address field shift; the e1000's internal PHY answers at address 1.
+const MDIC_PHY_SHIFT: u32 = 21;
+const MDIC_PHY_ADDR: u32 = 1;
+/// MDIC register-address field shift.
+const MDIC_REG_SHIFT: u32 = 16;
+/// PHY register 0: the Basic Mode Control Register (BMCR / MII control).
+const PHY_BMCR: u32 = 0;
+/// BMCR loopback bit — the PHY loops transmitted frames back into the receiver (QEMU preserves it).
+const BMCR_LOOPBACK: u16 = 0x4000;
+
+/// RX descriptor status bit: Descriptor Done — the card has filled this descriptor with a frame.
+const RXD_STAT_DD: u8 = 1 << 0;
+
 /// The initialized card, once [`init`] has mapped its registers, reset it, and read its identity.
 /// Stored behind a global so later sub-steps (and the tests) can reach the one card without
 /// threading a handle through boot. The fields are plain data, so this is safe to move into a
@@ -322,6 +350,9 @@ pub struct E1000 {
     tx_ring: u64,
     /// Physical address of the transmit descriptor ring — the value programmed into TDBAL/TDBAH.
     tx_ring_phys: u64,
+    /// Index of the next receive descriptor the driver expects the card to fill — the software-side
+    /// cursor into the RX ring, advanced by [`receive`](Self::receive).
+    rx_cur: u16,
 }
 
 impl E1000 {
@@ -721,6 +752,94 @@ impl E1000 {
             && self.tx_descriptor_len() as usize == TX_DESC_COUNT * 16
             && self.transmitter_enabled()
     }
+
+    /// Read PHY register `reg` through the MDI Control register. The internal PHY is address 1.
+    /// Bounded poll for the Ready bit; returns the 16-bit value (0 on timeout).
+    ///
+    /// # Safety
+    ///
+    /// The MMIO block must be mapped.
+    unsafe fn phy_read(&self, reg: u32) -> u16 {
+        self.write_reg(
+            REG_MDIC,
+            (reg << MDIC_REG_SHIFT) | (MDIC_PHY_ADDR << MDIC_PHY_SHIFT) | MDIC_OP_READ,
+        );
+        for _ in 0..1000 {
+            let mdic = self.read_reg(REG_MDIC);
+            if mdic & MDIC_READY != 0 {
+                return mdic as u16;
+            }
+            apic::pit_sleep_us(1);
+        }
+        0
+    }
+
+    /// Write `data` to PHY register `reg` through the MDI Control register. Bounded poll for Ready.
+    ///
+    /// # Safety
+    ///
+    /// The MMIO block must be mapped.
+    unsafe fn phy_write(&self, reg: u32, data: u16) {
+        self.write_reg(
+            REG_MDIC,
+            u32::from(data)
+                | (reg << MDIC_REG_SHIFT)
+                | (MDIC_PHY_ADDR << MDIC_PHY_SHIFT)
+                | MDIC_OP_WRITE,
+        );
+        for _ in 0..1000 {
+            if self.read_reg(REG_MDIC) & MDIC_READY != 0 {
+                return;
+            }
+            apic::pit_sleep_us(1);
+        }
+    }
+
+    /// Enable or disable PHY loopback: with it on, transmitted frames are looped straight back into
+    /// the receiver instead of going out on the wire — the way to exercise the RX path with no
+    /// external traffic. Read-modify-writes the PHY BMCR so the other control bits survive.
+    ///
+    /// # Safety
+    ///
+    /// The MMIO block must be mapped.
+    unsafe fn set_loopback(&self, enable: bool) {
+        let mut bmcr = self.phy_read(PHY_BMCR);
+        if enable {
+            bmcr |= BMCR_LOOPBACK;
+        } else {
+            bmcr &= !BMCR_LOOPBACK;
+        }
+        self.phy_write(PHY_BMCR, bmcr);
+    }
+
+    /// Poll the current receive descriptor; if the card has filled it (Descriptor Done), copy the
+    /// frame into `buf`, recycle the descriptor back to the card, advance the software cursor, and
+    /// return the frame's length. Returns `None` if no frame is ready. Non-blocking — checks one
+    /// descriptor and returns.
+    ///
+    /// # Safety
+    ///
+    /// The MMIO block must be mapped and [`setup_rx`](Self::setup_rx) must have run.
+    unsafe fn receive(&mut self, buf: &mut [u8]) -> Option<usize> {
+        let phys_offset = crate::memory::physical_memory_offset().as_u64();
+        let idx = self.rx_cur as usize;
+        let desc_ptr = (self.rx_ring + (idx * 16) as u64) as *mut RxDesc;
+        let desc = (desc_ptr as *const RxDesc).read_volatile();
+        if desc.status & RXD_STAT_DD == 0 {
+            return None; // the card has not filled this descriptor yet
+        }
+        let len = desc.length as usize;
+        let n = len.min(buf.len());
+        // Copy the received frame out of the DMA buffer (reached through the physical-memory window).
+        core::ptr::copy_nonoverlapping((phys_offset + desc.addr) as *const u8, buf.as_mut_ptr(), n);
+
+        // Recycle: clear Descriptor Done so a re-poll of this slot does not see the old frame, then
+        // hand the descriptor back to the card by moving the tail onto it, and advance our cursor.
+        desc_ptr.write_volatile(RxDesc { status: 0, ..desc });
+        self.write_reg(REG_RDT, idx as u32);
+        self.rx_cur = ((idx + 1) % RX_DESC_COUNT) as u16;
+        Some(len)
+    }
 }
 
 /// Map the e1000's 128 KiB MMIO register block at [`E1000_VIRT_BASE`], uncacheable.
@@ -788,6 +907,7 @@ pub fn init(
         rx_ring_phys: 0,
         tx_ring: 0,
         tx_ring_phys: 0,
+        rx_cur: 0,
     };
 
     // Stage 17b-2: reset the card to a known state, then apply general configuration.
@@ -900,4 +1020,74 @@ pub fn transmit_test_frame() -> bool {
     let msg = b"aether e1000 raw tx test";
     frame[14..14 + msg.len()].copy_from_slice(msg);
     transmit(&frame)
+}
+
+/// Stage 17b-5: prove the receive path with PHY loopback. Turn loopback on so a transmitted frame is
+/// looped straight back into the receiver, send a frame addressed to our own MAC (accepted by the RX
+/// filter via Receive Address 0), receive it off the RX ring, and confirm the bytes round-trip. Turns
+/// loopback back off before returning. Returns whether the frame came back intact.
+pub fn loopback_selftest() -> bool {
+    let mut guard = DEVICE.lock();
+    let dev = match guard.as_mut() {
+        Some(d) => d,
+        None => return false,
+    };
+    let mac = dev.mac;
+
+    // A 60-byte frame addressed to ourselves (accepted by the RX filter via Receive Address 0).
+    let mut frame = [0u8; 60];
+    frame[0..6].copy_from_slice(&mac); // destination: ourselves
+    frame[6..12].copy_from_slice(&mac); // source: ourselves
+    frame[12] = 0x88; // ethertype 0x88B5 (IEEE 802 local-experimental)
+    frame[13] = 0xB5;
+    let msg = b"aether e1000 loopback rx test";
+    frame[14..14 + msg.len()].copy_from_slice(msg);
+
+    // SAFETY: the device is initialized — MMIO mapped, both rings set up, bus mastering enabled.
+    unsafe {
+        let mut rxbuf = [0u8; 2048];
+        // Drain anything already sitting in the RX ring (e.g. delivered late from a prior call), so
+        // we only inspect the frame we loop back now.
+        while dev.receive(&mut rxbuf).is_some() {}
+
+        dev.set_loopback(true);
+
+        // Retry until the frame comes back. Under QEMU the e1000's receiver is not ready to accept
+        // frames until the link has settled (up to ~1 s of boot time on the first run); a frame sent
+        // before then is silently dropped rather than looped back. So resend, watching RDH advance as
+        // the fast "did the card accept a frame" check. Bounded so a link that never comes up cannot
+        // hang boot.
+        let mut result = None;
+        for _ in 0..1000 {
+            let rdh_before = dev.read_reg(REG_RDH);
+            let _ = dev.transmit(&frame);
+            // The loopback delivery is synchronous under QEMU, so a received frame shows up in RDH
+            // immediately; if RDH moved, consume it.
+            if dev.read_reg(REG_RDH) != rdh_before {
+                if let Some(len) = dev.receive(&mut rxbuf) {
+                    result = Some(len);
+                    break;
+                }
+            }
+            apic::pit_sleep_us(2000);
+        }
+        dev.set_loopback(false);
+
+        match result {
+            Some(len) => {
+                let ok = len >= frame.len() && rxbuf[..frame.len()] == frame;
+                serial_println!(
+                    "[e1000] loopback: sent a {} B frame to self, received {} B, match = {}",
+                    frame.len(),
+                    len,
+                    ok,
+                );
+                ok
+            }
+            None => {
+                serial_println!("[e1000] loopback: no frame looped back (link never became ready)");
+                false
+            }
+        }
+    }
 }

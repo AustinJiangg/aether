@@ -718,6 +718,20 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                         dev.transmitter_enabled(),
                         dev.tx_count(),
                     );
+                    // Stage 17b-5: prove the receive path. Enable PHY loopback, send a frame to our
+                    // own MAC, and receive it back off the RX ring — no external traffic needed. Do
+                    // this *before* the outgoing SLIRP transmit below: a normal-mode frame handed to
+                    // QEMU's host network stack leaves its receiver briefly busy, which drops the
+                    // very next looped-back frame.
+                    let looped = e1000::loopback_selftest();
+                    serial_println!("[ OK ] e1000 loopback receive round-trip = {}", looped);
+                    println!(
+                        "Network: e1000 received a frame via loopback (round-trip = {}).",
+                        looped,
+                    );
+                    // Stage 17b-4: the transmit ring is armed. Send a raw Ethernet frame out to the
+                    // network and let the card confirm it (the transmit descriptor's Done bit) — proof
+                    // the TX DMA path works.
                     let sent = e1000::transmit_test_frame();
                     serial_println!(
                         "[ OK ] e1000 transmitted a raw frame, card confirmed (DD) = {}",
