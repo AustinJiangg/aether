@@ -369,7 +369,7 @@ unify later.
     bit; the heap was grown 100 KiB → 1 MiB to fit the extra page per stack. This
     immediately exposed — and fixed — a latent bug: the Stage 16d-5 threaded shell was
     overflowing its 4 KiB stack (it now runs on a 32 KiB stack via `spawn_with_stack`).
-  - **FAT subdirectories — in progress.** Stage 14d-1 creates a *root-level* subdirectory
+  - **FAT subdirectories — done.** Stage 14d-1 creates a *root-level* subdirectory
     (`Fat::make_root_dir`: allocate a cluster, initialize it with `.`/`..`, add an
     `ATTR_DIRECTORY` entry to the root). Stage 14d-2 adds **read-path traversal**: a `DirLocation`
     (the fixed root region *or* a subdirectory cluster chain) unifies directory scanning
@@ -385,7 +385,10 @@ unify later.
     directory** past its first cluster: when `find_dir_slot` finds no free entry in a subdirectory,
     `grow_dir` appends a fresh, zeroed cluster to the directory's chain and puts the new entry there
     (the fixed-size root still reports `DirFull`), so a subdirectory no longer caps at 14 files.
-    Still to do: removing a directory (`rmdir`).
+    Stage 14d-6 adds **`rmdir`**: `FileSystem::remove` routes a directory to `remove_dir_in`, which
+    removes an *empty* directory (`dir_is_empty` guards it) — freeing its cluster chain and deleting
+    its parent entry — and refuses a non-empty one with `DirNotEmpty` (no recursive `rm -r`, unlike
+    `RamFs`). This completes FAT subdirectory support (grow-then-`rmdir`).
   - Still open: upgrade `bootloader` 0.9 → 0.11 (framebuffer, modern boot info). (Unifying the
     async executor with the thread scheduler is already done — Stage 16d-5.)
 

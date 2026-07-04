@@ -45,6 +45,9 @@ pub enum FsError {
     IsDir,
     /// Expected a directory but found a file.
     NotDir,
+    /// Tried to remove a directory that still has entries (`rmdir` only removes empty
+    /// directories; use it after emptying the directory).
+    DirNotEmpty,
     /// The filesystem does not support this operation: a write to a read-only on-disk
     /// volume, or descending into a subdirectory a minimal driver cannot yet walk.
     Unsupported,
@@ -61,6 +64,7 @@ impl FsError {
             FsError::Exists => "already exists",
             FsError::IsDir => "is a directory",
             FsError::NotDir => "not a directory",
+            FsError::DirNotEmpty => "directory not empty",
             FsError::Unsupported => "operation not supported",
             FsError::Io => "input/output error",
         }

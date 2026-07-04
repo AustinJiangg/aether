@@ -345,6 +345,20 @@ pub fn selftest() {
         dispatch(&mut cwd, command);
     }
 
+    // Stage 14d-6: `rm` now removes an *empty* directory on the FAT disk (rmdir). Make a directory,
+    // list it in the mount root, remove it, and confirm it is gone — the mkdir/rmdir round-trip.
+    // Self-cleaning, so a reboot starts from the seeded state.
+    sh_println!("[shell selftest] mkdir + rmdir on the FAT disk under /mnt:");
+    for command in [
+        "mkdir /mnt/TMPDIR",
+        "ls /mnt",
+        "rm /mnt/TMPDIR",
+        "ls /mnt",
+    ] {
+        sh_println!("aether:{}> {}", cwd, command);
+        dispatch(&mut cwd, command);
+    }
+
     // Exercise the interactive key path (echo, Backspace, Enter) by feeding
     // decoded keys through the same `handle_key` the live loop uses. We "type"
     // `echX`, Backspace (erasing the X), then `o hi` and Enter, so the buffer

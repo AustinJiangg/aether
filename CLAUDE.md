@@ -146,7 +146,8 @@ subdirectory traversal, so `cd`/`ls`/`cat` descend into subdirectories; Stage 14
 the file write path, so `write`/`rm` land inside subdirectories too; Stage 14d-4 does the same for
 `mkdir`, so a directory can be created inside a subdirectory with a correct `..` back-link; Stage
 14d-5 grows a subdirectory past its first cluster (appending a cluster to its chain) when it fills
-up, so only `rmdir` remains). **Stage 15a (hardware
+up; and Stage 14d-6 adds `rmdir`, so `rm` removes an empty directory too — completing the FAT
+subdirectory work). **Stage 15a (hardware
 track) is also done**: the Local APIC and its timer (`apic.rs`) replace the 8259 PIC's timer. It
 maps the LAPIC's MMIO page uncacheable (`NO_CACHE` — device registers must bypass the cache),
 software-enables the APIC via the spurious-vector register, and masks the 8259 PIC, so hardware
@@ -519,7 +520,10 @@ Exit QEMU: `Ctrl-A` then `X`.
   `write /mnt/SUB/CHILD/DEEP.TXT` works (three-level traversal). Stage 14d-5 grows a subdirectory
   past its first cluster: when `find_dir_slot` finds no free entry, `grow_dir` walks to the chain's
   last cluster, allocates and zeroes a fresh one, and links it on (the fixed-size root still reports
-  `DirFull`). Still to do: `rmdir`.
+  `DirFull`). Stage 14d-6 adds `rmdir`: `FileSystem::remove` routes a directory to `remove_dir_in`,
+  which (via `dir_is_empty`) removes an *empty* directory — freeing its cluster chain and deleting
+  its parent entry — and refuses a non-empty one with `NotEmpty`/`FsError::DirNotEmpty` (no recursive
+  delete, unlike `RamFs`). This completes the FAT subdirectory work.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

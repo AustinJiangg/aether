@@ -612,6 +612,36 @@ fn fat_grows_a_directory() {
     assert!(after.is_empty(), "files remained after cleanup: {:?}", after);
 }
 
+/// Stage 14d-6: `rmdir` — the FAT driver removes an *empty* directory. Create a directory, put a
+/// file in it and confirm removing it then fails with `DirNotEmpty`, empty it, then remove the
+/// directory itself and confirm it is gone (reading, re-removing, and `is_dir` all agree).
+/// Self-cleaning: it leaves the disk image as it found it.
+#[test_case]
+fn fat_removes_a_directory() {
+    use crate::fs::{self, FsError};
+
+    // A dedicated directory, tolerating one left by an earlier interrupted run.
+    match fs::mkdir("/mnt/RMTEST") {
+        Ok(()) | Err(FsError::Exists) => {}
+        Err(e) => panic!("mkdir /mnt/RMTEST failed: {:?}", e),
+    }
+    assert!(fs::is_dir("/mnt/RMTEST"));
+
+    // A non-empty directory cannot be removed: rmdir refuses it with DirNotEmpty.
+    fs::write("/mnt/RMTEST/A.TXT", b"content").expect("writing into the dir failed");
+    assert_eq!(fs::remove("/mnt/RMTEST"), Err(FsError::DirNotEmpty));
+
+    // Empty it, then the directory itself is removable.
+    fs::remove("/mnt/RMTEST/A.TXT").expect("removing the inner file failed");
+    fs::remove("/mnt/RMTEST").expect("rmdir on the now-empty directory failed");
+
+    // Gone: it is no longer a directory, and re-removing reports NotFound.
+    assert!(!fs::is_dir("/mnt/RMTEST"));
+    assert_eq!(fs::remove("/mnt/RMTEST"), Err(FsError::NotFound));
+    let root = fs::list("/mnt").unwrap();
+    assert!(!root.iter().any(|(n, _)| n.as_str() == "RMTEST"));
+}
+
 /// Stage 14c-1: the FAT driver creates and overwrites a root-level file. Write a payload
 /// spanning several clusters through the global VFS (`/mnt/...`), read it back, and confirm the
 /// bytes round-trip — exercising free-cluster allocation, the cluster chain, and the directory

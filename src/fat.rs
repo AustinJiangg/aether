@@ -72,6 +72,8 @@ pub enum FatError {
     DirFull,
     /// Tried to create a directory (or file) at a name that already exists.
     Exists,
+    /// Tried to remove a directory that still contains entries (rmdir only removes empty ones).
+    NotEmpty,
     /// The requested name does not fit FAT's 8.3 short-name form (empty, an over-long base or
     /// extension, more than one `.`, or a disallowed character).
     InvalidName,
@@ -522,6 +524,7 @@ impl From<FatError> for FsError {
             FatError::IsDirectory => FsError::IsDir,
             FatError::NotADirectory => FsError::NotDir,
             FatError::Exists => FsError::Exists,
+            FatError::NotEmpty => FsError::DirNotEmpty,
             FatError::InvalidName => FsError::Unsupported,
             FatError::Io(_)
             | FatError::BadSignature
@@ -542,10 +545,10 @@ impl From<FatError> for FsError {
 /// side does the same for the parent directory before creating a file (14d-3) or subdirectory
 /// (14d-4):
 /// - `read` reads a file anywhere in the tree; `list`/`is_dir` operate on any directory;
-/// - `write`/`remove` create/overwrite or delete a **file** anywhere in the tree;
+/// - `write` creates/overwrites a **file** anywhere in the tree; `remove` deletes a file *or* an
+///   empty directory (rmdir, Stage 14d-6);
 /// - `mkdir` creates a **subdirectory** anywhere in the tree (its `..` pointing back at the parent),
 ///   growing the parent by a cluster when it is a full subdirectory (Stage 14d-5).
-///   Removing a directory (`rmdir`) is still a later step.
 impl FileSystem for Fat {
     /// Create a subdirectory anywhere in the tree: the parent path is traversed to a directory
     /// ([`Fat::resolve_dir`]), then a new subdirectory is created there (Stage 14d-4). Creating the
@@ -572,8 +575,11 @@ impl FileSystem for Fat {
         Ok(self.write_file_in(dir, name, data)?)
     }
 
-    /// Remove a file anywhere in the tree: traverse the parent path to a directory, then delete
-    /// the file there (Stage 14d-3). Removing a directory (`rmdir`) is a later step.
+    /// Remove a file or an *empty* directory anywhere in the tree: traverse the parent path to a
+    /// directory, then delete the target there — routing a file to [`Fat::remove_file_in`] and a
+    /// directory to [`Fat::remove_dir_in`] (rmdir, Stage 14d-6, which refuses a non-empty directory
+    /// with [`FsError::DirNotEmpty`]). Recursive removal of a non-empty tree is not supported here
+    /// (unlike [`RamFs`], which drops a directory's whole subtree).
     fn remove(&mut self, path: &str) -> Result<(), FsError> {
         let comps: Vec<&str> = crate::fs::components(path).collect();
         let (name, parents) = match comps.split_last() {
@@ -581,7 +587,11 @@ impl FileSystem for Fat {
             Some(split) => split,
         };
         let dir = self.resolve_dir(parents.iter().copied())?;
-        Ok(self.remove_file_in(dir, name)?)
+        match self.find_entry_in(dir, name)? {
+            None => Err(FsError::NotFound),
+            Some(entry) if entry.is_dir => Ok(self.remove_dir_in(dir, name)?),
+            Some(_) => Ok(self.remove_file_in(dir, name)?),
+        }
     }
 
     /// Read a file anywhere in the tree. All path components but the last are traversed as
@@ -959,7 +969,7 @@ impl Fat {
     /// Remove the file `name` from directory `dir` — the root or, since Stage 14d-3, a
     /// subdirectory: free its cluster chain, then mark its directory entry deleted. Fails with
     /// `NotFound` if there is no such entry, or `IsDirectory` if `name` names a subdirectory (this
-    /// removes only files; `rmdir` is a later step).
+    /// removes only files — the VFS routes a directory to [`Fat::remove_dir_in`]).
     fn remove_file_in(&self, dir: DirLocation, name: &str) -> Result<(), FatError> {
         let short = string_to_short_name(name).ok_or(FatError::InvalidName)?;
         let slot = match self.find_entry(dir, &short)? {
@@ -975,6 +985,53 @@ impl Fat {
             self.free_chain(first)?; // release the data clusters back to the free pool
         }
         // Mark the directory entry free by writing 0xE5 over the first byte of its name.
+        let mut buf = vec![0u8; SECTOR_SIZE];
+        ata::read_sector_from(self.drive, slot.lba, &mut buf)?;
+        buf[slot.offset] = NAME_DELETED;
+        ata::write_sector(self.drive, slot.lba, &buf)?;
+        Ok(())
+    }
+
+    /// Whether directory `dir` holds no entries beyond the `.` and `..` self/parent links — the
+    /// condition rmdir requires (Stage 14d-6). Reuses the shared scanner, which already skips free,
+    /// deleted, long-name, and volume-label entries, and stops at the first real child.
+    fn dir_is_empty(&self, dir: DirLocation) -> Result<bool, FatError> {
+        let found_child = self.scan_dir(dir, |name, _entry| {
+            if name != "." && name != ".." {
+                Some(()) // a real child: the directory is not empty, stop scanning
+            } else {
+                None
+            }
+        })?;
+        Ok(found_child.is_none())
+    }
+
+    /// Remove the *empty* subdirectory `name` from directory `dir` (rmdir, Stage 14d-6): confirm it
+    /// is a directory holding only `.`/`..`, free its cluster chain, then mark its entry in `dir`
+    /// deleted. Fails with `NotFound` (no such entry), `NotADirectory` (the name is a file — the
+    /// VFS routes those to [`Fat::remove_file_in`]), or `NotEmpty` (it still contains entries).
+    fn remove_dir_in(&self, dir: DirLocation, name: &str) -> Result<(), FatError> {
+        let short = string_to_short_name(name).ok_or(FatError::InvalidName)?;
+        let slot = match self.find_entry(dir, &short)? {
+            Some(slot) => slot,
+            None => return Err(FatError::NotFound),
+        };
+        let (first, is_dir) = slot.existing.expect("find_entry always sets `existing`");
+        if !is_dir {
+            return Err(FatError::NotADirectory);
+        }
+
+        // rmdir removes only empty directories. A well-formed subdirectory always has a cluster
+        // (>= 2) holding at least `.`/`..`, so guard the degenerate clusterless case (a corrupt
+        // entry) — neither scan nor free a non-data cluster, just drop the entry.
+        if first >= 2 {
+            if !self.dir_is_empty(DirLocation::Sub(first))? {
+                return Err(FatError::NotEmpty);
+            }
+            self.free_chain(first)?; // release the directory's own clusters (`.`/`..` and slack)
+        }
+
+        // Mark the entry in the parent deleted — the same final step as removing a file.
         let mut buf = vec![0u8; SECTOR_SIZE];
         ata::read_sector_from(self.drive, slot.lba, &mut buf)?;
         buf[slot.offset] = NAME_DELETED;
