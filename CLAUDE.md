@@ -190,7 +190,13 @@ device's vendor/device id, class code, header type, and BARs; `find_e1000` locat
 `0x8086`, device `0x100E`), and `Device::mmio_bar`/`interrupt_line` decode its MMIO register base
 and IRQ. QEMU now attaches `-device e1000,netdev=net0 -netdev user,id=net0` (SLIRP, no host
 privileges), and boot reports the six bus-0 functions and the e1000 (`00:03.0`, BAR0 `0xfeb80000`,
-IRQ 11). `ROADMAP.md` carries the forward
+IRQ 11). **Stage 17b-1 is now also done**: the kernel starts *driving* the e1000 (`e1000.rs`). Like
+the APIC, the NIC is an MMIO device, so `init` maps its 128 KiB BAR0 register block into the kernel
+address space **uncacheable** (`NO_CACHE`) and accesses it only through `volatile` reads/writes; to
+prove register access works before the descriptor-ring work, it reads the Device Status register and
+the card's MAC address out of Receive Address entry 0 (RAL0/RAH0, which QEMU's model pre-loads from
+its emulated EEPROM) — boot reports MAC `52:54:00:12:34:56`, link up, full-duplex, and the handle is
+stashed in a global for later sub-steps. `ROADMAP.md` carries the forward
 plan (stages 9-18): the user-space main line (system calls, per-process address spaces +
 ELF, multiprocessing), plus persistence, APIC/SMP, and networking tracks.
 
@@ -541,6 +547,16 @@ Exit QEMU: `Ctrl-A` then `X`.
   assigned IRQ. `find_e1000` locates QEMU's `-device e1000` (vendor `0x8086`, device `0x100E`); boot lists
   every bus-0 function and reports the NIC's MMIO BAR0 + IRQ, the register block Stage 17b maps. Pure
   read-only config-space reads, like the ACPI table walk; needs the heap (returns a `Vec`).
+- `src/e1000.rs`: Stage 17b Intel e1000 (82540EM) NIC driver — the second step of the networking track,
+  where the kernel starts *driving* the card 17a found. Stage 17b-1: `init` takes the `pci::Device`,
+  maps its 128 KiB BAR0 MMIO register block (32 pages) into the kernel address space **uncacheable**
+  (`NO_CACHE` — device registers must bypass the cache, like the APIC's), and reads its identity through
+  `volatile` register accesses (`read_reg`/`write_reg`): the Device Status register (`REG_STATUS`) and
+  the MAC address out of Receive Address entry 0 (`REG_RAL0`/`REG_RAH0`, pre-loaded from the emulated
+  EEPROM by QEMU at power-on). The `E1000` handle (MMIO virtual base + the 6-byte MAC) is stored in a
+  global `Mutex<Option<E1000>>` (`device()`/`present()`) for later sub-steps; `link_up()`/`full_duplex()`
+  decode STATUS. The MMIO block is mapped at `E1000_VIRT_BASE` (L4 slot 101, one slot above the APIC's).
+  Descriptor rings, TX/RX, and the IRQ come in later sub-steps (17b-2+).
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

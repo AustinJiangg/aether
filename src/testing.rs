@@ -661,6 +661,29 @@ fn pci_finds_the_e1000_nic() {
     assert!(mmio != 0, "e1000 BAR0 (MMIO base) should be non-zero");
 }
 
+/// Stage 17b-1: the e1000 driver mapped the card's MMIO register block and read its identity over
+/// it. `kernel_main` calls `e1000::init` at boot (before this harness), which maps BAR0 uncacheable
+/// and reads the MAC out of Receive Address entry 0. So by now the card must be present and report a
+/// real MAC — non-zero and not the all-ones "no device" pattern — proving uncacheable MMIO register
+/// reads reach the hardware.
+#[test_case]
+fn e1000_reads_its_identity() {
+    use crate::e1000;
+
+    assert!(e1000::present(), "e1000 was not brought up during boot");
+    let dev = e1000::device().expect("e1000 device handle missing");
+
+    // A valid MAC is neither all-zeros nor all-ones (an unmapped register reads back 0xFF..).
+    let mac = dev.mac();
+    assert_ne!(mac, [0x00; 6], "e1000 MAC read back as all zeros");
+    assert_ne!(mac, [0xFF; 6], "e1000 MAC read back as all ones (register not reaching the device)");
+
+    // The Device Status register reads back a plausible value: bit 7 (reserved on the 8254x) reads
+    // as 0, and the whole dword is not the all-ones of an unmapped read.
+    let status = dev.status();
+    assert_ne!(status, 0xFFFF_FFFF, "e1000 STATUS read back as all ones");
+}
+
 /// Stage 14c-1: the FAT driver creates and overwrites a root-level file. Write a payload
 /// spanning several clusters through the global VFS (`/mnt/...`), read it back, and confirm the
 /// bytes round-trip — exercising free-cluster allocation, the cluster chain, and the directory

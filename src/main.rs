@@ -79,6 +79,7 @@ mod allocator;
 mod ata;
 mod fat;
 mod pci;
+mod e1000;
 mod task;
 // The Stage 6 thread scheduler is dormant during Stage 7: the kernel runs the
 // async executor (the shell) instead, so the scheduler's spawn/run/yield sit
@@ -669,10 +670,31 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 bar0,
                 nic.interrupt_line(),
             );
-            println!(
-                "Network: found Intel e1000 NIC (MMIO at {:#x}); driver bring-up is next.",
-                bar0
-            );
+
+            // Stage 17b-1: start driving the card. Map its MMIO register block (uncacheable, like
+            // the APIC's) into virtual memory and read its identity — the MAC address and Device
+            // Status register — to prove register access works before the descriptor-ring work.
+            // `init` stashes the card globally; we read it back through the global accessors for the
+            // summary line, confirming that path works too.
+            if e1000::init(&nic, &mut mapper, &mut frame_allocator).is_some() {
+                if let Some(dev) = e1000::device() {
+                    let mac = dev.mac();
+                    println!(
+                        "Network: e1000 up (present={}), MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, link {}, {}-duplex.",
+                        e1000::present(),
+                        mac[0],
+                        mac[1],
+                        mac[2],
+                        mac[3],
+                        mac[4],
+                        mac[5],
+                        if dev.link_up() { "up" } else { "down" },
+                        if dev.full_duplex() { "full" } else { "half" },
+                    );
+                }
+            } else {
+                println!("Network: e1000 found but BAR0 was not a memory BAR (unexpected).");
+            }
         }
         None => {
             serial_println!("[pci] no e1000 NIC found (is QEMU started with -device e1000?)");

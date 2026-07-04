@@ -352,6 +352,20 @@ unify later.
 > -netdev user,id=net0` (SLIRP — no host privileges, works in WSL2). Boot lists the six bus-0 functions
 > and reports the e1000 at `00:03.0` with MMIO BAR0 `0xfeb80000`, IRQ 11 — the register block Stage 17b
 > maps. Verified by 44 tests (the new `pci_finds_the_e1000_nic`).
+>
+> **Stage 17b-1 is also done** — reaching the e1000's registers. Like the APIC, the e1000 is an MMIO
+> device: it exposes a 128 KiB register block at the physical address in its BAR0, and we drive it by
+> reading/writing those registers. A new `e1000.rs` maps that whole block (32 pages) into the kernel
+> address space **uncacheable** (`NO_CACHE`) — device registers must bypass the cache, or reads see a
+> stale copy and writes never reach the card — and accesses it only through `volatile` reads/writes (so
+> the optimizer cannot reorder or elide them). To prove register access works end to end before the
+> descriptor-ring work, `init` reads two things that need no setup: the **Device Status** register (link
+> up, speed, duplex) and the card's **MAC address**, which QEMU's model has already loaded from its
+> emulated EEPROM into Receive Address entry 0 (RAL0/RAH0) by power-on. Boot logs the mapped block, the
+> MAC `52:54:00:12:34:56` (AV bit set), and STATUS `0x80080783` (link up, full-duplex). The handle is
+> stashed in a global for later sub-steps. Verified by 45 tests (the new `e1000_reads_its_identity`:
+> the card is present and reports a MAC that is neither all-zeros nor all-ones). Next (17b-2): device
+> reset and general configuration.
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|
