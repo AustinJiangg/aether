@@ -381,9 +381,11 @@ unify later.
     `write`/`remove` resolve the parent path and create or delete a file inside a subdirectory
     (`write /mnt/SUB/x`). Stage 14d-4 does the same for `mkdir`: `make_dir_in(parent, name)` sets
     the new directory's `..` back-link to the parent's first cluster (0 for the root), so
-    `mkdir /mnt/SUB/CHILD` — and then `write /mnt/SUB/CHILD/DEEP.TXT` — works. Still to do:
-    **growing a directory** past its first cluster when its entries fill up (Stage 14d-5; a full
-    directory reports `DirFull` for now), and removing a directory (`rmdir`).
+    `mkdir /mnt/SUB/CHILD` — and then `write /mnt/SUB/CHILD/DEEP.TXT` — works. Stage 14d-5 **grows a
+    directory** past its first cluster: when `find_dir_slot` finds no free entry in a subdirectory,
+    `grow_dir` appends a fresh, zeroed cluster to the directory's chain and puts the new entry there
+    (the fixed-size root still reports `DirFull`), so a subdirectory no longer caps at 14 files.
+    Still to do: removing a directory (`rmdir`).
   - Still open: upgrade `bootloader` 0.9 → 0.11 (framebuffer, modern boot info). (Unifying the
     async executor with the thread scheduler is already done — Stage 16d-5.)
 

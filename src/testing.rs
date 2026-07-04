@@ -557,6 +557,61 @@ fn fat_mkdir_in_subdirectory() {
     assert_eq!(fs::mkdir("/mnt/NODIR/x"), Err(FsError::NotFound));
 }
 
+/// Stage 14d-5: a subdirectory grows past its first cluster. Our test image has one sector per
+/// cluster (512 B = 16 directory entries), and a fresh subdirectory already spends two entries on
+/// `.`/`..`, so its first cluster holds only 14 files. Creating more than that must append a second
+/// cluster to the directory's chain instead of failing with `DirFull`. We create 20 files (forcing
+/// the grow), read each back (proving the appended cluster is walked on the read path), and confirm
+/// all 20 list. Then we delete them — self-cleaning at the file level; the directory keeps its now
+/// two clusters, which real FAT never shrinks, so a later run reuses the freed slots.
+#[test_case]
+fn fat_grows_a_directory() {
+    use crate::fs::{self, FsError};
+    use alloc::format;
+
+    const N: usize = 20; // > 14, so the first cluster overflows and the directory must grow
+
+    // A dedicated directory, tolerating one left by a previous run (no rmdir yet).
+    match fs::mkdir("/mnt/BIGDIR") {
+        Ok(()) | Err(FsError::Exists) => {}
+        Err(e) => panic!("mkdir /mnt/BIGDIR failed: {:?}", e),
+    }
+
+    // Create N files with distinct contents, forcing the directory past its first cluster.
+    for i in 0..N {
+        let path = format!("/mnt/BIGDIR/F{}.TXT", i);
+        let content = format!("file number {}", i);
+        fs::write(&path, content.as_bytes()).expect("writing a file in the growing dir failed");
+    }
+
+    // Every file reads back correctly — the entry in the appended cluster is found and its data
+    // chain is followed.
+    for i in 0..N {
+        let path = format!("/mnt/BIGDIR/F{}.TXT", i);
+        let expected = format!("file number {}", i);
+        assert_eq!(fs::read(&path).unwrap(), expected.as_bytes());
+    }
+
+    // All N files list, so the scan crossed the cluster boundary into the appended cluster.
+    let entries = fs::list("/mnt/BIGDIR").unwrap();
+    for i in 0..N {
+        let name = format!("F{}.TXT", i);
+        assert!(
+            entries.iter().any(|(n, is_dir)| n.as_str() == name && !*is_dir),
+            "missing {} after growing the directory",
+            name
+        );
+    }
+
+    // Clean up the files (the directory itself stays, two clusters long).
+    for i in 0..N {
+        let path = format!("/mnt/BIGDIR/F{}.TXT", i);
+        fs::remove(&path).expect("removing a file from the grown dir failed");
+    }
+    let after = fs::list("/mnt/BIGDIR").unwrap();
+    assert!(after.is_empty(), "files remained after cleanup: {:?}", after);
+}
+
 /// Stage 14c-1: the FAT driver creates and overwrites a root-level file. Write a payload
 /// spanning several clusters through the global VFS (`/mnt/...`), read it back, and confirm the
 /// bytes round-trip — exercising free-cluster allocation, the cluster chain, and the directory

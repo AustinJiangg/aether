@@ -67,7 +67,8 @@ pub enum FatError {
     BadChain,
     /// The volume has no free cluster left to allocate (the disk is full).
     NoSpace,
-    /// The root directory has no free entry left for a new file.
+    /// The fixed-size root directory has no free entry left (only the root can be full — a
+    /// subdirectory grows by a cluster instead).
     DirFull,
     /// Tried to create a directory (or file) at a name that already exists.
     Exists,
@@ -542,9 +543,9 @@ impl From<FatError> for FsError {
 /// (14d-4):
 /// - `read` reads a file anywhere in the tree; `list`/`is_dir` operate on any directory;
 /// - `write`/`remove` create/overwrite or delete a **file** anywhere in the tree;
-/// - `mkdir` creates a **subdirectory** anywhere in the tree (its `..` pointing back at the parent).
-///   Removing a directory (`rmdir`) is still a later step, and a directory that fills its first
-///   cluster is not yet grown (Stage 14d-5), so it reports [`FsError::Io`] (`DirFull`).
+/// - `mkdir` creates a **subdirectory** anywhere in the tree (its `..` pointing back at the parent),
+///   growing the parent by a cluster when it is a full subdirectory (Stage 14d-5).
+///   Removing a directory (`rmdir`) is still a later step.
 impl FileSystem for Fat {
     /// Create a subdirectory anywhere in the tree: the parent path is traversed to a directory
     /// ([`Fat::resolve_dir`]), then a new subdirectory is created there (Stage 14d-4). Creating the
@@ -848,9 +849,10 @@ impl Fat {
 
     /// Locate the slot for `short` in directory `dir`: the existing entry of that name (to
     /// overwrite), or the first free slot (to create in). Works on the root or a subdirectory
-    /// (Stage 14d-3). Errors with `DirFull` if the name is absent and the directory has no free
-    /// slot — a subdirectory that fills its cluster(s) is not yet grown (that is Stage 14d-5), so
-    /// it too reports `DirFull` for now.
+    /// (Stage 14d-3). If the name is absent and no slot is free, the **root** directory is
+    /// genuinely full (`DirFull` — it is a fixed-size region on FAT16), while a **subdirectory** is
+    /// grown by one cluster (Stage 14d-5, [`grow_dir`](Fat::grow_dir)) and the new entry placed at
+    /// its start.
     fn find_dir_slot(&self, dir: DirLocation, short: &[u8; 11]) -> Result<DirSlot, FatError> {
         if let Some(slot) = self.find_entry(dir, short)? {
             return Ok(slot); // overwrite an existing entry of the same name
@@ -868,7 +870,54 @@ impl Fat {
                 }
             }
         }
-        Err(FatError::DirFull)
+
+        // Every existing slot is in use. The fixed-size root directory cannot grow, so it is
+        // genuinely full; a subdirectory is a cluster chain in the data area, so append a fresh
+        // cluster and put the new entry at its start (Stage 14d-5).
+        match dir {
+            DirLocation::Root => Err(FatError::DirFull),
+            DirLocation::Sub(first) => self.grow_dir(first),
+        }
+    }
+
+    /// Append a fresh, zeroed cluster to the end of subdirectory chain `first_cluster` and return a
+    /// [`DirSlot`] at its very first entry (Stage 14d-5). Called by
+    /// [`find_dir_slot`](Fat::find_dir_slot) when a subdirectory's existing clusters are all in use.
+    /// A subdirectory is stored as a cluster chain in the data area, so unlike the fixed-size root
+    /// it can grow. Zeroing the new cluster makes every entry past the one about to be written read
+    /// as free (a `0x00` first byte is the end-of-directory marker); the new cluster is linked in
+    /// only *after* it is zeroed, so the directory chain never briefly includes garbage. `NoSpace`
+    /// (a full disk) leaves the directory unchanged. A cluster orphaned by a later I/O error is a
+    /// benign leak, as elsewhere in the write path.
+    fn grow_dir(&self, first_cluster: u16) -> Result<DirSlot, FatError> {
+        // Walk to the last cluster of the chain — the one whose FAT entry is an end-of-chain marker
+        // rather than another data cluster. Bounded against a corrupt/looping chain.
+        let max_steps = self.bpb.count_of_clusters() as usize + 2;
+        let mut last = first_cluster;
+        let mut steps = 0usize;
+        loop {
+            steps += 1;
+            if steps > max_steps {
+                return Err(FatError::BadChain);
+            }
+            let next = self.next_cluster(last)?;
+            if !is_data_cluster(next) {
+                break; // `last` is the final cluster; `next` is the end-of-chain marker
+            }
+            last = next;
+        }
+
+        // Claim a new cluster (alloc_cluster marks it EOC), zero all its sectors so every entry
+        // reads free, then link the old tail to it — extending the directory by one cluster.
+        let new = self.alloc_cluster()?.ok_or(FatError::NoSpace)?;
+        let zero = vec![0u8; SECTOR_SIZE];
+        let lba = self.cluster_lba(new);
+        for s in 0..self.bpb.sectors_per_cluster as u32 {
+            ata::write_sector(self.drive, lba + s, &zero)?;
+        }
+        self.write_fat_entry(last, new)?;
+
+        Ok(DirSlot { lba, offset: 0, existing: None })
     }
 
     /// Create or overwrite the file `name` with `data` inside directory `dir` — the root or, since
@@ -990,8 +1039,8 @@ impl Fat {
     /// Stage 14d-4, another subdirectory. Allocates a cluster, initializes it with `.`/`..` (the
     /// `..` pointing back at `parent`), then adds a directory entry (with `ATTR_DIRECTORY`) for it
     /// in `parent`. Fails with `InvalidName` (not a valid 8.3 name), `Exists` (the name is taken),
-    /// `DirFull` (the parent has no free slot — a full subdirectory is not grown until Stage
-    /// 14d-5), or `NoSpace` (the disk is full).
+    /// `DirFull` (a full *root* directory — a full subdirectory is grown instead, Stage 14d-5), or
+    /// `NoSpace` (the disk is full).
     fn make_dir_in(&self, parent: DirLocation, name: &str) -> Result<(), FatError> {
         let short = string_to_short_name(name).ok_or(FatError::InvalidName)?;
 

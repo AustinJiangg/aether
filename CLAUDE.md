@@ -144,8 +144,9 @@ marks its directory entry deleted, wired into `FileSystem::remove` (so `rm /mnt/
 `RamFs` behind the VFS (root-level `mkdir` since Stage 14d-1; Stage 14d-2 adds read-path
 subdirectory traversal, so `cd`/`ls`/`cat` descend into subdirectories; Stage 14d-3 extends it to
 the file write path, so `write`/`rm` land inside subdirectories too; Stage 14d-4 does the same for
-`mkdir`, so a directory can be created inside a subdirectory with a correct `..` back-link — growing
-a full directory and `rmdir` remain). **Stage 15a (hardware
+`mkdir`, so a directory can be created inside a subdirectory with a correct `..` back-link; Stage
+14d-5 grows a subdirectory past its first cluster (appending a cluster to its chain) when it fills
+up, so only `rmdir` remains). **Stage 15a (hardware
 track) is also done**: the Local APIC and its timer (`apic.rs`) replace the 8259 PIC's timer. It
 maps the LAPIC's MMIO page uncacheable (`NO_CACHE` — device registers must bypass the cache),
 software-enables the APIC via the spurious-vector register, and masks the 8259 PIC, so hardware
@@ -515,8 +516,10 @@ Exit QEMU: `Ctrl-A` then `X`.
   takes a `DirLocation`, and `FileSystem::mkdir` resolves the parent path — the crucial detail is
   that the new directory's `..` back-link is set to the parent's first cluster (0 for the root, the
   subdirectory's own first cluster otherwise), so `mkdir /mnt/SUB/CHILD` then
-  `write /mnt/SUB/CHILD/DEEP.TXT` works (three-level traversal). Still to do: growing a subdirectory
-  past its first cluster (Stage 14d-5) — a full directory reports `DirFull` for now — and `rmdir`.
+  `write /mnt/SUB/CHILD/DEEP.TXT` works (three-level traversal). Stage 14d-5 grows a subdirectory
+  past its first cluster: when `find_dir_slot` finds no free entry, `grow_dir` walks to the chain's
+  last cluster, allocates and zeroes a fresh one, and links it on (the fixed-size root still reports
+  `DirFull`). Still to do: `rmdir`.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run
