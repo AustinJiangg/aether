@@ -78,6 +78,10 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     idt.general_protection_fault
         .set_handler_fn(general_protection_fault_handler);
     idt[InterruptIndex::Keyboard.as_usize()].set_handler_fn(keyboard_interrupt_handler);
+    // Stage 17b-6: the e1000 NIC's receive interrupt, routed by the IO-APIC from the card's
+    // IRQ line (see `apic::route_pci_irq`). The handler drains received frames from the RX
+    // ring instead of the driver polling for them.
+    idt[E1000_VECTOR as usize].set_handler_fn(e1000_interrupt_handler);
     // Stage 15: the Local APIC's spurious-interrupt vector. The APIC can deliver a
     // "spurious" interrupt here (e.g. when an IRQ is masked just as it is being
     // accepted); by the architecture it requires no EOI. With no handler registered it
@@ -168,6 +172,13 @@ impl InterruptIndex {
         usize::from(self.as_u8())
     }
 }
+
+/// The vector the e1000 NIC's interrupt is routed to through the IO-APIC (Stage 17b-6).
+/// The card reports IRQ 11 in its PCI `interrupt_line`; the conventional vector for IRQ11 is
+/// `PIC_1_OFFSET + 11` = 43, clear of the timer (32), keyboard (33), self-IPI-test (0x40),
+/// syscall (0x80), and spurious (0xFF) vectors. `apic::route_pci_irq(11, E1000_VECTOR)` arms
+/// the IO-APIC redirection entry that delivers it here.
+pub const E1000_VECTOR: u8 = PIC_1_OFFSET + 11;
 
 /// Initialize and remap the PICs. Call once after the IDT is loaded and before
 /// enabling interrupts with `sti`.
@@ -455,6 +466,21 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     // Acknowledge the interrupt. Since Stage 15b the keyboard IRQ arrives through the
     // IO-APIC, so — like the timer — its EOI goes to the Local APIC's EOI register, not
     // the 8259 PIC.
+    crate::apic::end_of_interrupt();
+}
+
+/// Handler for the e1000 NIC's receive interrupt (Stage 17b-6, on [`E1000_VECTOR`], routed by
+/// the IO-APIC from the card's IRQ line).
+///
+/// It delegates to the driver's `on_interrupt`, which *reads and clears the card's interrupt
+/// cause* (mandatory for a level-triggered PCI IRQ — until the cause is cleared the card keeps
+/// its line asserted and the interrupt re-fires without end) and drains any received frames
+/// from the RX ring, then acknowledges the interrupt at the Local APIC. Order matters: the
+/// device cause is cleared first (inside `on_interrupt`), the LAPIC EOI last — the EOI tells the
+/// IO-APIC to re-sample the (now de-asserted) line, so a level-triggered interrupt is not
+/// spuriously retriggered.
+extern "x86-interrupt" fn e1000_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    crate::e1000::on_interrupt();
     crate::apic::end_of_interrupt();
 }
 

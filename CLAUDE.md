@@ -226,9 +226,23 @@ loopback bit, reached through the `MDIC` register since the PHY is not memory-ma
 `loopback_selftest` enables loopback, sends a 60-byte frame to our own MAC, and `receive()` polls the
 RX descriptor's Done bit and reads the frame back. Two QEMU behaviors had to be handled: a looped
 frame is dropped while the receiver is not ready, and the e1000 link is not ready to receive until
-~0.9 s into boot — so the selftest resends (watching RDH) until it comes back, bounded. `ROADMAP.md`
-carries the forward plan (stages 9-18): the user-space main line (system calls, per-process address
-spaces + ELF, multiprocessing), plus persistence, APIC/SMP, and networking tracks.
+~0.9 s into boot — so the selftest resends (watching RDH) until it comes back, bounded. **Stage 17b-6
+is now also done**: interrupt-driven receive, so the card *tells* the kernel a frame arrived instead
+of the driver polling. `apic::route_pci_irq` programs an IO-APIC redirection entry for the card's IRQ
+(11, from PCI `interrupt_line`; on QEMU's i440fx a PCI interrupt lands on the IO-APIC pin equal to
+that ISA IRQ) to vector 43 — **level-triggered, active-low** (the PCI convention, so `set_redirection`
+grew a `level` flag; the keyboard stays edge/active-high); `e1000::enable_rx_interrupt` sets the RXT0
+receive cause in IMS to arm the card; and a new IDT gate (`e1000_interrupt_handler`) calls
+`e1000::on_interrupt`, which **reads ICR first** (clearing the cause de-asserts the level-triggered
+line, or it re-fires forever) then drains the RX ring, before the LAPIC EOI. The handler reads ICR
+through a lock-free cached `MMIO_BASE` atomic and drains under a `try_lock` (a handler must never
+block on a lock the interrupted code holds); `interrupt_selftest` proves it without polling by looping
+a frame back and waiting for the *handler* to drain it (transmitting under `without_interrupts` so the
+synchronously-raised IRQ is delivered only after the device lock is dropped, avoiding a single-core
+deadlock). This completes the e1000 driver (reset/config, RX+TX rings, transmit, interrupt-driven
+receive). `ROADMAP.md` carries the forward plan (stages 9-18): the user-space main line (system calls,
+per-process address spaces + ELF, multiprocessing), plus persistence, APIC/SMP, and networking tracks
+— next is Stage 18, a minimal ARP+IPv4+ICMP network stack.
 
 ## Language and writing conventions
 
@@ -320,6 +334,9 @@ Exit QEMU: `Ctrl-A` then `X`.
   it bumps that core's per-CPU tick count, EOIs, and (Stage 16d-4) calls `sched::preempt`
   to round-robin this core's *own* per-CPU run queue — leaving the global tally and the
   process scheduler BSP-only; `init_idt_ap` points a woken AP's IDTR at the one shared IDT.
+  Stage 17b-6 adds the e1000 NIC's receive-interrupt gate: `E1000_VECTOR` (= `PIC_1_OFFSET + 11`
+  = 43) whose `e1000_interrupt_handler` calls `e1000::on_interrupt` (which reads/clears the card's
+  ICR — mandatory for the level-triggered PCI IRQ — and drains the RX ring) then EOIs the LAPIC.
 - `src/apic.rs`: Stage 15 APIC (Advanced Programmable Interrupt Controller) support.
   `init` maps the Local APIC's MMIO page uncacheable (`NO_CACHE`), software-enables it
   via the spurious-vector register, masks the 8259 PIC, then *calibrates* the LAPIC
@@ -330,7 +347,9 @@ Exit QEMU: `Ctrl-A` then `X`.
   shell's `uptime` reads it). Stage 15b adds the IO-APIC (accessed
   indirectly via IOREGSEL/IOWIN): `init` maps it uncacheable and programs the keyboard's
   redirection entry to route IRQ1 to vector 33 (`ioapic_redirection` reads an entry back
-  for the test). The 8259 PIC is now masked; all hardware interrupts come via the APIC. Stage 16a adds
+  for the test). `set_redirection` takes a `level` flag — edge/active-high for the ISA keyboard,
+  and (Stage 17b-6) level/active-low for PCI, exposed as `route_pci_irq(irq, vector)` which the e1000
+  driver uses to route its IRQ. The 8259 PIC is now masked; all hardware interrupts come via the APIC. Stage 16a adds
   `lapic_id()`, which reads this core's own Local APIC ID register (used to identify the BSP). Stage
   16b-1 adds `send_fixed_ipi(dest, vector)`, which issues an inter-processor interrupt through the ICR
   (Interrupt Command Register: write the destination apic id, then the low half to send, then poll
@@ -621,8 +640,16 @@ Exit QEMU: `Ctrl-A` then `X`.
   buffer, recycles the descriptor (clear status, move RDT onto it, advance the `rx_cur` cursor), and
   returns the length. `loopback_selftest` enables loopback, sends a 60-byte frame to our own MAC
   (accepted via Receive Address 0), and receives it — resending while watching RDH because QEMU drops a
-  looped frame until the link settles (~0.9 s into boot). The RX interrupt (IRQ 11 via the IO-APIC)
-  comes in a later sub-step (17b-6).
+  looped frame until the link settles (~0.9 s into boot). Stage 17b-6: interrupt-driven receive. `init`
+  publishes the MMIO base into a lock-free `MMIO_BASE` atomic so the handler can read/clear ICR without
+  the device `Mutex`; `enable_interrupts(irq)` routes the card's IRQ through the IO-APIC
+  (`apic::route_pci_irq`, level-triggered/active-low) to `interrupts::E1000_VECTOR` and arms the RX
+  cause in `REG_IMS` (`enable_rx_interrupt`); `on_interrupt` (called from `interrupts.rs`'s new gate)
+  reads `REG_ICR` (clearing the cause de-asserts the level line) and, under a `try_lock`, drains the RX
+  ring, bumping `RX_IRQ_COUNT`/`RX_FRAMES_VIA_IRQ`/`LAST_RX_LEN`. `interrupt_selftest` proves it without
+  polling: loopback a frame and wait for the *handler* to drain it, transmitting under
+  `without_interrupts` so the synchronously-raised IRQ arrives only after the device lock is dropped
+  (no single-core deadlock). This completes the e1000 driver.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

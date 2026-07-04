@@ -95,9 +95,38 @@
 //! our experimental broadcast; nothing comes back until we speak a real protocol, in Stage 18.) The
 //! demo transmits one minimum-length raw Ethernet frame and checks DD; consuming *received* frames
 //! is the next sub-step.
+//!
+//! ## 17b-6: interrupt-driven receive
+//!
+//! Until now the driver *polls* the RX ring (`receive` reads the descriptor's Done bit). A real
+//! driver instead lets the card tell it when a frame arrives, via an interrupt — the CPU does other
+//! work and is only pulled in when there is a packet. Three pieces:
+//!
+//! 1. **Route the card's IRQ.** The e1000 raises a PCI interrupt line; the IO-APIC must forward it
+//!    to a CPU vector (`apic::route_pci_irq(irq, E1000_VECTOR)`). Unlike the keyboard's ISA IRQ, a
+//!    PCI interrupt is **level-triggered and active-low**: the card holds the line asserted until
+//!    the driver clears the cause, so the redirection entry must say "level" or the interrupt is
+//!    mishandled.
+//! 2. **Arm the card.** Writing the receive causes (RXT0 | RXDMT0) to the Interrupt Mask Set
+//!    register (IMS) tells the card to actually assert its line when a frame lands.
+//! 3. **Handle it.** The interrupt handler ([`on_interrupt`]) *reads ICR* first — that returns and
+//!    clears the pending causes, de-asserting the (level-triggered) line, without which the
+//!    interrupt would re-fire forever — then drains every ready frame from the ring. It must use a
+//!    `try_lock`: a handler may never block on a lock the interrupted code holds, so if the device
+//!    is momentarily busy it clears the cause and returns, leaving frames in the ring for later.
+//!
+//! We prove it with loopback again ([`interrupt_selftest`]), but this time we do *not* poll: we send
+//! a frame to ourselves and wait for the handler to have drained it. The one trick is that QEMU
+//! delivers a looped frame synchronously during the transmit's doorbell write, so the transmit runs
+//! with interrupts disabled — the raised IRQ stays pending until we drop the device lock and
+//! re-enable interrupts, at which point the handler takes the lock cleanly (rather than deadlocking
+//! against the transmit that still holds it, on our single boot core).
+
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use spin::Mutex;
 use x86_64::{
+    instructions::interrupts::without_interrupts,
     structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, PhysFrame, Size4KiB},
     PhysAddr, VirtAddr,
 };
@@ -123,8 +152,20 @@ const REG_CTRL: u64 = 0x0000;
 const REG_STATUS: u64 = 0x0008;
 /// Interrupt Cause Read — reading it returns and clears the pending interrupt causes.
 const REG_ICR: u64 = 0x00C0;
+/// Interrupt Mask Set — writing a 1 to a bit enables (unmasks) that interrupt cause (Stage 17b-6).
+const REG_IMS: u64 = 0x00D0;
 /// Interrupt Mask Clear — writing a 1 to a bit disables (masks) that interrupt cause.
 const REG_IMC: u64 = 0x00D8;
+
+// --- Interrupt cause / mask bits (shared by ICR, IMS, IMC), Stage 17b-6 ---
+
+/// Receive Descriptor Minimum Threshold hit — the free-descriptor count fell below RCTL's
+/// threshold (the ring is filling up). We enable it alongside RXT0 as a second "frames waiting"
+/// signal.
+const ICR_RXDMT0: u32 = 1 << 4;
+/// Receiver Timer interrupt — a frame has been received (with the receive delay timer at 0, as
+/// after reset, the card raises this immediately per frame). This is the "a packet arrived" cause.
+const ICR_RXT0: u32 = 1 << 7;
 /// Multicast Table Array: 128 32-bit entries (0x5200..0x5400) that filter which multicast MAC
 /// addresses the receiver accepts.
 const REG_MTA: u64 = 0x5200;
@@ -328,6 +369,20 @@ const RXD_STAT_DD: u8 = 1 << 0;
 /// threading a handle through boot. The fields are plain data, so this is safe to move into a
 /// `Mutex`.
 static DEVICE: Mutex<Option<E1000>> = Mutex::new(None);
+
+/// The card's mapped MMIO base, published separately from [`DEVICE`] (Stage 17b-6). The interrupt
+/// handler needs to read/clear ICR *without* taking the device `Mutex` (it may not block on a lock
+/// the interrupted code holds), so `init` stores the base here where the handler can reach it lock-free.
+/// Zero until the card is up.
+static MMIO_BASE: AtomicU64 = AtomicU64::new(0);
+
+/// How many times the e1000 receive interrupt handler ran and saw a receive cause (Stage 17b-6).
+static RX_IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
+/// How many frames the interrupt handler drained from the RX ring (Stage 17b-6). Distinct from
+/// [`RX_IRQ_COUNT`] because one interrupt can cover several arrived frames.
+static RX_FRAMES_VIA_IRQ: AtomicU64 = AtomicU64::new(0);
+/// Length of the most recent frame the interrupt handler drained (Stage 17b-6), for the self-test.
+static LAST_RX_LEN: AtomicUsize = AtomicUsize::new(0);
 
 /// A handle on the e1000 NIC: the virtual base of its mapped register block, its MAC address, and
 /// whether the reset completed. `Copy` so a caller can take a snapshot out of the global without
@@ -840,6 +895,20 @@ impl E1000 {
         self.rx_cur = ((idx + 1) % RX_DESC_COUNT) as u16;
         Some(len)
     }
+
+    /// Stage 17b-6: arm the card's receive interrupt. Writing the receive causes (RXT0, a frame
+    /// arrived; RXDMT0, the ring is filling) to the Interrupt Mask Set register tells the card to
+    /// assert its IRQ line on those events. The IO-APIC must already route that line to a handled
+    /// vector ([`crate::interrupts::E1000_VECTOR`]) before this is called, or the card would assert
+    /// a line nothing listens to.
+    ///
+    /// # Safety
+    ///
+    /// The MMIO block must be mapped. Unmasking a cause only enables an interrupt source; the handler
+    /// for the routed vector must be registered first.
+    unsafe fn enable_rx_interrupt(&self) {
+        self.write_reg(REG_IMS, ICR_RXT0 | ICR_RXDMT0);
+    }
 }
 
 /// Map the e1000's 128 KiB MMIO register block at [`E1000_VIRT_BASE`], uncacheable.
@@ -892,6 +961,11 @@ pub fn init(
 ) -> Option<E1000> {
     let phys_base = nic.mmio_bar(0)?;
     map_mmio(phys_base, mapper, frame_allocator);
+
+    // Stage 17b-6: publish the MMIO base so the interrupt handler can read/clear ICR without taking
+    // the device lock. Release-ordered so a handler that later sees a non-zero base also sees the
+    // mapping established.
+    MMIO_BASE.store(E1000_VIRT_BASE, Ordering::Release);
 
     // Enable PCI bus mastering before any DMA: the descriptor rings and packet buffers are all DMA,
     // and the card cannot touch host memory until this is set (the command register resets to 0 at
@@ -1090,4 +1164,171 @@ pub fn loopback_selftest() -> bool {
             }
         }
     }
+}
+
+/// Stage 17b-6: switch the receive path from polling to interrupts. Route the card's PCI IRQ line
+/// through the IO-APIC to the handled e1000 vector, then arm the card's receive interrupt (IMS), so
+/// a received frame raises an interrupt that [`on_interrupt`] services. `irq` is the card's
+/// `interrupt_line` from PCI config space. Order matters: the IDT gate and the IO-APIC route are put
+/// in place before the card is told (via IMS) to assert its line.
+pub fn enable_interrupts(irq: u8) {
+    // Route the card's IRQ line to our vector first (the handler is already in the IDT).
+    apic::route_pci_irq(irq, crate::interrupts::E1000_VECTOR);
+    let guard = DEVICE.lock();
+    if let Some(dev) = guard.as_ref() {
+        // SAFETY: the device is initialized (MMIO mapped); IMS is a valid register and setting the
+        // receive-cause bits only unmasks those interrupt sources. The E1000_VECTOR handler is
+        // registered and the IO-APIC route is now in place, so the asserted line has a destination.
+        unsafe { dev.enable_rx_interrupt() };
+    }
+    serial_println!("[e1000] receive interrupt armed (IRQ{} -> IO-APIC, IMS set)", irq);
+}
+
+/// Stage 17b-6: the receive-interrupt bottom half, called from the IDT handler
+/// (`interrupts::e1000_interrupt_handler`). Reads and clears the card's interrupt cause — mandatory
+/// for a level-triggered PCI interrupt, or the line stays asserted and the interrupt re-fires
+/// endlessly — and, if a receive cause is set, drains every ready frame from the RX ring.
+///
+/// Draining uses `try_lock`: an interrupt handler must never *block* on a lock the code it
+/// interrupted might hold (a single-core deadlock). If the device is momentarily locked elsewhere
+/// (e.g. a polled transmit), we still clear the cause and return; the frames stay in the ring
+/// (Descriptor Done set) for the next drain. Runs in interrupt context, so it only counts and
+/// measures frames — a real driver would hand each up to the network stack (Stage 18).
+pub fn on_interrupt() {
+    let base = MMIO_BASE.load(Ordering::Acquire);
+    if base == 0 {
+        return; // the card is not up yet
+    }
+    // Read ICR: returns the pending causes and clears them, de-asserting the card's IRQ line.
+    // SAFETY: `base` is the mapped, uncacheable MMIO base published by `init`; ICR (0x00C0) is a
+    // valid register whose read is exactly what clears the pending cause.
+    let icr = unsafe { ((base + REG_ICR) as *const u32).read_volatile() };
+    if icr & (ICR_RXT0 | ICR_RXDMT0) == 0 {
+        return; // not a receive cause (e.g. a link-status change) — nothing to drain
+    }
+    RX_IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    if let Some(mut guard) = DEVICE.try_lock() {
+        if let Some(dev) = guard.as_mut() {
+            let mut buf = [0u8; 2048];
+            // SAFETY: the device is initialized (MMIO mapped, RX ring set up); `receive` reads the
+            // next ready descriptor and recycles it. Drain every ready frame — one interrupt can
+            // cover several arrivals — recording the last length and counting each.
+            while let Some(len) = unsafe { dev.receive(&mut buf) } {
+                LAST_RX_LEN.store(len, Ordering::Relaxed);
+                RX_FRAMES_VIA_IRQ.fetch_add(1, Ordering::Release);
+            }
+        }
+    }
+}
+
+/// Number of times the e1000 receive interrupt fired with a receive cause (Stage 17b-6).
+pub fn rx_irq_count() -> u64 {
+    RX_IRQ_COUNT.load(Ordering::Relaxed)
+}
+
+/// Number of frames drained from the RX ring by the interrupt handler (Stage 17b-6).
+pub fn rx_frames_via_irq() -> u64 {
+    RX_FRAMES_VIA_IRQ.load(Ordering::Acquire)
+}
+
+/// Length of the most recent frame the interrupt handler drained (Stage 17b-6).
+pub fn last_rx_len() -> usize {
+    LAST_RX_LEN.load(Ordering::Relaxed)
+}
+
+/// Stage 17b-6: prove interrupt-driven receive. With the card's RX interrupt armed and its IRQ
+/// routed (see [`enable_interrupts`]), enable PHY loopback and send a frame to our own MAC; the card
+/// loops it back and raises the receive interrupt, whose handler ([`on_interrupt`]) drains it from
+/// the ring — this path never polls. Returns whether the interrupt fired and delivered our frame.
+///
+/// The measured transmit runs under `without_interrupts` so the IRQ raised during the doorbell write
+/// stays pending until the device lock is dropped; on re-enable the handler takes the lock cleanly (a
+/// single-core handler would otherwise deadlock against the transmit still holding it). Bounded
+/// resends cover the case where QEMU's receiver is not yet ready (the looped frame is dropped and no
+/// interrupt fires), and stale frames are drained first so the counters reflect only our frame.
+pub fn interrupt_selftest() -> bool {
+    let mac = match device() {
+        Some(dev) => dev.mac,
+        None => return false,
+    };
+    // A 60-byte frame addressed to ourselves (accepted by the RX filter via Receive Address 0).
+    let mut frame = [0u8; 60];
+    frame[0..6].copy_from_slice(&mac); // destination: ourselves
+    frame[6..12].copy_from_slice(&mac); // source: ourselves
+    frame[12] = 0x88; // ethertype 0x88B5 (IEEE 802 local-experimental)
+    frame[13] = 0xB5;
+    let msg = b"aether e1000 irq rx test";
+    frame[14..14 + msg.len()].copy_from_slice(msg);
+
+    // Enable loopback and drain anything already in the ring, so the counters below reflect only the
+    // frame we send.
+    {
+        let mut guard = DEVICE.lock();
+        let dev = match guard.as_mut() {
+            Some(d) => d,
+            None => return false,
+        };
+        // SAFETY: the device is initialized — MMIO mapped, RX ring set up.
+        unsafe {
+            dev.set_loopback(true);
+            let mut sink = [0u8; 2048];
+            while dev.receive(&mut sink).is_some() {}
+        }
+    }
+    RX_IRQ_COUNT.store(0, Ordering::Relaxed);
+    RX_FRAMES_VIA_IRQ.store(0, Ordering::Relaxed);
+    LAST_RX_LEN.store(0, Ordering::Relaxed);
+
+    // Send, then wait for the handler to drain our frame. Resend (bounded) until QEMU's receiver is
+    // ready to loop it back.
+    let mut delivered = false;
+    for _ in 0..1000 {
+        // Transmit with interrupts off: the IRQ raised during the doorbell write is delivered only
+        // after the lock is dropped and interrupts are re-enabled, so the handler cannot deadlock
+        // against this transmit.
+        without_interrupts(|| {
+            let mut guard = DEVICE.lock();
+            if let Some(dev) = guard.as_mut() {
+                // SAFETY: device initialized; `transmit` copies the frame in and rings the doorbell.
+                unsafe {
+                    let _ = dev.transmit(&frame);
+                }
+            }
+        });
+        // Interrupts are back on; a pending IRQ (if the frame was accepted) is delivered before the
+        // spin below. Give the handler a bounded moment to run.
+        for _ in 0..100_000 {
+            if RX_FRAMES_VIA_IRQ.load(Ordering::Acquire) > 0 {
+                delivered = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if delivered {
+            break;
+        }
+        // Not yet — the receiver is still settling; wait and resend.
+        apic::pit_sleep_us(2000);
+    }
+
+    // Restore normal (non-loopback) operation.
+    {
+        let guard = DEVICE.lock();
+        if let Some(dev) = guard.as_ref() {
+            // SAFETY: device initialized.
+            unsafe { dev.set_loopback(false) };
+        }
+    }
+
+    let len = LAST_RX_LEN.load(Ordering::Relaxed);
+    let ok = delivered && len == frame.len();
+    serial_println!(
+        "[e1000] interrupt receive: irqs {}, frames drained {}, last len {}, match = {}",
+        RX_IRQ_COUNT.load(Ordering::Relaxed),
+        RX_FRAMES_VIA_IRQ.load(Ordering::Relaxed),
+        len,
+        ok,
+    );
+    ok
 }

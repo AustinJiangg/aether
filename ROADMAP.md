@@ -434,8 +434,33 @@ unify later.
 > while the receiver is not ready, and QEMU's e1000 link is not ready to receive until it has settled
 > **~0.9 s** into boot — so the selftest resends, watching RDH advance as the readiness check, bounded
 > so a dead link cannot hang boot; (2) once ready, delivery is synchronous, so RDH moves the instant we
-> transmit. Verified by 49 tests (the new `e1000_receives_via_loopback`). Next (17b-6): the RX
-> interrupt (route IRQ 11 through the IO-APIC and drive receive from the handler instead of polling).
+> transmit. Verified by 49 tests (the new `e1000_receives_via_loopback`).
+>
+> **Stage 17b-6 is also done** — interrupt-driven receive, so the card *tells* the kernel a frame
+> arrived instead of the driver polling for it. Three pieces. (1) **Route the card's IRQ**: the e1000
+> reports IRQ 11 in its PCI `interrupt_line`, and on QEMU's i440fx a PCI interrupt appears on the
+> IO-APIC pin equal to that ISA IRQ, so `apic::route_pci_irq(11, E1000_VECTOR)` programs a redirection
+> entry to vector 43 — **level-triggered and active-low**, the PCI convention (unlike the keyboard's
+> edge-triggered, active-high ISA line), so `apic.rs`'s `set_redirection` grew a `level` flag. (2)
+> **Arm the card**: `enable_rx_interrupt` sets the receive causes (RXT0 | RXDMT0) in the Interrupt Mask
+> Set register (IMS), so the card asserts its line on a received frame. (3) **Handle it**: a new IDT
+> gate (`interrupts::e1000_interrupt_handler` on `E1000_VECTOR`) calls `e1000::on_interrupt`, which
+> **reads ICR first** (that returns and clears the pending causes, de-asserting the level-triggered
+> line — without it the interrupt re-fires endlessly) and then drains every ready frame from the RX
+> ring, before the LAPIC EOI. Two correctness details: the handler reads ICR through a **lock-free
+> cached MMIO base** (`MMIO_BASE`, an `AtomicU64` published by `init`) and drains under a **`try_lock`**
+> — an interrupt handler must never block on a lock the interrupted code holds (a single-core
+> deadlock), so if the device is momentarily busy it still clears the cause and returns, leaving frames
+> in the ring. `interrupt_selftest` proves it without polling: enable loopback, send a frame to our own
+> MAC, and wait for the *handler* to have drained it — the transmit runs under `without_interrupts` so
+> the IRQ QEMU raises synchronously during the doorbell write stays pending until the device lock is
+> dropped (else the handler would deadlock against the transmit still holding it). Boot logs "interrupt
+> receive: irqs 1, frames drained 1, last len 60, match = true", and the RX interrupt is left armed as
+> the kernel runs on to the shell (a stray broadcast just fires the handler, which drains or drops it —
+> no storm). Verified by 50 tests (the new `e1000_receives_via_interrupt`). **This completes the e1000
+> driver (Stage 17b): reset/config, RX and TX descriptor rings, transmit, and now interrupt-driven
+> receive — the raw-frame send/receive the networking track needed.** Next is Stage 18: a minimal
+> network stack (ARP + IPv4 + ICMP, replying to the host's `ping`).
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

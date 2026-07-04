@@ -794,6 +794,37 @@ fn e1000_receives_via_loopback() {
     );
 }
 
+/// Stage 17b-6: the e1000 driver receives a frame by *interrupt* rather than polling. `kernel_main`
+/// has already routed the card's IRQ through the IO-APIC and armed its receive interrupt (IMS). This
+/// enables loopback, sends a frame to our own MAC, and confirms the interrupt handler — not a poll
+/// loop — drained it: the interrupt fired at least once and drained at least one frame. Exercises the
+/// full interrupt path: IO-APIC routing, the level-triggered PCI IRQ, ICR cause-clearing, and the
+/// handler draining the RX ring.
+#[test_case]
+fn e1000_receives_via_interrupt() {
+    use crate::e1000;
+
+    assert!(e1000::present(), "e1000 not initialized");
+    assert!(
+        e1000::interrupt_selftest(),
+        "e1000 interrupt-driven receive failed (no interrupt delivered our looped-back frame)"
+    );
+    assert!(
+        e1000::rx_irq_count() > 0,
+        "e1000 receive interrupt never fired"
+    );
+    assert!(
+        e1000::rx_frames_via_irq() > 0,
+        "e1000 interrupt handler drained no frames"
+    );
+    // The handler drained our 60-byte frame (the card strips the CRC via RCTL.SECRC).
+    assert_eq!(
+        e1000::last_rx_len(),
+        60,
+        "interrupt handler drained a frame of unexpected length"
+    );
+}
+
 /// Stage 14c-1: the FAT driver creates and overwrites a root-level file. Write a payload
 /// spanning several clusters through the global VFS (`/mnt/...`), read it back, and confirm the
 /// bytes round-trip — exercising free-cluster allocation, the cluster chain, and the directory

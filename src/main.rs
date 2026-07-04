@@ -741,6 +741,23 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                         "Network: e1000 transmitted a raw Ethernet frame (card confirmed = {}).",
                         sent,
                     );
+                    // Stage 17b-6: switch the receive path from polling to interrupts. Route the
+                    // card's IRQ line through the IO-APIC to a handled vector and arm the card's RX
+                    // interrupt, then prove it: enable loopback, send a frame to ourselves, and let
+                    // the interrupt handler — not a poll loop — drain it from the ring.
+                    e1000::enable_interrupts(nic.interrupt_line());
+                    let irq_rx = e1000::interrupt_selftest();
+                    serial_println!(
+                        "[ OK ] e1000 interrupt-driven receive = {} ({} IRQ(s), {} frame(s) of {} B drained in the handler)",
+                        irq_rx,
+                        e1000::rx_irq_count(),
+                        e1000::rx_frames_via_irq(),
+                        e1000::last_rx_len(),
+                    );
+                    println!(
+                        "Network: e1000 received a frame via interrupt (handler-driven = {}).",
+                        irq_rx,
+                    );
                 }
             } else {
                 println!("Network: e1000 found but BAR0 was not a memory BAR (unexpected).");

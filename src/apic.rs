@@ -510,6 +510,13 @@ const IOAPIC_REG_VERSION: u32 = 0x01;
 /// is the mask (1 = disabled); we leave it clear to enable an entry.
 const IOAPIC_REG_REDIR_BASE: u32 = 0x10;
 
+/// Redirection-entry low-word bit 13: interrupt input polarity is active-low. PCI INTx lines
+/// are active-low; ISA IRQs (keyboard) are active-high, where this bit stays clear.
+const IOAPIC_REDIR_ACTIVE_LOW: u32 = 1 << 13;
+/// Redirection-entry low-word bit 15: level-triggered. PCI INTx is level-triggered (the device
+/// holds the line asserted until its cause is cleared); ISA IRQs are edge-triggered.
+const IOAPIC_REDIR_LEVEL: u32 = 1 << 15;
+
 /// The keyboard's legacy IRQ line, which is also its IO-APIC input pin: on a PC the
 /// keyboard is IRQ1, identity-mapped to pin 1. (A real kernel confirms this via the
 /// ACPI MADT's interrupt-source overrides; QEMU uses the identity mapping.)
@@ -562,8 +569,9 @@ fn init_ioapic() {
     }
 
     // Route the keyboard to its vector, delivered to the BSP (LAPIC id 0), then read
-    // the entry back to confirm it (and to exercise the read path the test uses).
-    set_redirection(KEYBOARD_IRQ, KEYBOARD_VECTOR, 0);
+    // the entry back to confirm it (and to exercise the read path the test uses). The
+    // keyboard is an ISA IRQ — edge-triggered, active-high — so `level` is false.
+    set_redirection(KEYBOARD_IRQ, KEYBOARD_VECTOR, 0, false);
     let entry = ioapic_redirection(KEYBOARD_IRQ);
     serial_println!(
         "[apic] IO-APIC: routed keyboard IRQ{} -> vector {} (redirection entry {:#x})",
@@ -573,18 +581,26 @@ fn init_ioapic() {
     );
 }
 
-/// Program one redirection entry: deliver `irq` as `vector` to LAPIC `dest_apic`,
-/// fixed delivery, physical destination, active-high, edge-triggered, unmasked.
-fn set_redirection(irq: u8, vector: u8, dest_apic: u8) {
+/// Program one redirection entry: deliver `irq` as `vector` to LAPIC `dest_apic`, fixed
+/// delivery, physical destination, unmasked. `level` selects the electrical convention:
+/// `false` = active-high, edge-triggered (the ISA/keyboard style); `true` = active-low,
+/// level-triggered (the PCI style). PCI matters because a PCI device holds its INTx line
+/// asserted until the driver clears the cause *at the card* — a level-triggered entry, so
+/// the LAPIC EOI notifies the IO-APIC to re-check the line rather than assuming one pulse.
+fn set_redirection(irq: u8, vector: u8, dest_apic: u8, level: bool) {
     let index = IOAPIC_REG_REDIR_BASE + (irq as u32) * 2;
-    // Low word: vector in bits 0..8; all the mode bits we want are 0 (fixed delivery,
-    // physical dest, active-high, edge-triggered), and bit 16 (mask) cleared = enabled.
-    let low = vector as u32;
+    // Low word: vector in bits 0..8; delivery mode / dest mode 0 (fixed, physical). For a
+    // PCI line also set the polarity (active-low) and trigger-mode (level) bits. Bit 16
+    // (mask) cleared = enabled.
+    let mut low = vector as u32;
+    if level {
+        low |= IOAPIC_REDIR_ACTIVE_LOW | IOAPIC_REDIR_LEVEL;
+    }
     // High word: the destination APIC id sits in bits 56..64 of the 64-bit entry,
     // i.e. bits 24..32 of the high word.
     let high = (dest_apic as u32) << 24;
 
-    // SAFETY: the IO-APIC is mapped, and this runs during `init` with interrupts still
+    // SAFETY: the IO-APIC is mapped, and this runs during bring-up with interrupts still
     // disabled, so the stateful IOREGSEL/IOWIN pair cannot be interrupted mid-update.
     // Write the high word first and the low word (which unmasks) last, so the entry is
     // never live while only half-written.
@@ -592,6 +608,23 @@ fn set_redirection(irq: u8, vector: u8, dest_apic: u8) {
         ioapic_write(index + 1, high);
         ioapic_write(index, low);
     }
+}
+
+/// Route a PCI device's interrupt line (`irq` — its `interrupt_line`, which on QEMU's i440fx
+/// is also its IO-APIC input pin) to `vector` on the BSP, level-triggered and active-low: the
+/// electrical convention every PCI INTx interrupt uses. Called by the e1000 driver (Stage
+/// 17b-6) once it has registered a handler for `vector`. Runs after `init`, so the IO-APIC is
+/// already mapped; interrupts may be enabled by now, so the entry write is wrapped in
+/// `without_interrupts` to keep the stateful IOREGSEL/IOWIN pair from being disturbed midway.
+pub fn route_pci_irq(irq: u8, vector: u8) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        set_redirection(irq, vector, 0, true);
+    });
+    serial_println!(
+        "[apic] IO-APIC: routed PCI IRQ{} -> vector {} (level-triggered, active-low)",
+        irq,
+        vector
+    );
 }
 
 /// Read back the 64-bit redirection entry for `irq`. Exposed so a test can verify
