@@ -671,17 +671,17 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 nic.interrupt_line(),
             );
 
-            // Stage 17b-1: start driving the card. Map its MMIO register block (uncacheable, like
-            // the APIC's) into virtual memory and read its identity — the MAC address and Device
-            // Status register — to prove register access works before the descriptor-ring work.
-            // `init` stashes the card globally; we read it back through the global accessors for the
-            // summary line, confirming that path works too.
+            // Stage 17b: start driving the card. 17b-1 maps its MMIO register block (uncacheable,
+            // like the APIC's) into virtual memory; 17b-2 resets the card and applies general
+            // configuration (Set-Link-Up, clear the multicast filter), then reads its identity — the
+            // MAC address and Device Status register. `init` stashes the card globally; we read it
+            // back through the global accessors for the summary line, confirming that path too.
             if e1000::init(&nic, &mut mapper, &mut frame_allocator).is_some() {
                 if let Some(dev) = e1000::device() {
                     let mac = dev.mac();
                     println!(
-                        "Network: e1000 up (present={}), MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, link {}, {}-duplex.",
-                        e1000::present(),
+                        "Network: e1000 reset {}, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, link {}, {}-duplex.",
+                        if dev.reset_succeeded() { "ok" } else { "TIMED OUT" },
                         mac[0],
                         mac[1],
                         mac[2],
@@ -690,6 +690,12 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                         mac[5],
                         if dev.link_up() { "up" } else { "down" },
                         if dev.full_duplex() { "full" } else { "half" },
+                    );
+                    serial_println!(
+                        "[ OK ] e1000 driver up: present={}, reset_ok={}, link-up requested (SLU)={}",
+                        e1000::present(),
+                        dev.reset_succeeded(),
+                        dev.link_requested(),
                     );
                 }
             } else {

@@ -678,10 +678,33 @@ fn e1000_reads_its_identity() {
     assert_ne!(mac, [0x00; 6], "e1000 MAC read back as all zeros");
     assert_ne!(mac, [0xFF; 6], "e1000 MAC read back as all ones (register not reaching the device)");
 
-    // The Device Status register reads back a plausible value: bit 7 (reserved on the 8254x) reads
-    // as 0, and the whole dword is not the all-ones of an unmapped read.
+    // The Device Status register reads back a plausible value: not the all-ones of an unmapped read.
     let status = dev.status();
     assert_ne!(status, 0xFFFF_FFFF, "e1000 STATUS read back as all ones");
+}
+
+/// Stage 17b-2: the e1000 driver reset the card and applied general configuration. `e1000::init`
+/// (at boot, before this harness) issues a global reset via the self-clearing CTRL.RST bit, waits
+/// for it to complete, then sets Set-Link-Up in CTRL and clears the multicast table. So by now: the
+/// reset must have completed, the MAC must have survived it (the reset reloads Receive Address entry
+/// 0 from the EEPROM), and our CTRL.SLU write must have stuck (a live read-back proves the config
+/// took effect — independent of the link's actual state).
+#[test_case]
+fn e1000_reset_and_configure() {
+    use crate::e1000;
+
+    let dev = e1000::device().expect("e1000 not initialized");
+
+    // The global reset self-cleared within the timeout.
+    assert!(dev.reset_succeeded(), "e1000 device reset did not complete");
+
+    // The MAC survived the reset (reloaded into RAL0/RAH0 from the EEPROM).
+    let mac = dev.mac();
+    assert_ne!(mac, [0x00; 6], "e1000 MAC lost after reset");
+    assert_ne!(mac, [0xFF; 6], "e1000 MAC reads back as all ones after reset");
+
+    // Our configuration write took effect: Set-Link-Up is asserted in CTRL.
+    assert!(dev.link_requested(), "CTRL.SLU not set after configure");
 }
 
 /// Stage 14c-1: the FAT driver creates and overwrites a root-level file. Write a payload

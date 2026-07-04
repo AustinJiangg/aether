@@ -196,7 +196,11 @@ address space **uncacheable** (`NO_CACHE`) and accesses it only through `volatil
 prove register access works before the descriptor-ring work, it reads the Device Status register and
 the card's MAC address out of Receive Address entry 0 (RAL0/RAH0, which QEMU's model pre-loads from
 its emulated EEPROM) — boot reports MAC `52:54:00:12:34:56`, link up, full-duplex, and the handle is
-stashed in a global for later sub-steps. `ROADMAP.md` carries the forward
+stashed in a global for later sub-steps. **Stage 17b-2 is now also done**: `init` first *resets* the
+card (mask all interrupts via IMC, set the self-clearing `CTRL.RST` and poll until it clears, drain
+ICR) and *configures* it (set `CTRL.SLU`/`ASDE`, clear the reset/loss-of-signal/VLAN bits, zero the
+128-entry multicast table) — the standard "put the device in a known state" opening move — then
+re-reads the EEPROM-reloaded MAC; boot reports "reset completed". `ROADMAP.md` carries the forward
 plan (stages 9-18): the user-space main line (system calls, per-process address spaces +
 ELF, multiprocessing), plus persistence, APIC/SMP, and networking tracks.
 
@@ -553,10 +557,17 @@ Exit QEMU: `Ctrl-A` then `X`.
   (`NO_CACHE` — device registers must bypass the cache, like the APIC's), and reads its identity through
   `volatile` register accesses (`read_reg`/`write_reg`): the Device Status register (`REG_STATUS`) and
   the MAC address out of Receive Address entry 0 (`REG_RAL0`/`REG_RAH0`, pre-loaded from the emulated
-  EEPROM by QEMU at power-on). The `E1000` handle (MMIO virtual base + the 6-byte MAC) is stored in a
-  global `Mutex<Option<E1000>>` (`device()`/`present()`) for later sub-steps; `link_up()`/`full_duplex()`
-  decode STATUS. The MMIO block is mapped at `E1000_VIRT_BASE` (L4 slot 101, one slot above the APIC's).
-  Descriptor rings, TX/RX, and the IRQ come in later sub-steps (17b-2+).
+  EEPROM by QEMU at power-on). Stage 17b-2: `init` also resets and configures the card first —
+  `reset()` masks all interrupts (`REG_IMC`), sets the self-clearing `CTRL.RST` bit and polls (bounded,
+  via `apic::pit_sleep_us`) until the card clears it, then re-masks and drains `REG_ICR`; `configure()`
+  sets `CTRL_SLU` (Set Link Up) + `CTRL_ASDE` and clears the link-reset/PHY-reset/loss-of-signal/VLAN
+  bits, then zeroes the 128-entry Multicast Table Array (`REG_MTA`). The MAC is (re-)read from RAL0/RAH0
+  after the reset (which reloads them from the EEPROM). The `E1000` handle (MMIO virtual base + the
+  6-byte MAC + a `reset_ok` flag) is stored in a global `Mutex<Option<E1000>>` (`device()`/`present()`)
+  for later sub-steps; `control()`/`status()` are live register reads, `reset_succeeded()`/
+  `link_requested()` (CTRL.SLU)/`link_up()`/`full_duplex()` decode them. The MMIO block is mapped at
+  `E1000_VIRT_BASE` (L4 slot 101, one slot above the APIC's). Descriptor rings, TX/RX, and the IRQ come
+  in later sub-steps (17b-3+).
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

@@ -364,8 +364,20 @@ unify later.
 > emulated EEPROM into Receive Address entry 0 (RAL0/RAH0) by power-on. Boot logs the mapped block, the
 > MAC `52:54:00:12:34:56` (AV bit set), and STATUS `0x80080783` (link up, full-duplex). The handle is
 > stashed in a global for later sub-steps. Verified by 45 tests (the new `e1000_reads_its_identity`:
-> the card is present and reports a MAC that is neither all-zeros nor all-ones). Next (17b-2): device
-> reset and general configuration.
+> the card is present and reports a MAC that is neither all-zeros nor all-ones).
+>
+> **Stage 17b-2 is also done** — resetting and configuring the card, the standard opening move of a
+> device driver: put the hardware in a known state before using it. `e1000.rs`'s `init` now, after
+> mapping the registers, (1) masks every interrupt at the card (writes all-ones to **IMC**, since
+> there is no e1000 IRQ handler yet), (2) issues a **global reset** by setting the self-clearing
+> **CTRL.RST** bit and polling (bounded, paced by `apic::pit_sleep_us`) until the card clears it,
+> then re-masks interrupts and drains **ICR**, (3) applies general config in CTRL — sets **SLU**
+> (Set Link Up) + **ASDE** (Auto-Speed Detection), clears the link-reset/PHY-reset/loss-of-signal/
+> VLAN bits — and (4) clears the 128-entry **Multicast Table Array** (accept no multicast by
+> default). The reset reloads Receive Address entry 0 from the EEPROM, so the MAC is re-read after
+> it. Boot logs "reset completed (CTRL 0x00140260, SLU true)" and the surviving MAC. Verified by 46
+> tests (the new `e1000_reset_and_configure`: reset completed, the MAC survived, and a live CTRL
+> read-back confirms SLU stuck). Next (17b-3): the receive (RX) descriptor ring and buffers.
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|
