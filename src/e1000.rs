@@ -122,11 +122,10 @@
 //! re-enable interrupts, at which point the handler takes the lock cleanly (rather than deadlocking
 //! against the transmit that still holds it, on our single boot core).
 
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use spin::Mutex;
 use x86_64::{
-    instructions::interrupts::without_interrupts,
     structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, PhysFrame, Size4KiB},
     PhysAddr, VirtAddr,
 };
@@ -376,12 +375,16 @@ static DEVICE: Mutex<Option<E1000>> = Mutex::new(None);
 /// Zero until the card is up.
 static MMIO_BASE: AtomicU64 = AtomicU64::new(0);
 
-/// How many times the e1000 receive interrupt handler ran and saw a receive cause (Stage 17b-6).
+/// How many times the e1000 receive interrupt fired with a receive cause (Stage 17b-6).
 static RX_IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
-/// How many frames the interrupt handler drained from the RX ring (Stage 17b-6). Distinct from
-/// [`RX_IRQ_COUNT`] because one interrupt can cover several arrived frames.
-static RX_FRAMES_VIA_IRQ: AtomicU64 = AtomicU64::new(0);
-/// Length of the most recent frame the interrupt handler drained (Stage 17b-6), for the self-test.
+/// Set by the interrupt handler to flag "frames may be waiting in the RX ring" (Stage 18a). The
+/// handler no longer drains the ring itself (that would allocate/lock in interrupt context); it
+/// raises this, and `poll_frame` (called from `net::poll`, ordinary context) does the draining and
+/// clears it when the ring runs dry — the NAPI-style interrupt/poll split.
+static RX_PENDING: AtomicBool = AtomicBool::new(false);
+/// How many frames the stack has pulled off the ring via [`poll_frame`] (Stage 18a).
+static RX_FRAMES: AtomicU64 = AtomicU64::new(0);
+/// Length of the most recent frame pulled off the ring (Stage 17b-6/18a), for the self-tests.
 static LAST_RX_LEN: AtomicUsize = AtomicUsize::new(0);
 
 /// A handle on the e1000 NIC: the virtual base of its mapped register block, its MAC address, and
@@ -1184,16 +1187,17 @@ pub fn enable_interrupts(irq: u8) {
     serial_println!("[e1000] receive interrupt armed (IRQ{} -> IO-APIC, IMS set)", irq);
 }
 
-/// Stage 17b-6: the receive-interrupt bottom half, called from the IDT handler
-/// (`interrupts::e1000_interrupt_handler`). Reads and clears the card's interrupt cause — mandatory
-/// for a level-triggered PCI interrupt, or the line stays asserted and the interrupt re-fires
-/// endlessly — and, if a receive cause is set, drains every ready frame from the RX ring.
+/// Stage 17b-6 / 18a: the receive-interrupt top half, called from the IDT handler
+/// (`interrupts::e1000_interrupt_handler`). It **reads and clears the card's interrupt cause**
+/// (mandatory for a level-triggered PCI interrupt — until the cause is cleared the card keeps its
+/// line asserted and the interrupt re-fires endlessly) and, if a receive cause is set, just **flags**
+/// that frames are waiting.
 ///
-/// Draining uses `try_lock`: an interrupt handler must never *block* on a lock the code it
-/// interrupted might hold (a single-core deadlock). If the device is momentarily locked elsewhere
-/// (e.g. a polled transmit), we still clear the cause and return; the frames stay in the ring
-/// (Descriptor Done set) for the next drain. Runs in interrupt context, so it only counts and
-/// measures frames — a real driver would hand each up to the network stack (Stage 18).
+/// Deliberately minimal (the NAPI-style split, Stage 18a): it does *not* drain the ring or allocate
+/// here — both are unsafe in interrupt context (the ring drain would need the device lock, and the
+/// stack allocates). The actual draining and protocol work happen in [`poll_frame`] / `net::poll`
+/// from ordinary (task/boot) context. Because the handler takes no lock, it can never deadlock
+/// against code holding the device lock, and it reaches ICR through the lock-free cached [`MMIO_BASE`].
 pub fn on_interrupt() {
     let base = MMIO_BASE.load(Ordering::Acquire);
     if base == 0 {
@@ -1204,21 +1208,41 @@ pub fn on_interrupt() {
     // valid register whose read is exactly what clears the pending cause.
     let icr = unsafe { ((base + REG_ICR) as *const u32).read_volatile() };
     if icr & (ICR_RXT0 | ICR_RXDMT0) == 0 {
-        return; // not a receive cause (e.g. a link-status change) — nothing to drain
+        return; // not a receive cause (e.g. a link-status change)
     }
     RX_IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
+    RX_PENDING.store(true, Ordering::Release);
+}
 
-    if let Some(mut guard) = DEVICE.try_lock() {
-        if let Some(dev) = guard.as_mut() {
-            let mut buf = [0u8; 2048];
-            // SAFETY: the device is initialized (MMIO mapped, RX ring set up); `receive` reads the
-            // next ready descriptor and recycles it. Drain every ready frame — one interrupt can
-            // cover several arrivals — recording the last length and counting each.
-            while let Some(len) = unsafe { dev.receive(&mut buf) } {
-                LAST_RX_LEN.store(len, Ordering::Relaxed);
-                RX_FRAMES_VIA_IRQ.fetch_add(1, Ordering::Release);
-            }
+/// Stage 18a: pull one received frame off the RX ring into `buf`, from ordinary (non-interrupt)
+/// context — the consumer side of the NAPI-style split. Returns the frame's length, or `None` if the
+/// ring is empty (also clearing the "pending" flag then, so a waiter re-arms on the next interrupt).
+/// `net::poll` calls this in a loop to drain and dispatch everything the card has received.
+pub fn poll_frame(buf: &mut [u8]) -> Option<usize> {
+    let mut guard = DEVICE.lock();
+    let dev = guard.as_mut()?;
+    // SAFETY: the device is initialized (MMIO mapped, RX ring set up); `receive` reads the next
+    // ready descriptor, copies it out, and recycles the descriptor back to the card.
+    match unsafe { dev.receive(buf) } {
+        Some(len) => {
+            LAST_RX_LEN.store(len, Ordering::Relaxed);
+            RX_FRAMES.fetch_add(1, Ordering::Release);
+            Some(len)
         }
+        None => {
+            RX_PENDING.store(false, Ordering::Release);
+            None
+        }
+    }
+}
+
+/// Stage 18a: toggle the card's PHY loopback from outside the driver — the net stack's loopback
+/// self-test uses it to send a frame to itself with no external traffic.
+pub fn set_loopback(enable: bool) {
+    let guard = DEVICE.lock();
+    if let Some(dev) = guard.as_ref() {
+        // SAFETY: the device is initialized; `set_loopback` read-modify-writes the PHY BMCR.
+        unsafe { dev.set_loopback(enable) };
     }
 }
 
@@ -1227,26 +1251,31 @@ pub fn rx_irq_count() -> u64 {
     RX_IRQ_COUNT.load(Ordering::Relaxed)
 }
 
-/// Number of frames drained from the RX ring by the interrupt handler (Stage 17b-6).
-pub fn rx_frames_via_irq() -> u64 {
-    RX_FRAMES_VIA_IRQ.load(Ordering::Acquire)
+/// Number of frames the stack has pulled off the ring via [`poll_frame`] (Stage 18a).
+pub fn rx_frames() -> u64 {
+    RX_FRAMES.load(Ordering::Acquire)
 }
 
-/// Length of the most recent frame the interrupt handler drained (Stage 17b-6).
+/// Whether the interrupt handler has flagged that frames may be waiting (Stage 18a).
+pub fn rx_pending() -> bool {
+    RX_PENDING.load(Ordering::Acquire)
+}
+
+/// Length of the most recent frame pulled off the ring (Stage 17b-6/18a).
 pub fn last_rx_len() -> usize {
     LAST_RX_LEN.load(Ordering::Relaxed)
 }
 
-/// Stage 17b-6: prove interrupt-driven receive. With the card's RX interrupt armed and its IRQ
-/// routed (see [`enable_interrupts`]), enable PHY loopback and send a frame to our own MAC; the card
-/// loops it back and raises the receive interrupt, whose handler ([`on_interrupt`]) drains it from
-/// the ring — this path never polls. Returns whether the interrupt fired and delivered our frame.
+/// Stage 17b-6 / 18a: prove interrupt-driven receive. With the card's RX interrupt armed and routed
+/// (see [`enable_interrupts`]), enable PHY loopback and send a frame to our own MAC; the card loops it
+/// back and raises the receive interrupt, whose handler ([`on_interrupt`]) flags a frame is waiting;
+/// we then confirm the interrupt fired and pull the frame off the ring via [`poll_frame`] — the same
+/// interrupt-signals / poll-drains path the network stack uses. Returns whether it round-tripped.
 ///
-/// The measured transmit runs under `without_interrupts` so the IRQ raised during the doorbell write
-/// stays pending until the device lock is dropped; on re-enable the handler takes the lock cleanly (a
-/// single-core handler would otherwise deadlock against the transmit still holding it). Bounded
-/// resends cover the case where QEMU's receiver is not yet ready (the looped frame is dropped and no
-/// interrupt fires), and stale frames are drained first so the counters reflect only our frame.
+/// Since Stage 18a the handler takes no device lock (it only flags), so this needs no
+/// interrupt-disabling dance: a receive interrupt landing while `transmit` still holds the lock is
+/// harmless. Bounded resends cover QEMU's receiver not yet being ready (a looped frame is silently
+/// dropped and no interrupt fires); stale frames are drained first so the counters reflect only ours.
 pub fn interrupt_selftest() -> bool {
     let mac = match device() {
         Some(dev) => dev.mac,
@@ -1261,72 +1290,44 @@ pub fn interrupt_selftest() -> bool {
     let msg = b"aether e1000 irq rx test";
     frame[14..14 + msg.len()].copy_from_slice(msg);
 
-    // Enable loopback and drain anything already in the ring, so the counters below reflect only the
-    // frame we send.
-    {
-        let mut guard = DEVICE.lock();
-        let dev = match guard.as_mut() {
-            Some(d) => d,
-            None => return false,
-        };
-        // SAFETY: the device is initialized — MMIO mapped, RX ring set up.
-        unsafe {
-            dev.set_loopback(true);
-            let mut sink = [0u8; 2048];
-            while dev.receive(&mut sink).is_some() {}
-        }
-    }
+    set_loopback(true);
+    // Drain anything already in the ring so the counters below reflect only the frame we send.
+    let mut buf = [0u8; 2048];
+    while poll_frame(&mut buf).is_some() {}
     RX_IRQ_COUNT.store(0, Ordering::Relaxed);
-    RX_FRAMES_VIA_IRQ.store(0, Ordering::Relaxed);
+    RX_FRAMES.store(0, Ordering::Relaxed);
     LAST_RX_LEN.store(0, Ordering::Relaxed);
+    RX_PENDING.store(false, Ordering::Release);
 
-    // Send, then wait for the handler to drain our frame. Resend (bounded) until QEMU's receiver is
-    // ready to loop it back.
+    // Send to ourselves; the receive interrupt fires and flags a frame, which we then poll off.
     let mut delivered = false;
     for _ in 0..1000 {
-        // Transmit with interrupts off: the IRQ raised during the doorbell write is delivered only
-        // after the lock is dropped and interrupts are re-enabled, so the handler cannot deadlock
-        // against this transmit.
-        without_interrupts(|| {
-            let mut guard = DEVICE.lock();
-            if let Some(dev) = guard.as_mut() {
-                // SAFETY: device initialized; `transmit` copies the frame in and rings the doorbell.
-                unsafe {
-                    let _ = dev.transmit(&frame);
-                }
-            }
-        });
-        // Interrupts are back on; a pending IRQ (if the frame was accepted) is delivered before the
-        // spin below. Give the handler a bounded moment to run.
+        transmit(&frame);
+        // Wait (bounded) for the interrupt to flag a waiting frame, then drain it.
         for _ in 0..100_000 {
-            if RX_FRAMES_VIA_IRQ.load(Ordering::Acquire) > 0 {
-                delivered = true;
+            if rx_pending() {
                 break;
             }
             core::hint::spin_loop();
         }
+        while poll_frame(&mut buf).is_some() {
+            delivered = true;
+        }
         if delivered {
             break;
         }
-        // Not yet — the receiver is still settling; wait and resend.
+        // The receiver is still settling; wait and resend.
         apic::pit_sleep_us(2000);
     }
 
-    // Restore normal (non-loopback) operation.
-    {
-        let guard = DEVICE.lock();
-        if let Some(dev) = guard.as_ref() {
-            // SAFETY: device initialized.
-            unsafe { dev.set_loopback(false) };
-        }
-    }
+    set_loopback(false);
 
     let len = LAST_RX_LEN.load(Ordering::Relaxed);
-    let ok = delivered && len == frame.len();
+    let ok = delivered && rx_irq_count() > 0 && len == frame.len();
     serial_println!(
-        "[e1000] interrupt receive: irqs {}, frames drained {}, last len {}, match = {}",
-        RX_IRQ_COUNT.load(Ordering::Relaxed),
-        RX_FRAMES_VIA_IRQ.load(Ordering::Relaxed),
+        "[e1000] interrupt receive: irqs {}, frames polled {}, last len {}, match = {}",
+        rx_irq_count(),
+        rx_frames(),
         len,
         ok,
     );

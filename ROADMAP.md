@@ -461,6 +461,24 @@ unify later.
 > driver (Stage 17b): reset/config, RX and TX descriptor rings, transmit, and now interrupt-driven
 > receive — the raw-frame send/receive the networking track needed.** Next is Stage 18: a minimal
 > network stack (ARP + IPv4 + ICMP, replying to the host's `ping`).
+>
+> **Stage 18a is also done** — Ethernet framing plus the receive plumbing, the first layer of the
+> network stack (`net/`). Networking is built in layers (each wrapping the next like nested
+> envelopes); 18a handles the outermost, Ethernet II, and wires the NIC into the stack. `net/ether.rs`
+> parses and builds the 14-byte header (dst/src MAC + EtherType, all big-endian "network byte order"),
+> and `net/mod.rs` gives the stack a static identity (IP `10.0.2.15`, the SLIRP default lease; the
+> card's MAC) and a `poll` that drains frames from the NIC and dispatches each by EtherType (ARP vs
+> IPv4 vs other — 18a only classifies and counts; the handlers come in 18b/18c). This sub-step also
+> **refactored the e1000 receive path into the standard NAPI-style split**: the RX interrupt handler
+> (`e1000::on_interrupt`) no longer drains the ring or allocates in interrupt context — it only reads
+> ICR (still mandatory, to clear the level-triggered cause) and *flags* that frames are waiting;
+> `e1000::poll_frame` does the actual ring drain from ordinary context, so the handler takes no lock
+> and cannot deadlock (which also let the 17b-6 self-test drop its `without_interrupts` dance).
+> `net::loopback_selftest` proves the path end to end with the card's PHY loopback (build a frame to
+> ourselves, send, and confirm the stack receives and classifies it) — boot logs "stack up: IP
+> 10.0.2.15 ..." and "loopback framing test: ... match = true". Verified by 52 tests (the new
+> `ethernet_frame_parses_and_builds` — pure parse/build round-trip — and `net_receives_ethernet_frame`
+> — the loopback path). Next (18b): ARP, resolving the gateway's MAC (the first live SLIRP exchange).
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

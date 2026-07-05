@@ -235,14 +235,21 @@ grew a `level` flag; the keyboard stays edge/active-high); `e1000::enable_rx_int
 receive cause in IMS to arm the card; and a new IDT gate (`e1000_interrupt_handler`) calls
 `e1000::on_interrupt`, which **reads ICR first** (clearing the cause de-asserts the level-triggered
 line, or it re-fires forever) then drains the RX ring, before the LAPIC EOI. The handler reads ICR
-through a lock-free cached `MMIO_BASE` atomic and drains under a `try_lock` (a handler must never
-block on a lock the interrupted code holds); `interrupt_selftest` proves it without polling by looping
-a frame back and waiting for the *handler* to drain it (transmitting under `without_interrupts` so the
-synchronously-raised IRQ is delivered only after the device lock is dropped, avoiding a single-core
-deadlock). This completes the e1000 driver (reset/config, RX+TX rings, transmit, interrupt-driven
-receive). `ROADMAP.md` carries the forward plan (stages 9-18): the user-space main line (system calls,
+through a lock-free cached `MMIO_BASE` atomic (a handler must never block on a lock the interrupted
+code holds). This completed the e1000 driver (reset/config, RX+TX rings, transmit, interrupt-driven
+receive). **Stage 18 (networking) has now begun. Stage 18a is done**: Ethernet framing plus the
+receive plumbing — the first layer of a hand-written network stack (`net/`). Networking is built in
+layers, each wrapping the next; `net/ether.rs` parses/builds the 14-byte Ethernet II header (dst/src
+MAC + EtherType, big-endian), and `net/mod.rs` gives the stack a static identity (IP `10.0.2.15`, the
+SLIRP default; the card's MAC) and a `poll` that drains frames and dispatches by EtherType (ARP/IPv4/
+other — 18a only classifies and counts). 18a also **refactored the e1000 RX path into the NAPI-style
+split**: `on_interrupt` no longer drains the ring or allocates in interrupt context — it reads ICR
+(still mandatory, to clear the level-triggered cause) and only *flags* frames are waiting;
+`e1000::poll_frame` drains from ordinary context, so the handler takes no lock (which also let
+`interrupt_selftest` drop its `without_interrupts` dance). `net::loopback_selftest` proves it via PHY
+loopback. `ROADMAP.md` carries the forward plan (stages 9-18): the user-space main line (system calls,
 per-process address spaces + ELF, multiprocessing), plus persistence, APIC/SMP, and networking tracks
-— next is Stage 18, a minimal ARP+IPv4+ICMP network stack.
+— next is Stage 18b, ARP (resolving the gateway's MAC — the first live SLIRP exchange).
 
 ## Language and writing conventions
 
@@ -644,12 +651,22 @@ Exit QEMU: `Ctrl-A` then `X`.
   publishes the MMIO base into a lock-free `MMIO_BASE` atomic so the handler can read/clear ICR without
   the device `Mutex`; `enable_interrupts(irq)` routes the card's IRQ through the IO-APIC
   (`apic::route_pci_irq`, level-triggered/active-low) to `interrupts::E1000_VECTOR` and arms the RX
-  cause in `REG_IMS` (`enable_rx_interrupt`); `on_interrupt` (called from `interrupts.rs`'s new gate)
-  reads `REG_ICR` (clearing the cause de-asserts the level line) and, under a `try_lock`, drains the RX
-  ring, bumping `RX_IRQ_COUNT`/`RX_FRAMES_VIA_IRQ`/`LAST_RX_LEN`. `interrupt_selftest` proves it without
-  polling: loopback a frame and wait for the *handler* to drain it, transmitting under
-  `without_interrupts` so the synchronously-raised IRQ arrives only after the device lock is dropped
-  (no single-core deadlock). This completes the e1000 driver.
+  cause in `REG_IMS` (`enable_rx_interrupt`). Stage 18a then split the RX path NAPI-style: `on_interrupt`
+  (called from `interrupts.rs`'s gate) reads `REG_ICR` (clearing the cause de-asserts the level line) and
+  only *flags* `RX_PENDING` (no ring drain, no allocation, no lock in interrupt context), while
+  `poll_frame(buf)` drains one frame from the ring in ordinary context (bumping `RX_FRAMES`/`LAST_RX_LEN`,
+  clearing `RX_PENDING` when empty) — the consumer the network stack's `net::poll` calls. `set_loopback`
+  is now a public module fn (the net loopback test uses it). `interrupt_selftest` proves the path
+  (loopback a frame, wait for the interrupt flag, poll it off); because the handler takes no lock it needs
+  no interrupt-disabling dance. This completes the e1000 driver.
+- `src/net/`: Stage 18 hand-written network stack over the e1000. `net/ether.rs` (Stage 18a) parses and
+  builds the 14-byte Ethernet II header (`Frame::parse` borrows the receive buffer; `build` emits a heap
+  frame), with `MacAddr`/`BROADCAST` and the `ETHERTYPE_IPV4`/`ETHERTYPE_ARP` tags (big-endian on the
+  wire). `net/mod.rs` holds the stack's static identity (`OUR_IP` = `10.0.2.15`, the SLIRP default lease;
+  `GATEWAY_IP` = `10.0.2.2`; the card's MAC recorded in `init`), a `poll` that drains frames via
+  `e1000::poll_frame` and dispatches each by EtherType (`receive` — 18a classifies/counts ARP vs IPv4 vs
+  other; the handlers arrive in 18b/18c), and `loopback_selftest` proving the receive path end to end via
+  the card's PHY loopback. ARP (`net/arp.rs`, 18b) and IPv4+ICMP (`net/ipv4.rs`/`net/icmp.rs`, 18c) come next.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

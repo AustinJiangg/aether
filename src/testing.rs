@@ -794,12 +794,12 @@ fn e1000_receives_via_loopback() {
     );
 }
 
-/// Stage 17b-6: the e1000 driver receives a frame by *interrupt* rather than polling. `kernel_main`
-/// has already routed the card's IRQ through the IO-APIC and armed its receive interrupt (IMS). This
-/// enables loopback, sends a frame to our own MAC, and confirms the interrupt handler — not a poll
-/// loop — drained it: the interrupt fired at least once and drained at least one frame. Exercises the
-/// full interrupt path: IO-APIC routing, the level-triggered PCI IRQ, ICR cause-clearing, and the
-/// handler draining the RX ring.
+/// Stage 17b-6 / 18a: the e1000 driver receives a frame by *interrupt* rather than polling.
+/// `kernel_main` has already routed the card's IRQ through the IO-APIC and armed its receive
+/// interrupt (IMS). This enables loopback, sends a frame to our own MAC, confirms the interrupt fired
+/// (the NAPI-style handler flags a waiting frame), and pulls the frame off the ring via `poll_frame`.
+/// Exercises the full interrupt path: IO-APIC routing, the level-triggered PCI IRQ, ICR
+/// cause-clearing, the pending flag, and the poll-side ring drain.
 #[test_case]
 fn e1000_receives_via_interrupt() {
     use crate::e1000;
@@ -807,22 +807,60 @@ fn e1000_receives_via_interrupt() {
     assert!(e1000::present(), "e1000 not initialized");
     assert!(
         e1000::interrupt_selftest(),
-        "e1000 interrupt-driven receive failed (no interrupt delivered our looped-back frame)"
+        "e1000 interrupt-driven receive failed (no interrupt flagged our looped-back frame)"
     );
     assert!(
         e1000::rx_irq_count() > 0,
         "e1000 receive interrupt never fired"
     );
     assert!(
-        e1000::rx_frames_via_irq() > 0,
-        "e1000 interrupt handler drained no frames"
+        e1000::rx_frames() > 0,
+        "no frame was polled off the RX ring"
     );
-    // The handler drained our 60-byte frame (the card strips the CRC via RCTL.SECRC).
+    // We polled our 60-byte frame off the ring (the card strips the CRC via RCTL.SECRC).
     assert_eq!(
         e1000::last_rx_len(),
         60,
-        "interrupt handler drained a frame of unexpected length"
+        "polled a frame of unexpected length"
     );
+}
+
+/// Stage 18a: the Ethernet layer parses and builds frames correctly. Pure logic (no hardware):
+/// build a frame, parse it back, and confirm every field round-trips, plus that a runt is rejected.
+#[test_case]
+fn ethernet_frame_parses_and_builds() {
+    use crate::net::ether;
+
+    let dst = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+    let src = [0xAA; 6];
+    let payload = [0xDE, 0xAD, 0xBE, 0xEF];
+    let frame = ether::build(dst, src, ether::ETHERTYPE_ARP, &payload);
+    assert_eq!(frame.len(), ether::HEADER_LEN + payload.len());
+
+    let parsed = ether::Frame::parse(&frame).expect("built frame should parse");
+    assert_eq!(parsed.dst, dst);
+    assert_eq!(parsed.src, src);
+    assert_eq!(parsed.ethertype, ether::ETHERTYPE_ARP, "EtherType must be big-endian on the wire");
+    assert_eq!(parsed.payload, &payload);
+
+    // A buffer shorter than the 14-byte header is a runt and must not parse.
+    assert!(ether::Frame::parse(&[0u8; 10]).is_none());
+}
+
+/// Stage 18a: the network stack receives a frame off the NIC and dispatches it. `kernel_main` brings
+/// the stack up; this loops a frame back to ourselves and confirms `net::poll` pulled it off the ring
+/// and classified it (by EtherType) — the receive plumbing from the card up into the stack.
+#[test_case]
+fn net_receives_ethernet_frame() {
+    use crate::net;
+
+    assert!(crate::e1000::present(), "e1000 not initialized");
+    assert!(
+        net::loopback_selftest(),
+        "net stack did not receive its own looped-back Ethernet frame"
+    );
+    assert!(net::frames_received() > 0, "stack parsed no frames");
+    assert!(net::arp_seen() > 0, "stack did not classify the ARP-typed loopback frame");
 }
 
 /// Stage 14c-1: the FAT driver creates and overwrites a root-level file. Write a payload

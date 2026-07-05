@@ -80,6 +80,7 @@ mod ata;
 mod fat;
 mod pci;
 mod e1000;
+mod net;
 mod task;
 // The Stage 6 thread scheduler is dormant during Stage 7: the kernel runs the
 // async executor (the shell) instead, so the scheduler's spawn/run/yield sit
@@ -748,10 +749,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     e1000::enable_interrupts(nic.interrupt_line());
                     let irq_rx = e1000::interrupt_selftest();
                     serial_println!(
-                        "[ OK ] e1000 interrupt-driven receive = {} ({} IRQ(s), {} frame(s) of {} B drained in the handler)",
+                        "[ OK ] e1000 interrupt-driven receive = {} ({} IRQ(s), {} frame(s) of {} B polled off the ring)",
                         irq_rx,
                         e1000::rx_irq_count(),
-                        e1000::rx_frames_via_irq(),
+                        e1000::rx_frames(),
                         e1000::last_rx_len(),
                     );
                     println!(
@@ -766,6 +767,27 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         None => {
             serial_println!("[pci] no e1000 NIC found (is QEMU started with -device e1000?)");
             println!("Network: no e1000 NIC found on the PCI bus.");
+        }
+    }
+
+    // Stage 18a (networking): bring up the network stack over the e1000. The NIC moves raw Ethernet
+    // frames; the `net` module turns them into a protocol stack, starting with the outermost layer —
+    // Ethernet framing — and the receive plumbing (the RX interrupt now flags frames, `net::poll`
+    // drains and dispatches them). Prove it with the card's own loopback: send a frame to ourselves
+    // and confirm the stack receives and classifies it. ARP (18b) and IPv4/ICMP (18c) build on this.
+    if e1000::present() {
+        if let Some(dev) = e1000::device() {
+            net::init(dev.mac());
+            let framing_ok = net::loopback_selftest();
+            serial_println!(
+                "[ OK ] net 18a: Ethernet framing over loopback = {} ({} frame(s) parsed)",
+                framing_ok,
+                net::frames_received(),
+            );
+            println!(
+                "Network stack: received and parsed an Ethernet frame via loopback = {}.",
+                framing_ok,
+            );
         }
     }
 
