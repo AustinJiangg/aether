@@ -260,9 +260,12 @@ echo messages. Both directions are live: `net::receive`'s `handle_icmp` answers 
 kernel is pingable) and records echo replies, and `net::ping(ip)` sends ICMP-in-IPv4-in-Ethernet and
 pumps `poll` for the matching reply. At boot a loopback self-test proves the bidirectional path, and
 `ping(10.0.2.2)` gets a real reply from SLIRP ("ping 10.0.2.2: reply seq=1"). The from-scratch stack is
-complete: Ethernet -> ARP -> IPv4 -> ICMP over the interrupt-driven e1000. `ROADMAP.md` records the full
-staged history (stages 0-18); optional non-blocking follow-ons remain (a net task + shell `ping`/`arp`
-commands, DHCP, UDP/TCP).
+complete: Ethernet -> ARP -> IPv4 -> ICMP over the interrupt-driven e1000. **Stage 18d then made it a
+live service with a UI**: a background network thread (`unify::net_thread`) runs `net::poll` forever on
+the BSP run queue (peer to the shell, `hlt`ing between polls), so the kernel keeps answering ARP/pings
+while the shell is idle; the shell gains `ifconfig`, `arp`, and `ping <a.b.c.d>` commands (backed by
+`net::parse_ipv4` / `arp::cache_entries`). `ROADMAP.md` records the full staged history (stages 0-18);
+remaining optional follow-ons are DHCP or a transport layer (UDP/TCP).
 
 ## Language and writing conventions
 
@@ -494,7 +497,9 @@ Exit QEMU: `Ctrl-A` then `X`.
   profiles, so `cargo test` covers it — spawns an async-executor thread (a bounded async task) and a plain
   kernel thread on the BSP run queue and lets the timer preempt them to completion, recording `async_work`/
   `kernel_work` (and BSP `preemptions` via `percpu`). `run_shell_threaded` (non-test) runs the interactive
-  shell as a scheduled thread alongside a coexisting heartbeat thread, forever — on a 32 KiB stack via
+  shell as a scheduled thread alongside a coexisting heartbeat thread and (Stage 18d) a background
+  `net_thread` that loops `net::poll` + `hlt` to keep the network stack answering ARP/pings while the shell
+  is idle, forever — the shell on a 32 KiB stack, the net thread on 16 KiB, via
   `sched::spawn_with_stack` (the deep executor+shell+FAT call chain overflows the default 4 KiB; the
   guard-page refinement exposed this as a clean fault). Concurrent printing from
   these BSP threads is safe because the VGA/serial writers lock inside `without_interrupts`.
@@ -502,8 +507,10 @@ Exit QEMU: `Ctrl-A` then `X`.
   keystrokes from the keyboard `ScancodeStream`, buffers a line (with Backspace)
   against a current working directory, and on Enter routes it through a `dispatch`
   table of built-in commands (including the Stage 8 file commands, which since Stage
-  14b-3 also reach the FAT disk mounted at `/mnt`). Includes a boot `selftest` so the
-  shell and file system are verifiable without a keyboard.
+  14b-3 also reach the FAT disk mounted at `/mnt`, and the Stage 18d network commands
+  `ifconfig`/`arp`/`ping <a.b.c.d>` over the live `net` stack). Includes a boot `selftest`
+  (now also driving the network commands) so the shell, file system, and net stack are
+  verifiable without a keyboard.
 - `src/fs.rs`: Stage 8 in-memory file system — a heap-backed tree of `File`/`Dir`
   nodes addressed by `/`-separated paths, exposed as a global `RamFs` behind a
   mutex with `mkdir`/`write`/`read`/`list`/`remove`/`is_dir`. No disk, no
@@ -688,7 +695,10 @@ Exit QEMU: `Ctrl-A` then `X`.
   `net/icmp.rs` parses/builds ICMP echo messages (`Echo`, `build_echo_request`/`build_echo_reply`). `net`'s
   `handle_icmp` answers echo requests (kernel is pingable) and records replies; `net::ping(ip)` sends
   ICMP-in-IPv4-in-Ethernet and pumps `poll` for the matching reply (matched by id/seq). `ping_loopback_selftest`
-  proves both directions with no peer; `ping(10.0.2.2)` gets a live reply from SLIRP. This completes the stack.
+  proves both directions with no peer; `ping(10.0.2.2)` gets a live reply from SLIRP. Stage 18d adds
+  `net::parse_ipv4` (dotted-decimal -> octets, for the shell `ping`) and `arp::cache_entries` (a cache
+  snapshot for the shell `arp`); a background thread (`unify::net_thread`) drives `net::poll` so the stack
+  answers ARP/pings continuously. This completes the stack.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

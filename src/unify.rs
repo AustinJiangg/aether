@@ -122,6 +122,12 @@ pub fn demo() {
 #[cfg(not(test))]
 const SHELL_STACK_SIZE: usize = 32 * 1024;
 
+/// Usable stack for the background network thread. Its poll -> parse -> build -> transmit
+/// chain (with heap-allocated packet buffers and the ARP `BTreeMap`) is moderately deep, so
+/// it gets more than the default 4 KiB.
+#[cfg(not(test))]
+const NET_STACK_SIZE: usize = 16 * 1024;
+
 /// Run the interactive shell as a scheduled kernel thread, forever (non-test).
 ///
 /// This is the real unification: instead of the executor `run()`ing as a separate
@@ -131,13 +137,28 @@ const SHELL_STACK_SIZE: usize = 32 * 1024;
 pub fn run_shell_threaded() -> ! {
     // Spawn with interrupts off (atomic w.r.t. the timer); `run_to_completion` enables
     // them. `shell_thread` never finishes, so `run_to_completion` never returns. The
-    // shell executor gets a large stack (see `SHELL_STACK_SIZE`); the heartbeat thread
-    // does trivial work, so the default stack is plenty.
+    // shell executor gets a large stack (see `SHELL_STACK_SIZE`); the net thread a medium
+    // one; the heartbeat thread does trivial work, so the default stack is plenty.
     int::disable();
     sched::spawn_with_stack(shell_thread, SHELL_STACK_SIZE);
+    sched::spawn_with_stack(net_thread, NET_STACK_SIZE);
     sched::spawn(heartbeat_thread);
     sched::run_to_completion();
     crate::hlt_loop(); // unreachable: shell_thread runs forever
+}
+
+/// The background network thread (Stage 18d): forever drain and dispatch received frames, so the
+/// stack keeps answering ARP requests and incoming pings while the shell is idle. Between polls it
+/// `hlt`s — sleeping until the next interrupt (the e1000 receive IRQ, or the timer that preempts it
+/// to the shell) — so an idle network costs nothing. Reached via the scheduler like any other thread.
+#[cfg(not(test))]
+fn net_thread() {
+    loop {
+        crate::net::poll();
+        // Sleep until an interrupt wakes us: a received frame (so we poll it promptly) or the timer
+        // (which preempts us to the shell). A bare `hlt` is safe here — interrupts are enabled.
+        x86_64::instructions::hlt();
+    }
 }
 
 /// The shell as a kernel thread: build the async executor, spawn the shell task, and

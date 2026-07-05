@@ -313,6 +313,21 @@ pub fn icmp_replies_received() -> u64 {
     ICMP_REPLIES_RECEIVED.load(Ordering::Acquire)
 }
 
+/// Stage 18d: parse a dotted-decimal IPv4 address (`"10.0.2.2"`) into four octets, or `None` if it is
+/// malformed (wrong number of parts, non-numeric, or an octet out of 0..=255). Used by the shell's
+/// `ping` command. `u8::from_str` (via `parse`) rejects out-of-range and non-digit octets for us.
+pub fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
+    let mut octets = [0u8; 4];
+    let mut parts = s.trim().split('.');
+    for octet in octets.iter_mut() {
+        *octet = parts.next()?.parse::<u8>().ok()?;
+    }
+    if parts.next().is_some() {
+        return None; // more than four parts
+    }
+    Some(octets)
+}
+
 /// Stage 18a self-test: send an Ethernet frame to ourselves through the card's PHY loopback and
 /// confirm the stack receives and classifies it. Returns whether a frame with our own source MAC and
 /// the sent EtherType came back. Reuses the e1000 loopback (no external traffic), the same technique

@@ -141,6 +141,11 @@ pub fn cache_len() -> usize {
     CACHE.lock().len()
 }
 
+/// Snapshot the ARP cache as a list of (IP, MAC) pairs — for the shell's `arp` command (Stage 18d).
+pub fn cache_entries() -> alloc::vec::Vec<([u8; 4], MacAddr)> {
+    CACHE.lock().iter().map(|(&ip, &mac)| (ip, mac)).collect()
+}
+
 /// Process an incoming ARP packet. It always learns the sender's IP -> MAC mapping (every ARP packet
 /// carries one), and if the packet is a *request for `our_ip`* it returns the ARP **reply payload**
 /// to send back to the requester; otherwise `None`. Pure apart from the cache update — no I/O — so it

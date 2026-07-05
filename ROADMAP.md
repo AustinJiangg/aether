@@ -512,8 +512,18 @@ unify later.
 > `ipv4_header_parses_and_builds` and `icmp_echo_parses_and_builds` (build/parse + self-checksum),
 > `net_pings_over_loopback` (the bidirectional loopback path), and the live `pings_the_gateway`. **This
 > completes the from-scratch stack: Ethernet -> ARP -> IPv4 -> ICMP, sending and receiving real frames
-> over the e1000 with interrupt-driven receive.** Optional follow-ons (all non-blocking): a background
-> net task + `ping`/`arp`/`ifconfig` shell commands (18d), DHCP for a leased address, or UDP/TCP.
+> over the e1000 with interrupt-driven receive.**
+>
+> **Stage 18d is also done** — the network stack is now a *live service* with a user interface. A
+> background **network thread** (`unify::net_thread`) runs `net::poll` forever on the BSP's run queue,
+> peer to the shell thread, `hlt`ing between polls (woken by the e1000 receive IRQ or the timer) — so
+> the kernel keeps answering ARP requests and incoming pings while the shell sits idle, at no cost when
+> the network is quiet. The shell gains three commands: `ifconfig` (our IP/MAC + traffic counters),
+> `arp` (the ARP cache), and `ping <a.b.c.d>` (send an echo and report the reply), backed by
+> `net::parse_ipv4` and `arp::cache_entries`. The boot self-test drives them headlessly: `ping 10.0.2.2`
+> and `ping 10.0.2.3` both get replies over the wire. Verified by 62 tests (`parse_ipv4_accepts_and_rejects`
+> and `arp_cache_snapshot_lists_the_gateway`). Remaining optional follow-ons: DHCP for a leased address,
+> or a transport layer (UDP/TCP).
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

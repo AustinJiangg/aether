@@ -1024,6 +1024,36 @@ fn pings_the_gateway() {
     assert!(seq >= 1, "ping returned an invalid sequence number");
 }
 
+/// Stage 18d: the `ping` command's dotted-decimal IPv4 parser. Pure logic: accept well-formed
+/// addresses and reject malformed ones (wrong part count, out-of-range octet, non-numeric).
+#[test_case]
+fn parse_ipv4_accepts_and_rejects() {
+    use crate::net;
+
+    assert_eq!(net::parse_ipv4("10.0.2.2"), Some([10, 0, 2, 2]));
+    assert_eq!(net::parse_ipv4("255.255.255.255"), Some([255, 255, 255, 255]));
+    assert_eq!(net::parse_ipv4("  1.2.3.4 "), Some([1, 2, 3, 4]), "surrounding spaces are trimmed");
+
+    assert!(net::parse_ipv4("10.0.2").is_none(), "too few octets");
+    assert!(net::parse_ipv4("10.0.2.2.2").is_none(), "too many octets");
+    assert!(net::parse_ipv4("10.0.2.256").is_none(), "octet out of range");
+    assert!(net::parse_ipv4("10.0.x.2").is_none(), "non-numeric octet");
+    assert!(net::parse_ipv4("").is_none(), "empty string");
+}
+
+/// Stage 18d: the ARP cache snapshot the `arp` command prints reflects real learned mappings. After
+/// resolving the gateway, its (IP, MAC) pair appears in `cache_entries` with a MAC matching the
+/// direct lookup.
+#[test_case]
+fn arp_cache_snapshot_lists_the_gateway() {
+    use crate::net;
+
+    let mac = net::arp_resolve(net::GATEWAY_IP).expect("gateway did not answer ARP");
+    let entries = net::arp::cache_entries();
+    let found = entries.iter().find(|(ip, _)| *ip == net::GATEWAY_IP);
+    assert_eq!(found.map(|(_, m)| *m), Some(mac), "gateway mapping missing from the ARP cache snapshot");
+}
+
 /// Stage 14c-1: the FAT driver creates and overwrites a root-level file. Write a payload
 /// spanning several clusters through the global VFS (`/mnt/...`), read it back, and confirm the
 /// bytes round-trip — exercising free-cluster allocation, the cluster chain, and the directory

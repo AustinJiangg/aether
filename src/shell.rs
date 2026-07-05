@@ -29,7 +29,7 @@ use futures_util::stream::StreamExt;
 use pc_keyboard::{layouts::Us104Key, DecodedKey, HandleControl, PS2Keyboard, ScancodeSet1};
 
 use crate::task::keyboard::ScancodeStream;
-use crate::{allocator, fs, interrupts, vga_buffer};
+use crate::{allocator, fs, interrupts, net, vga_buffer};
 
 /// Print to BOTH the screen and the serial log, with a trailing newline.
 ///
@@ -133,6 +133,11 @@ fn dispatch(cwd: &mut String, line: &str) {
         "rm" => cmd_rm(cwd, args),
         "cd" => cmd_cd(cwd, args),
 
+        // --- network commands (Stage 18d) ---
+        "ifconfig" => cmd_ifconfig(),
+        "arp" => cmd_arp(),
+        "ping" => cmd_ping(args),
+
         other => sh_println!("unknown command: '{}' (try 'help')", other),
     }
 }
@@ -152,6 +157,9 @@ fn help() {
     sh_println!("  rm <path>             remove a file or directory");
     sh_println!("  cd <path>             change directory");
     sh_println!("  pwd                   print the working directory");
+    sh_println!("  ifconfig              show the network interface + stats");
+    sh_println!("  arp                   show the ARP cache");
+    sh_println!("  ping <a.b.c.d>        send an ICMP echo to an IPv4 address");
 }
 
 /// `ls [path]` — list a directory (the cwd if no path is given).
@@ -228,6 +236,59 @@ fn cmd_cd(cwd: &mut String, args: &str) {
         *cwd = path;
     } else {
         sh_println!("cd: {}: not a directory", path);
+    }
+}
+
+/// `ifconfig` — show our network interface (IP + MAC) and traffic counters (Stage 18d).
+fn cmd_ifconfig() {
+    let ip = net::our_ip();
+    let mac = net::our_mac();
+    sh_println!(
+        "eth0: inet {}.{}.{}.{}  ether {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        ip[0], ip[1], ip[2], ip[3],
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+    );
+    sh_println!(
+        "  RX frames {}  ARP replies sent {}  pings sent-back {}  answered {}",
+        net::frames_received(),
+        net::arp_replies_sent(),
+        net::icmp_replies_received(),
+        net::icmp_requests_handled(),
+    );
+}
+
+/// `arp` — print the ARP cache (learned IPv4 -> MAC mappings), Stage 18d.
+fn cmd_arp() {
+    let entries = net::arp::cache_entries();
+    if entries.is_empty() {
+        sh_println!("(arp cache empty)");
+        return;
+    }
+    for (ip, mac) in entries {
+        sh_println!(
+            "  {}.{}.{}.{}  ->  {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            ip[0], ip[1], ip[2], ip[3],
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+        );
+    }
+}
+
+/// `ping <a.b.c.d>` — send an ICMP echo request and report the reply (Stage 18d).
+fn cmd_ping(args: &str) {
+    let ip = match net::parse_ipv4(args) {
+        Some(ip) => ip,
+        None => {
+            sh_println!("usage: ping <a.b.c.d>");
+            return;
+        }
+    };
+    sh_println!("PING {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+    match net::ping(ip) {
+        Some(seq) => sh_println!(
+            "  reply from {}.{}.{}.{}: icmp_seq={}",
+            ip[0], ip[1], ip[2], ip[3], seq
+        ),
+        None => sh_println!("  no reply from {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]),
     }
 }
 
@@ -355,6 +416,15 @@ pub fn selftest() {
         "rm /mnt/TMPDIR",
         "ls /mnt",
     ] {
+        sh_println!("aether:{}> {}", cwd, command);
+        dispatch(&mut cwd, command);
+    }
+
+    // Stage 18d: the network commands over the live stack. The e1000 + net stack came up earlier in
+    // boot (our IP/MAC, the gateway resolved by ARP), so `ifconfig`/`arp` show real state and `ping`
+    // reaches SLIRP's gateway over the (emulated) wire — the same commands a user types interactively.
+    sh_println!("[shell selftest] network stack at /net (18d): ifconfig / arp / ping:");
+    for command in ["ifconfig", "arp", "ping 10.0.2.2", "ping 10.0.2.3"] {
         sh_println!("aether:{}> {}", cwd, command);
         dispatch(&mut cwd, command);
     }
