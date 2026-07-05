@@ -247,9 +247,15 @@ split**: `on_interrupt` no longer drains the ring or allocates in interrupt cont
 (still mandatory, to clear the level-triggered cause) and only *flags* frames are waiting;
 `e1000::poll_frame` drains from ordinary context, so the handler takes no lock (which also let
 `interrupt_selftest` drop its `without_interrupts` dance). `net::loopback_selftest` proves it via PHY
-loopback. `ROADMAP.md` carries the forward plan (stages 9-18): the user-space main line (system calls,
+loopback. **Stage 18b is now also done**: ARP, the stack's first live exchange with a real peer.
+`net/arp.rs` parses/builds the 28-byte ARP packet, keeps an ARP cache (`BTreeMap<[u8;4], MacAddr>`), and
+has a pure `process` (learns the sender's IP->MAC, replies to requests for our IP); `net::receive`
+routes ARP frames to it and transmits replies, and `net::arp_resolve(ip)` broadcasts a request and
+pumps `poll` until the reply is cached. At boot, `arp_resolve(10.0.2.2)` asks SLIRP's gateway for its
+MAC and gets a real reply ("ARP: 10.0.2.2 is at 52:55:0a:00:02:02"), proving send/receive/parse over
+the wire. `ROADMAP.md` carries the forward plan (stages 9-18): the user-space main line (system calls,
 per-process address spaces + ELF, multiprocessing), plus persistence, APIC/SMP, and networking tracks
-— next is Stage 18b, ARP (resolving the gateway's MAC — the first live SLIRP exchange).
+— next is Stage 18c, IPv4 + ICMP echo (pinging the gateway).
 
 ## Language and writing conventions
 
@@ -664,9 +670,13 @@ Exit QEMU: `Ctrl-A` then `X`.
   frame), with `MacAddr`/`BROADCAST` and the `ETHERTYPE_IPV4`/`ETHERTYPE_ARP` tags (big-endian on the
   wire). `net/mod.rs` holds the stack's static identity (`OUR_IP` = `10.0.2.15`, the SLIRP default lease;
   `GATEWAY_IP` = `10.0.2.2`; the card's MAC recorded in `init`), a `poll` that drains frames via
-  `e1000::poll_frame` and dispatches each by EtherType (`receive` — 18a classifies/counts ARP vs IPv4 vs
-  other; the handlers arrive in 18b/18c), and `loopback_selftest` proving the receive path end to end via
-  the card's PHY loopback. ARP (`net/arp.rs`, 18b) and IPv4+ICMP (`net/ipv4.rs`/`net/icmp.rs`, 18c) come next.
+  `e1000::poll_frame` and dispatches each by EtherType (`receive`), and `loopback_selftest` proving the
+  receive path end to end via the card's PHY loopback. `net/arp.rs` (Stage 18b) adds ARP: parse/build the
+  28-byte packet (`ArpPacket`, `build_request`/`build_reply`), an ARP cache (`cache_insert`/`cache_lookup`,
+  a `static Mutex<BTreeMap<[u8;4], MacAddr>>`), and a pure `process` that learns the sender's mapping and
+  returns a reply payload for a request aimed at our IP. `net::receive` routes ARP frames to `process` and
+  transmits the reply; `net::arp_resolve(ip)` broadcasts a request and pumps `poll` until the cache has the
+  answer — proven live against SLIRP's gateway at boot. IPv4+ICMP (`net/ipv4.rs`/`net/icmp.rs`, 18c) come next.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

@@ -479,6 +479,22 @@ unify later.
 > 10.0.2.15 ..." and "loopback framing test: ... match = true". Verified by 52 tests (the new
 > `ethernet_frame_parses_and_builds` — pure parse/build round-trip — and `net_receives_ethernet_frame`
 > — the loopback path). Next (18b): ARP, resolving the gateway's MAC (the first live SLIRP exchange).
+>
+> **Stage 18b is also done** — ARP, and with it the stack's **first live exchange with a real peer**.
+> ARP (the Address Resolution Protocol) is the IP-to-MAC lookup: IP addresses are 32-bit but Ethernet
+> delivers to 48-bit MACs, so before sending an IP packet a host broadcasts "who has IP X? tell me",
+> and X's owner replies (unicast) with its MAC. `net/arp.rs` parses/builds the fixed 28-byte ARP
+> packet (IPv4-over-Ethernet), keeps a small **ARP cache** (`BTreeMap<[u8;4], MacAddr>`), and has a
+> pure, unit-testable `process` that learns any sender's mapping and returns a reply payload when the
+> packet is a request for our IP. Both directions are live: `net::receive` now routes ARP frames to
+> `process` and transmits the reply (so other hosts can find us), and `net::arp_resolve(ip)` broadcasts
+> a request and pumps `poll` until the reply lands in the cache (bounded, re-broadcasting periodically).
+> The headline: at boot, `arp_resolve(10.0.2.2)` asks QEMU's SLIRP gateway for its MAC and gets a real
+> answer — boot logs "ARP: 10.0.2.2 is at 52:55:0a:00:02:02" (libslirp's gateway MAC is `52:55` + the IP
+> bytes) — proving send, receive, and parse all work end to end over the emulated wire, not just
+> loopback. Verified by 55 tests: `arp_packet_parses_and_builds` and `arp_replies_to_request_for_us`
+> (pure logic — the reply payload and cache learning) plus the live `arp_resolves_gateway`. Next (18c):
+> IPv4 + ICMP echo — pinging the gateway (the headline milestone).
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

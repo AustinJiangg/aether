@@ -21,7 +21,17 @@
 //! Our network identity is **static** for now: we simply claim `10.0.2.15`, the address QEMU's SLIRP
 //! user-mode network hands out by default (DHCP would negotiate it — a possible later step). The MAC
 //! is whatever the card reports.
+//!
+//! ## 18b: ARP
+//!
+//! [`arp`] adds the Address Resolution Protocol — the IP-to-MAC lookup. Two directions, both live:
+//! `receive` now feeds ARP frames to [`arp::process`], which learns the sender's mapping and, if the
+//! packet is a request for our IP, sends a reply (so other hosts can find us); and [`arp_resolve`]
+//! sends a request for a target IP and pumps [`poll`] until the reply populates the cache. This is
+//! the stack's first *live* exchange: asking SLIRP's gateway (`10.0.2.2`) for its MAC and getting an
+//! answer back proves send, receive, and parse all work against a real peer.
 
+pub mod arp;
 pub mod ether;
 
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -34,7 +44,6 @@ use ether::MacAddr;
 /// Our static IPv4 address on QEMU's SLIRP network (the default guest lease).
 pub const OUR_IP: [u8; 4] = [10, 0, 2, 15];
 /// SLIRP's virtual gateway (it answers our ARP and — in 18c — our pings).
-#[allow(dead_code)] // resolved/pinged by 18b (ARP) and 18c (ICMP)
 pub const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
 
 /// Our MAC address, copied from the e1000 in [`init`]. Behind a `Mutex` so it can be a non-const
@@ -47,6 +56,8 @@ static FRAMES_RECEIVED: AtomicU64 = AtomicU64::new(0);
 static ARP_SEEN: AtomicU64 = AtomicU64::new(0);
 /// Frames classified as IPv4 (Stage 18a; IPv4 is actually handled in 18c).
 static IPV4_SEEN: AtomicU64 = AtomicU64::new(0);
+/// ARP replies we have sent in response to requests for our IP (Stage 18b).
+static ARP_REPLIES_SENT: AtomicU64 = AtomicU64::new(0);
 /// Source MAC of the most recently received frame, for the loopback self-test.
 static LAST_SRC: Mutex<MacAddr> = Mutex::new([0; 6]);
 
@@ -96,6 +107,15 @@ fn receive(bytes: &[u8]) {
     match frame.ethertype {
         ether::ETHERTYPE_ARP => {
             ARP_SEEN.fetch_add(1, Ordering::Relaxed);
+            // Stage 18b: learn the sender's IP->MAC, and reply if it is asking for us.
+            if let Some(pkt) = arp::ArpPacket::parse(frame.payload) {
+                if let Some(reply) = arp::process(our_mac(), OUR_IP, &pkt) {
+                    // Unicast the reply back to the requester (Ethernet src = us).
+                    let eth = ether::build(pkt.sha, our_mac(), ether::ETHERTYPE_ARP, &reply);
+                    e1000::transmit(&eth);
+                    ARP_REPLIES_SENT.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
         ether::ETHERTYPE_IPV4 => {
             IPV4_SEEN.fetch_add(1, Ordering::Relaxed);
@@ -118,6 +138,36 @@ pub fn arp_seen() -> u64 {
 #[allow(dead_code)] // asserted by the IPv4/ICMP tests in 18c
 pub fn ipv4_seen() -> u64 {
     IPV4_SEEN.load(Ordering::Relaxed)
+}
+
+/// ARP replies we have sent in response to requests for our IP (Stage 18b).
+#[allow(dead_code)] // surfaced by the `arp` shell command in 18d
+pub fn arp_replies_sent() -> u64 {
+    ARP_REPLIES_SENT.load(Ordering::Relaxed)
+}
+
+/// Stage 18b: resolve `ip` to a MAC via ARP. Returns a cached answer immediately if we have one;
+/// otherwise broadcasts an ARP request and pumps [`poll`] until the reply lands in the cache,
+/// bounded so a silent network cannot hang boot (returns `None` on timeout). Re-broadcasts
+/// periodically in case an early frame is lost while the link settles.
+pub fn arp_resolve(ip: [u8; 4]) -> Option<MacAddr> {
+    if let Some(mac) = arp::cache_lookup(ip) {
+        return Some(mac);
+    }
+    let request = arp::build_request(our_mac(), OUR_IP, ip);
+    let frame = ether::build(ether::BROADCAST, our_mac(), ether::ETHERTYPE_ARP, &request);
+    // Up to ~2 s total, re-broadcasting every ~200 ms; returns the instant the reply is cached.
+    for i in 0..2000 {
+        if i % 200 == 0 {
+            e1000::transmit(&frame);
+        }
+        poll(); // drain and dispatch anything the NIC has received (the reply arrives here)
+        if let Some(mac) = arp::cache_lookup(ip) {
+            return Some(mac);
+        }
+        crate::apic::pit_sleep_us(1000);
+    }
+    None
 }
 
 /// Stage 18a self-test: send an Ethernet frame to ourselves through the card's PHY loopback and

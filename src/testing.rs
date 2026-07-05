@@ -863,6 +863,82 @@ fn net_receives_ethernet_frame() {
     assert!(net::arp_seen() > 0, "stack did not classify the ARP-typed loopback frame");
 }
 
+/// Stage 18b: the ARP layer parses and builds packets correctly. Pure logic (no hardware): build a
+/// request, parse it back, confirm the fields, and reject a runt / non-ARP buffer.
+#[test_case]
+fn arp_packet_parses_and_builds() {
+    use crate::net::arp;
+
+    let our_mac = [1, 2, 3, 4, 5, 6];
+    let our_ip = [10, 0, 2, 15];
+    let target_ip = [10, 0, 2, 2];
+    let req = arp::build_request(our_mac, our_ip, target_ip);
+    assert_eq!(req.len(), arp::PACKET_LEN);
+
+    let p = arp::ArpPacket::parse(&req).expect("built request should parse");
+    assert_eq!(p.oper, arp::OPER_REQUEST);
+    assert_eq!(p.sha, our_mac);
+    assert_eq!(p.spa, our_ip);
+    assert_eq!(p.tpa, target_ip);
+    assert_eq!(p.tha, [0u8; 6], "a request has no known target MAC");
+
+    assert!(arp::ArpPacket::parse(&[0u8; 10]).is_none(), "a runt must not parse as ARP");
+}
+
+/// Stage 18b: we answer an ARP request for our own IP, and learn the sender's mapping. Pure logic:
+/// `arp::process` on a crafted request for our IP returns the correct reply payload and caches the
+/// sender; a request for some other IP returns no reply (but still learns the sender).
+#[test_case]
+fn arp_replies_to_request_for_us() {
+    use crate::net::{arp, OUR_IP};
+
+    let our_mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+    let sender_mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+    let sender_ip = [10, 0, 2, 99];
+
+    // "Who has OUR_IP? tell sender" — we must reply.
+    let request = arp::ArpPacket {
+        oper: arp::OPER_REQUEST,
+        sha: sender_mac,
+        spa: sender_ip,
+        tha: [0; 6],
+        tpa: OUR_IP,
+    };
+    let reply = arp::process(our_mac, OUR_IP, &request).expect("should reply to a request for us");
+    let parsed = arp::ArpPacket::parse(&reply).expect("reply should parse");
+    assert_eq!(parsed.oper, arp::OPER_REPLY);
+    assert_eq!(parsed.sha, our_mac, "reply announces our MAC");
+    assert_eq!(parsed.spa, OUR_IP);
+    assert_eq!(parsed.tha, sender_mac, "reply is addressed back to the requester");
+    assert_eq!(parsed.tpa, sender_ip);
+    // Processing any ARP packet learns the sender's mapping.
+    assert_eq!(arp::cache_lookup(sender_ip), Some(sender_mac));
+
+    // A request for a different IP is not ours: no reply.
+    let not_us = arp::ArpPacket {
+        oper: arp::OPER_REQUEST,
+        sha: sender_mac,
+        spa: sender_ip,
+        tha: [0; 6],
+        tpa: [10, 0, 2, 200],
+    };
+    assert!(arp::process(our_mac, OUR_IP, &not_us).is_none());
+}
+
+/// Stage 18b: the first *live* network exchange. Resolve SLIRP's gateway (10.0.2.2) to a MAC via ARP
+/// — broadcast a request, receive SLIRP's reply, parse it, and cache the mapping. `kernel_main`
+/// already resolved it at boot, so this usually hits the cache; either way it asserts a real MAC came
+/// back (non-zero and not our own).
+#[test_case]
+fn arp_resolves_gateway() {
+    use crate::net;
+
+    assert!(crate::e1000::present(), "e1000 not initialized");
+    let mac = net::arp_resolve(net::GATEWAY_IP).expect("SLIRP gateway did not answer ARP");
+    assert_ne!(mac, [0u8; 6], "gateway MAC resolved to all-zeros");
+    assert_ne!(mac, net::our_mac(), "gateway MAC should differ from our own");
+}
+
 /// Stage 14c-1: the FAT driver creates and overwrites a root-level file. Write a payload
 /// spanning several clusters through the global VFS (`/mnt/...`), read it back, and confirm the
 /// bytes round-trip — exercising free-cluster allocation, the cluster chain, and the directory

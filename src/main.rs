@@ -788,6 +788,30 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 "Network stack: received and parsed an Ethernet frame via loopback = {}.",
                 framing_ok,
             );
+
+            // Stage 18b (networking): ARP. Ask SLIRP's gateway for its MAC — the stack's first live
+            // exchange with a real peer (SLIRP always answers ARP for 10.0.2.2). Getting a reply back
+            // proves send + receive + parse all work end to end over the (emulated) wire.
+            let gw = net::GATEWAY_IP;
+            match net::arp_resolve(gw) {
+                Some(mac) => {
+                    serial_println!(
+                        "[ OK ] ARP: {}.{}.{}.{} is at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ({} cache entry/entries)",
+                        gw[0], gw[1], gw[2], gw[3],
+                        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                        net::arp::cache_len(),
+                    );
+                    println!(
+                        "Network: ARP resolved gateway {}.{}.{}.{} -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}.",
+                        gw[0], gw[1], gw[2], gw[3],
+                        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                    );
+                }
+                None => {
+                    serial_println!("[net] ARP: gateway did not answer (SLIRP link not ready?)");
+                    println!("Network: ARP got no reply from the gateway.");
+                }
+            }
         }
     }
 
