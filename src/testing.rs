@@ -939,6 +939,91 @@ fn arp_resolves_gateway() {
     assert_ne!(mac, net::our_mac(), "gateway MAC should differ from our own");
 }
 
+/// Stage 18c: the Internet checksum (RFC 1071). A known-answer test on the canonical IPv4 header
+/// example: with the checksum field zeroed the routine yields 0xb861, and with that value in place
+/// re-summing the header yields zero (how a receiver validates a header).
+#[test_case]
+fn internet_checksum_known_answer() {
+    use crate::net::ipv4;
+
+    let mut hdr = [
+        0x45u8, 0x00, 0x00, 0x73, 0x00, 0x00, 0x40, 0x00, 0x40, 0x11, 0x00, 0x00, 0xc0, 0xa8, 0x00,
+        0x01, 0xc0, 0xa8, 0x00, 0xc7,
+    ];
+    assert_eq!(ipv4::checksum(&hdr), 0xb861, "checksum of the zeroed header");
+    hdr[10] = 0xb8;
+    hdr[11] = 0x61;
+    assert_eq!(ipv4::checksum(&hdr), 0, "a header with its checksum re-sums to zero");
+}
+
+/// Stage 18c: the IPv4 layer parses and builds packets, with a correct header checksum. Build a
+/// packet, confirm summing its header yields zero, then parse the fields back; reject a runt.
+#[test_case]
+fn ipv4_header_parses_and_builds() {
+    use crate::net::ipv4;
+
+    let src = [10, 0, 2, 15];
+    let dst = [10, 0, 2, 2];
+    let payload = [0xAA, 0xBB, 0xCC, 0xDD];
+    let pkt = ipv4::build(src, dst, ipv4::PROTO_ICMP, &payload);
+    assert_eq!(pkt.len(), ipv4::HEADER_LEN + payload.len());
+    assert_eq!(ipv4::checksum(&pkt[..ipv4::HEADER_LEN]), 0, "built header must carry a valid checksum");
+
+    let parsed = ipv4::Ipv4Packet::parse(&pkt).expect("built packet should parse");
+    assert_eq!(parsed.src, src);
+    assert_eq!(parsed.dst, dst);
+    assert_eq!(parsed.protocol, ipv4::PROTO_ICMP);
+    assert_eq!(parsed.payload, &payload);
+    assert!(ipv4::Ipv4Packet::parse(&[0u8; 10]).is_none(), "a runt must not parse as IPv4");
+}
+
+/// Stage 18c: the ICMP layer parses and builds echo messages, with a correct checksum. Build a
+/// request and a reply, confirm each self-checksums to zero, and round-trip the fields.
+#[test_case]
+fn icmp_echo_parses_and_builds() {
+    use crate::net::{icmp, ipv4};
+
+    let data = b"ping-data";
+    let req = icmp::build_echo_request(0x1234, 7, data);
+    assert_eq!(ipv4::checksum(&req), 0, "built ICMP message must carry a valid checksum");
+
+    let e = icmp::Echo::parse(&req).expect("request should parse");
+    assert_eq!(e.typ, icmp::TYPE_ECHO_REQUEST);
+    assert_eq!(e.id, 0x1234);
+    assert_eq!(e.seq, 7);
+    assert_eq!(e.data, data);
+
+    let rep = icmp::build_echo_reply(0x1234, 7, data);
+    let e2 = icmp::Echo::parse(&rep).expect("reply should parse");
+    assert_eq!(e2.typ, icmp::TYPE_ECHO_REPLY);
+    assert!(icmp::Echo::parse(&[0u8; 4]).is_none(), "a runt must not parse as ICMP echo");
+}
+
+/// Stage 18c: the full ICMP path bidirectionally, via loopback (no external peer). Send an echo
+/// request to ourselves; the stack answers it and receives its own reply — exercising build, parse,
+/// checksum, dispatch, the reply we generate, and receiving that reply.
+#[test_case]
+fn net_pings_over_loopback() {
+    use crate::net;
+
+    assert!(crate::e1000::present(), "e1000 not initialized");
+    assert!(net::ping_loopback_selftest(), "ICMP loopback round-trip failed");
+    assert!(net::icmp_requests_handled() > 0, "we answered no echo request");
+    assert!(net::icmp_replies_received() > 0, "we received no echo reply");
+}
+
+/// Stage 18c: the headline — ping SLIRP's gateway over the (emulated) wire and get an echo reply.
+/// `net::ping` resolves the MAC, sends ICMP-in-IPv4-in-Ethernet, and matches the returning reply by
+/// identifier and sequence number.
+#[test_case]
+fn pings_the_gateway() {
+    use crate::net;
+
+    assert!(crate::e1000::present(), "e1000 not initialized");
+    let seq = net::ping(net::GATEWAY_IP).expect("SLIRP gateway did not answer our ping");
+    assert!(seq >= 1, "ping returned an invalid sequence number");
+}
+
 /// Stage 14c-1: the FAT driver creates and overwrites a root-level file. Write a payload
 /// spanning several clusters through the global VFS (`/mnt/...`), read it back, and confirm the
 /// bytes round-trip — exercising free-cluster allocation, the cluster chain, and the directory

@@ -30,16 +30,33 @@
 //! sends a request for a target IP and pumps [`poll`] until the reply populates the cache. This is
 //! the stack's first *live* exchange: asking SLIRP's gateway (`10.0.2.2`) for its MAC and getting an
 //! answer back proves send, receive, and parse all work against a real peer.
+//!
+//! ## 18c: IPv4 + ICMP echo (ping)
+//!
+//! [`ipv4`] and [`icmp`] add the next two layers and the headline capability: **ping**. An echo
+//! request is ICMP-in-IPv4-in-Ethernet; the target echoes an ICMP reply. Both directions are live:
+//! `receive` dispatches IPv4/ICMP frames addressed to us — answering echo *requests* (so we are
+//! pingable) and recording echo *replies* — and [`ping`] sends an echo request and pumps [`poll`]
+//! until the matching reply comes back. [`ping`]ing SLIRP's gateway succeeds because libslirp reflects
+//! echoes aimed at `10.0.2.2` directly. The [`ipv4::checksum`] (the "Internet checksum") protects both
+//! the IP header and the ICMP message.
 
 pub mod arp;
 pub mod ether;
+pub mod icmp;
+pub mod ipv4;
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use spin::Mutex;
 
 use crate::{e1000, serial_println};
 use ether::MacAddr;
+
+/// ICMP identifier we stamp on our outgoing pings (arbitrary; lets us recognize our own replies).
+const PING_ID: u16 = 0xAE71;
+/// The payload our pings carry (echoed back by the target unchanged).
+const PING_PAYLOAD: &[u8] = b"aether ping 0123456789abcdef";
 
 /// Our static IPv4 address on QEMU's SLIRP network (the default guest lease).
 pub const OUR_IP: [u8; 4] = [10, 0, 2, 15];
@@ -58,6 +75,15 @@ static ARP_SEEN: AtomicU64 = AtomicU64::new(0);
 static IPV4_SEEN: AtomicU64 = AtomicU64::new(0);
 /// ARP replies we have sent in response to requests for our IP (Stage 18b).
 static ARP_REPLIES_SENT: AtomicU64 = AtomicU64::new(0);
+/// ICMP echo *requests* we have answered — i.e. how many times we were successfully pinged (18c).
+static ICMP_REQUESTS_HANDLED: AtomicU64 = AtomicU64::new(0);
+/// ICMP echo *replies* we have received — i.e. how many of our pings came back (18c).
+static ICMP_REPLIES_RECEIVED: AtomicU64 = AtomicU64::new(0);
+/// Identifier / sequence of the most recently received echo reply, so [`ping`] can match its own.
+static LAST_REPLY_ID: AtomicU32 = AtomicU32::new(0);
+static LAST_REPLY_SEQ: AtomicU32 = AtomicU32::new(0);
+/// Monotonic sequence number stamped on successive outgoing pings.
+static PING_SEQ: AtomicU32 = AtomicU32::new(0);
 /// Source MAC of the most recently received frame, for the loopback self-test.
 static LAST_SRC: Mutex<MacAddr> = Mutex::new([0; 6]);
 
@@ -119,8 +145,41 @@ fn receive(bytes: &[u8]) {
         }
         ether::ETHERTYPE_IPV4 => {
             IPV4_SEEN.fetch_add(1, Ordering::Relaxed);
+            // Stage 18c: handle IPv4 packets addressed to us. Only ICMP so far.
+            if let Some(pkt) = ipv4::Ipv4Packet::parse(frame.payload) {
+                if pkt.dst == OUR_IP && pkt.protocol == ipv4::PROTO_ICMP {
+                    handle_icmp(&pkt, frame.src);
+                }
+            }
         }
         _ => {} // some other EtherType — ignored for now
+    }
+}
+
+/// Stage 18c: handle an ICMP message addressed to us. An echo *request* is answered with a reply
+/// (wrapped back through IP and Ethernet to the sender's MAC), so we are pingable; an echo *reply* is
+/// recorded (its id/seq) so [`ping`] can confirm its own ping came back. `src_mac` is the Ethernet
+/// source of the frame — where a reply goes (no ARP lookup needed to answer whoever addressed us).
+fn handle_icmp(pkt: &ipv4::Ipv4Packet, src_mac: MacAddr) {
+    let echo = match icmp::Echo::parse(pkt.payload) {
+        Some(e) => e,
+        None => return,
+    };
+    match echo.typ {
+        icmp::TYPE_ECHO_REQUEST => {
+            // Answer: swap the addresses and send an echo reply back to the requester.
+            let reply = icmp::build_echo_reply(echo.id, echo.seq, echo.data);
+            let ip = ipv4::build(OUR_IP, pkt.src, ipv4::PROTO_ICMP, &reply);
+            let frame = ether::build(src_mac, our_mac(), ether::ETHERTYPE_IPV4, &ip);
+            e1000::transmit(&frame);
+            ICMP_REQUESTS_HANDLED.fetch_add(1, Ordering::Relaxed);
+        }
+        icmp::TYPE_ECHO_REPLY => {
+            LAST_REPLY_ID.store(u32::from(echo.id), Ordering::Relaxed);
+            LAST_REPLY_SEQ.store(u32::from(echo.seq), Ordering::Relaxed);
+            ICMP_REPLIES_RECEIVED.fetch_add(1, Ordering::Release);
+        }
+        _ => {}
     }
 }
 
@@ -168,6 +227,90 @@ pub fn arp_resolve(ip: [u8; 4]) -> Option<MacAddr> {
         crate::apic::pit_sleep_us(1000);
     }
     None
+}
+
+/// Stage 18c: ping `ip` — send an ICMP echo request and wait (bounded) for the matching reply.
+/// Returns the round-trip sequence number on success, or `None` on timeout. Resolves the target's
+/// MAC via ARP first, then builds ICMP-in-IPv4-in-Ethernet, transmits, and pumps [`poll`] until an
+/// echo reply carrying our identifier and this request's sequence number comes back. Re-sends
+/// periodically in case a frame is lost.
+pub fn ping(ip: [u8; 4]) -> Option<u16> {
+    let mac = arp_resolve(ip)?;
+    let seq = (PING_SEQ.fetch_add(1, Ordering::Relaxed) + 1) as u16;
+    let icmp = icmp::build_echo_request(PING_ID, seq, PING_PAYLOAD);
+    let ip_pkt = ipv4::build(OUR_IP, ip, ipv4::PROTO_ICMP, &icmp);
+    let frame = ether::build(mac, our_mac(), ether::ETHERTYPE_IPV4, &ip_pkt);
+
+    let replies_before = ICMP_REPLIES_RECEIVED.load(Ordering::Acquire);
+    for i in 0..2000 {
+        if i % 200 == 0 {
+            e1000::transmit(&frame);
+        }
+        poll();
+        if ICMP_REPLIES_RECEIVED.load(Ordering::Acquire) > replies_before
+            && LAST_REPLY_ID.load(Ordering::Relaxed) == u32::from(PING_ID)
+            && LAST_REPLY_SEQ.load(Ordering::Relaxed) == u32::from(seq)
+        {
+            return Some(seq);
+        }
+        crate::apic::pit_sleep_us(1000);
+    }
+    None
+}
+
+/// Stage 18c self-test of the full ICMP path with no external peer: with PHY loopback on, send an
+/// echo *request* addressed to ourselves. The stack receives it, answers with an echo *reply*, which
+/// (still in loopback) comes back and is recorded — so success exercises both directions: building
+/// and parsing the request, the reply we generate, and receiving that reply. Returns whether both a
+/// request was handled and a reply received.
+pub fn ping_loopback_selftest() -> bool {
+    let mac = our_mac();
+    let icmp = icmp::build_echo_request(PING_ID, 0xFFFF, b"aether icmp loopback selftest");
+    // Addressed to ourselves at every layer, so our generated reply also returns to us.
+    let ip_pkt = ipv4::build(OUR_IP, OUR_IP, ipv4::PROTO_ICMP, &icmp);
+    let frame = ether::build(mac, mac, ether::ETHERTYPE_IPV4, &ip_pkt);
+
+    e1000::set_loopback(true);
+    // Drain stale frames so the counters reflect only this exchange.
+    let mut sink = [0u8; 2048];
+    while e1000::poll_frame(&mut sink).is_some() {}
+    let handled_before = ICMP_REQUESTS_HANDLED.load(Ordering::Relaxed);
+    let replies_before = ICMP_REPLIES_RECEIVED.load(Ordering::Acquire);
+
+    let mut ok = false;
+    for _ in 0..1000 {
+        e1000::transmit(&frame);
+        // First poll receives the request (and transmits our reply, which loops back); a second
+        // poll receives that reply.
+        poll();
+        poll();
+        if ICMP_REQUESTS_HANDLED.load(Ordering::Relaxed) > handled_before
+            && ICMP_REPLIES_RECEIVED.load(Ordering::Acquire) > replies_before
+        {
+            ok = true;
+            break;
+        }
+        crate::apic::pit_sleep_us(2000);
+    }
+    e1000::set_loopback(false);
+
+    serial_println!(
+        "[net] ICMP loopback selftest: requests answered {}, replies received {}, ok = {}",
+        icmp_requests_handled(),
+        icmp_replies_received(),
+        ok,
+    );
+    ok
+}
+
+/// ICMP echo requests we have answered (times we were pinged), Stage 18c.
+pub fn icmp_requests_handled() -> u64 {
+    ICMP_REQUESTS_HANDLED.load(Ordering::Relaxed)
+}
+
+/// ICMP echo replies we have received (pings that came back), Stage 18c.
+pub fn icmp_replies_received() -> u64 {
+    ICMP_REPLIES_RECEIVED.load(Ordering::Acquire)
 }
 
 /// Stage 18a self-test: send an Ethernet frame to ourselves through the card's PHY loopback and

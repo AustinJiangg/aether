@@ -253,9 +253,16 @@ has a pure `process` (learns the sender's IP->MAC, replies to requests for our I
 routes ARP frames to it and transmits replies, and `net::arp_resolve(ip)` broadcasts a request and
 pumps `poll` until the reply is cached. At boot, `arp_resolve(10.0.2.2)` asks SLIRP's gateway for its
 MAC and gets a real reply ("ARP: 10.0.2.2 is at 52:55:0a:00:02:02"), proving send/receive/parse over
-the wire. `ROADMAP.md` carries the forward plan (stages 9-18): the user-space main line (system calls,
-per-process address spaces + ELF, multiprocessing), plus persistence, APIC/SMP, and networking tracks
-— next is Stage 18c, IPv4 + ICMP echo (pinging the gateway).
+the wire. **Stage 18c is now also done — completing Stage 18, the networking track, and the whole
+roadmap.** IPv4 + ICMP echo: the kernel can **ping**. `net/ipv4.rs` parses/builds the 20-byte IPv4
+header and holds the Internet checksum (RFC 1071, shared with ICMP); `net/icmp.rs` parses/builds ICMP
+echo messages. Both directions are live: `net::receive`'s `handle_icmp` answers echo requests (so the
+kernel is pingable) and records echo replies, and `net::ping(ip)` sends ICMP-in-IPv4-in-Ethernet and
+pumps `poll` for the matching reply. At boot a loopback self-test proves the bidirectional path, and
+`ping(10.0.2.2)` gets a real reply from SLIRP ("ping 10.0.2.2: reply seq=1"). The from-scratch stack is
+complete: Ethernet -> ARP -> IPv4 -> ICMP over the interrupt-driven e1000. `ROADMAP.md` records the full
+staged history (stages 0-18); optional non-blocking follow-ons remain (a net task + shell `ping`/`arp`
+commands, DHCP, UDP/TCP).
 
 ## Language and writing conventions
 
@@ -676,7 +683,12 @@ Exit QEMU: `Ctrl-A` then `X`.
   a `static Mutex<BTreeMap<[u8;4], MacAddr>>`), and a pure `process` that learns the sender's mapping and
   returns a reply payload for a request aimed at our IP. `net::receive` routes ARP frames to `process` and
   transmits the reply; `net::arp_resolve(ip)` broadcasts a request and pumps `poll` until the cache has the
-  answer — proven live against SLIRP's gateway at boot. IPv4+ICMP (`net/ipv4.rs`/`net/icmp.rs`, 18c) come next.
+  answer — proven live against SLIRP's gateway at boot. `net/ipv4.rs` (Stage 18c) parses/builds the 20-byte
+  IPv4 header (`Ipv4Packet`, `build`) and holds the Internet checksum (`checksum`, RFC 1071, reused by ICMP);
+  `net/icmp.rs` parses/builds ICMP echo messages (`Echo`, `build_echo_request`/`build_echo_reply`). `net`'s
+  `handle_icmp` answers echo requests (kernel is pingable) and records replies; `net::ping(ip)` sends
+  ICMP-in-IPv4-in-Ethernet and pumps `poll` for the matching reply (matched by id/seq). `ping_loopback_selftest`
+  proves both directions with no peer; `ping(10.0.2.2)` gets a live reply from SLIRP. This completes the stack.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

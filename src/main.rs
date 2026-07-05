@@ -812,6 +812,34 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     println!("Network: ARP got no reply from the gateway.");
                 }
             }
+
+            // Stage 18c (networking): IPv4 + ICMP echo — ping. First a deterministic self-test of the
+            // whole ICMP path via loopback (send an echo request to ourselves, answer it, receive the
+            // reply). Then the headline: ping SLIRP's gateway over the real (emulated) wire and time
+            // the round-trip by sequence number.
+            let icmp_ok = net::ping_loopback_selftest();
+            serial_println!(
+                "[ OK ] net 18c: ICMP echo over loopback = {} (answered {}, received {})",
+                icmp_ok,
+                net::icmp_requests_handled(),
+                net::icmp_replies_received(),
+            );
+            match net::ping(gw) {
+                Some(seq) => {
+                    serial_println!(
+                        "[ OK ] ping {}.{}.{}.{}: reply seq={}",
+                        gw[0], gw[1], gw[2], gw[3], seq,
+                    );
+                    println!(
+                        "Network: ping {}.{}.{}.{} -> reply received (seq {}).",
+                        gw[0], gw[1], gw[2], gw[3], seq,
+                    );
+                }
+                None => {
+                    serial_println!("[net] ping {}.{}.{}.{}: no reply", gw[0], gw[1], gw[2], gw[3]);
+                    println!("Network: ping to the gateway got no reply.");
+                }
+            }
         }
     }
 

@@ -495,6 +495,25 @@ unify later.
 > loopback. Verified by 55 tests: `arp_packet_parses_and_builds` and `arp_replies_to_request_for_us`
 > (pure logic — the reply payload and cache learning) plus the live `arp_resolves_gateway`. Next (18c):
 > IPv4 + ICMP echo — pinging the gateway (the headline milestone).
+>
+> **Stage 18c is also done — and with it Stage 18, the networking track, and the whole roadmap.** IPv4
+> + ICMP echo: the kernel can **ping**. `net/ipv4.rs` parses/builds the 20-byte IPv4 header (no options,
+> never fragmented) and holds the **Internet checksum** (RFC 1071 — the one's-complement sum that
+> protects both the IP header and the ICMP message). `net/icmp.rs` parses/builds ICMP echo messages
+> (type 8 request / 0 reply, with identifier + sequence). Both directions are live: `net::receive`
+> dispatches IPv4/ICMP frames addressed to us — `handle_icmp` answers an echo *request* with a reply
+> (so the kernel is pingable) and records an echo *reply* by id/seq — and `net::ping(ip)` resolves the
+> MAC via ARP, sends ICMP-in-IPv4-in-Ethernet, and pumps `poll` until the matching reply returns. Two
+> proofs at boot: a deterministic loopback self-test (`ping_loopback_selftest` — send an echo request
+> to ourselves, answer it, receive our own reply, exercising *both* directions with no peer) logs "ICMP
+> echo over loopback = true", and the headline — `ping(10.0.2.2)` over the emulated wire logs "ping
+> 10.0.2.2: reply seq=1" (libslirp reflects echoes aimed at the gateway, so no host ICMP permission is
+> needed). Verified by 60 tests: `internet_checksum_known_answer` (the canonical IPv4-header value),
+> `ipv4_header_parses_and_builds` and `icmp_echo_parses_and_builds` (build/parse + self-checksum),
+> `net_pings_over_loopback` (the bidirectional loopback path), and the live `pings_the_gateway`. **This
+> completes the from-scratch stack: Ethernet -> ARP -> IPv4 -> ICMP, sending and receiving real frames
+> over the e1000 with interrupt-driven receive.** Optional follow-ons (all non-blocking): a background
+> net task + `ping`/`arp`/`ifconfig` shell commands (18d), DHCP for a leased address, or UDP/TCP.
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|
@@ -503,7 +522,7 @@ unify later.
 | **15** | Hardware | Replace the 8259 PIC with the Local APIC + IO-APIC; use the Local APIC timer instead of the PIT | modern interrupt delivery; prereq for SMP |
 | **16** | Hardware | SMP: bring up the other cores via INIT-SIPI-SIPI, per-CPU data, run the scheduler on multiple cores | real concurrency, per-CPU state |
 | **17** | Networking | NIC driver (virtio-net or e1000): send/receive raw Ethernet frames | DMA, ring buffers |
-| **18** | Networking | Minimal network stack: ARP + IPv4 + ICMP (reply to host `ping`), or integrate `smoltcp` | protocol layering |
+| **18** | Networking | Minimal network stack: ARP + IPv4 + ICMP (ping the gateway) | protocol layering |
 
 ### Notes
 
