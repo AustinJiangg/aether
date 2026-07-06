@@ -522,8 +522,24 @@ unify later.
 > `arp` (the ARP cache), and `ping <a.b.c.d>` (send an echo and report the reply), backed by
 > `net::parse_ipv4` and `arp::cache_entries`. The boot self-test drives them headlessly: `ping 10.0.2.2`
 > and `ping 10.0.2.3` both get replies over the wire. Verified by 62 tests (`parse_ipv4_accepts_and_rejects`
-> and `arp_cache_snapshot_lists_the_gateway`). Remaining optional follow-ons: DHCP for a leased address,
-> or a transport layer (UDP/TCP).
+> and `arp_cache_snapshot_lists_the_gateway`).
+>
+> **Stage 19a is also done** — UDP, the stack's first *transport* layer (the follow-on that lets
+> *applications* talk, not just the control-plane ICMP). `net/udp.rs` parses/builds the 8-byte header and
+> computes the **pseudo-header checksum** — the Internet checksum (reusing `ipv4::checksum`) over a 12-byte
+> scratch header of {src IP, dst IP, protocol 17, UDP length} prepended to the datagram, a deliberate
+> layering shortcut so a receiver can confirm the datagram really was addressed to it (and it applies the
+> RFC 768 rule that a computed 0 is transmitted as 0xFFFF). 19a-1 was that pure module; **19a-2** wired it
+> live: `net::receive` now dispatches IPv4 by protocol number, routing UDP to `handle_udp`, a tiny **echo
+> server** on port 7 (RFC 862) that bounces a datagram straight back to its sender with the ports swapped
+> — the UDP analog of answering a ping — while datagrams on other ports are *delivered* (payload
+> recorded). `net::udp_send` is the outbound path (resolves the MAC via ARP, builds
+> UDP-in-IPv4-in-Ethernet), and `udp_echo_loopback_selftest` proves both directions with no peer (send to
+> our own echo port, echo it, receive the echo). The shell's `ifconfig` gained UDP counters. Verified by
+> 64 tests (`udp_datagram_parses_and_builds` — pure build/parse + pseudo-header checksum — and
+> `net_udp_echoes_over_loopback` — the live loopback round-trip) and the boot self-test. Remaining
+> optional follow-ons: **DNS over UDP** (query SLIRP's server at `10.0.2.3` — the first thing UDP does for
+> real), DHCP for a leased address, or TCP for a reliable transport.
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

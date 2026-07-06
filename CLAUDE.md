@@ -264,8 +264,17 @@ complete: Ethernet -> ARP -> IPv4 -> ICMP over the interrupt-driven e1000. **Sta
 live service with a UI**: a background network thread (`unify::net_thread`) runs `net::poll` forever on
 the BSP run queue (peer to the shell, `hlt`ing between polls), so the kernel keeps answering ARP/pings
 while the shell is idle; the shell gains `ifconfig`, `arp`, and `ping <a.b.c.d>` commands (backed by
-`net::parse_ipv4` / `arp::cache_entries`). `ROADMAP.md` records the full staged history (stages 0-18);
-remaining optional follow-ons are DHCP or a transport layer (UDP/TCP).
+`net::parse_ipv4` / `arp::cache_entries`). **Stage 19a is also done — UDP, the first transport layer.**
+`net/udp.rs` parses/builds the 8-byte header and computes the **pseudo-header checksum** (the Internet
+checksum over a scratch {src IP, dst IP, protocol 17, UDP length} header prepended to the datagram —
+UDP reaching down into IP so a receiver can confirm the datagram was addressed to it; RFC 768's "a
+computed 0 is sent as 0xFFFF" rule included). `net::receive` now dispatches IPv4 by protocol number,
+routing UDP to a `handle_udp` that runs a tiny **echo server** on port 7 (bounces a datagram back to its
+sender, ports swapped — the UDP analog of answering a ping) and *delivers* datagrams on other ports;
+`net::udp_send` is the outbound path (ARP-resolves the MAC, builds UDP-in-IPv4-in-Ethernet) and
+`udp_echo_loopback_selftest` proves both directions with no peer. `ifconfig` gained UDP counters.
+`ROADMAP.md` records the full staged history (stages 0-19a); remaining optional follow-ons are DNS over
+UDP (the first real use), DHCP, or TCP.
 
 ## Language and writing conventions
 
@@ -698,7 +707,14 @@ Exit QEMU: `Ctrl-A` then `X`.
   proves both directions with no peer; `ping(10.0.2.2)` gets a live reply from SLIRP. Stage 18d adds
   `net::parse_ipv4` (dotted-decimal -> octets, for the shell `ping`) and `arp::cache_entries` (a cache
   snapshot for the shell `arp`); a background thread (`unify::net_thread`) drives `net::poll` so the stack
-  answers ARP/pings continuously. This completes the stack.
+  answers ARP/pings continuously. `net/udp.rs` (Stage 19a) adds UDP, the first transport layer: parse/build
+  the 8-byte header (`Datagram`, `build`) and the **pseudo-header checksum** (`checksum`, the Internet
+  checksum over a {src IP, dst IP, proto 17, UDP length} scratch header prepended to the datagram, reusing
+  `ipv4::checksum`; a computed 0 is sent as 0xFFFF). `net::receive` dispatches IPv4 by protocol number,
+  routing UDP to `handle_udp` — a tiny echo server on `UDP_ECHO_PORT` (7) that bounces a datagram back to
+  its sender, ports swapped, while other-port datagrams are recorded as *delivered* (`LAST_UDP_PAYLOAD`).
+  `net::udp_send` sends UDP-in-IPv4-in-Ethernet to a peer (ARP-resolving the MAC), and
+  `udp_echo_loopback_selftest` proves both directions with no peer.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

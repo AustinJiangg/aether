@@ -29,7 +29,6 @@
 //! ```
 //!
 //! `length` counts the header + data (so the minimum is 8). Everything multi-byte is big-endian.
-#![allow(dead_code)] // the send/receive paths that use this are wired into `net` in Stage 19a-2
 
 use alloc::vec::Vec;
 

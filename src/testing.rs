@@ -1045,6 +1045,20 @@ fn net_pings_over_loopback() {
     assert!(net::icmp_replies_received() > 0, "we received no echo reply");
 }
 
+/// Stage 19a-2: the full UDP path bidirectionally, via loopback (no external peer). Send a datagram to
+/// our own echo server; the stack echoes it and receives the echo back — exercising build, parse, the
+/// pseudo-header checksum, protocol dispatch, the echo we generate, and delivering it with its bytes
+/// intact.
+#[test_case]
+fn net_udp_echoes_over_loopback() {
+    use crate::net;
+
+    assert!(crate::e1000::present(), "e1000 not initialized");
+    assert!(net::udp_echo_loopback_selftest(), "UDP echo loopback round-trip failed");
+    assert!(net::udp_echoes_sent() > 0, "our echo server bounced nothing");
+    assert!(net::udp_delivered() > 0, "we received no echoed datagram back");
+}
+
 /// Stage 18c: the headline — ping SLIRP's gateway over the (emulated) wire and get an echo reply.
 /// `net::ping` resolves the MAC, sends ICMP-in-IPv4-in-Ethernet, and matches the returning reply by
 /// identifier and sequence number.

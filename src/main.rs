@@ -824,6 +824,18 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 net::icmp_requests_handled(),
                 net::icmp_replies_received(),
             );
+
+            // Stage 19a-2 (networking): UDP — the first transport layer. A deterministic self-test of
+            // the whole UDP path via loopback: send a datagram to our own echo server (port 7), which
+            // bounces it back, and receive that echo — proving build/parse, the pseudo-header checksum,
+            // dispatch by protocol, and the echo we generate, all with no external peer.
+            let udp_ok = net::udp_echo_loopback_selftest();
+            serial_println!(
+                "[ OK ] net 19a: UDP echo over loopback = {} (echoes sent {}, delivered {})",
+                udp_ok,
+                net::udp_echoes_sent(),
+                net::udp_delivered(),
+            );
             match net::ping(gw) {
                 Some(seq) => {
                     serial_println!(

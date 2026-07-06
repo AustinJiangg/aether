@@ -255,6 +255,12 @@ fn cmd_ifconfig() {
         net::icmp_replies_received(),
         net::icmp_requests_handled(),
     );
+    sh_println!(
+        "  UDP received {}  echoed {}  delivered {}",
+        net::udp_received(),
+        net::udp_echoes_sent(),
+        net::udp_delivered(),
+    );
 }
 
 /// `arp` — print the ARP cache (learned IPv4 -> MAC mappings), Stage 18d.

@@ -49,6 +49,7 @@ pub mod udp;
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use alloc::vec::Vec;
 use spin::Mutex;
 
 use crate::{e1000, serial_println};
@@ -63,6 +64,12 @@ const PING_PAYLOAD: &[u8] = b"aether ping 0123456789abcdef";
 pub const OUR_IP: [u8; 4] = [10, 0, 2, 15];
 /// SLIRP's virtual gateway (it answers our ARP and — in 18c — our pings).
 pub const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
+
+/// The UDP port on which we run a tiny echo server (Stage 19a-2): a datagram that arrives here is
+/// sent straight back to its sender, with the ports swapped. Port 7 is the well-known Echo Protocol
+/// (RFC 862). This makes the kernel a *live* UDP service — a peer, or our own loopback self-test, can
+/// bounce a datagram off it to prove the send/receive path end to end.
+pub const UDP_ECHO_PORT: u16 = 7;
 
 /// Our MAC address, copied from the e1000 in [`init`]. Behind a `Mutex` so it can be a non-const
 /// `static`; it is written once at boot and only read afterward.
@@ -87,6 +94,18 @@ static LAST_REPLY_SEQ: AtomicU32 = AtomicU32::new(0);
 static PING_SEQ: AtomicU32 = AtomicU32::new(0);
 /// Source MAC of the most recently received frame, for the loopback self-test.
 static LAST_SRC: Mutex<MacAddr> = Mutex::new([0; 6]);
+
+/// UDP datagrams addressed to us that we have parsed (Stage 19a-2), whatever their port.
+static UDP_RECEIVED: AtomicU64 = AtomicU64::new(0);
+/// UDP echo replies we have sent (datagrams that arrived on [`UDP_ECHO_PORT`]), Stage 19a-2.
+static UDP_ECHOES_SENT: AtomicU64 = AtomicU64::new(0);
+/// UDP datagrams delivered to us on a non-echo port — i.e. data/replies meant for us to keep
+/// (as opposed to bounce), Stage 19a-2. `Release`/`Acquire`-ordered so a reader that sees the count
+/// bump also sees the `LAST_UDP_PAYLOAD` write that preceded it.
+static UDP_DELIVERED: AtomicU64 = AtomicU64::new(0);
+/// The payload of the most recently *delivered* datagram (non-echo port), so a self-test — and, later,
+/// a socket layer — can inspect what arrived. A `Vec` in a `Mutex` (`Vec::new` is a const fn).
+static LAST_UDP_PAYLOAD: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
 /// Bring the stack up: record our MAC and log our identity. Call once, after the e1000 is up.
 pub fn init(mac: MacAddr) {
@@ -146,10 +165,14 @@ fn receive(bytes: &[u8]) {
         }
         ether::ETHERTYPE_IPV4 => {
             IPV4_SEEN.fetch_add(1, Ordering::Relaxed);
-            // Stage 18c: handle IPv4 packets addressed to us. Only ICMP so far.
+            // Stage 18c/19a-2: handle IPv4 packets addressed to us, dispatched by protocol.
             if let Some(pkt) = ipv4::Ipv4Packet::parse(frame.payload) {
-                if pkt.dst == OUR_IP && pkt.protocol == ipv4::PROTO_ICMP {
-                    handle_icmp(&pkt, frame.src);
+                if pkt.dst == OUR_IP {
+                    match pkt.protocol {
+                        ipv4::PROTO_ICMP => handle_icmp(&pkt, frame.src),
+                        udp::PROTO_UDP => handle_udp(&pkt, frame.src),
+                        _ => {} // some other IP protocol (e.g. TCP) — ignored for now
+                    }
                 }
             }
         }
@@ -181,6 +204,33 @@ fn handle_icmp(pkt: &ipv4::Ipv4Packet, src_mac: MacAddr) {
             ICMP_REPLIES_RECEIVED.fetch_add(1, Ordering::Release);
         }
         _ => {}
+    }
+}
+
+/// Stage 19a-2: handle a UDP datagram addressed to us. Mirrors [`handle_icmp`]. A datagram aimed at
+/// [`UDP_ECHO_PORT`] is bounced straight back to its sender (ports swapped) — our tiny echo server, the
+/// UDP analog of answering a ping; anything else is *delivered* (its payload recorded) as data meant
+/// for us. `src_mac` is the Ethernet source of the frame, where an echo goes (no ARP lookup needed to
+/// answer whoever addressed us — exactly as ICMP replies do).
+fn handle_udp(pkt: &ipv4::Ipv4Packet, src_mac: MacAddr) {
+    let dg = match udp::Datagram::parse(pkt.payload) {
+        Some(d) => d,
+        None => return,
+    };
+    UDP_RECEIVED.fetch_add(1, Ordering::Relaxed);
+    if dg.dst_port == UDP_ECHO_PORT {
+        // Echo server: reply with the same payload, swapping the ports (our echo port -> their port)
+        // and the addresses (us -> them). The reply is a fresh UDP-in-IPv4-in-Ethernet frame.
+        let reply = udp::build(OUR_IP, pkt.src, UDP_ECHO_PORT, dg.src_port, dg.payload);
+        let ip = ipv4::build(OUR_IP, pkt.src, udp::PROTO_UDP, &reply);
+        let frame = ether::build(src_mac, our_mac(), ether::ETHERTYPE_IPV4, &ip);
+        e1000::transmit(&frame);
+        UDP_ECHOES_SENT.fetch_add(1, Ordering::Relaxed);
+    } else {
+        // Delivered to us (a reply to something we sent, or data for some port we "listen" on):
+        // record its payload so a self-test — or a future socket layer — can consume it.
+        *LAST_UDP_PAYLOAD.lock() = dg.payload.to_vec();
+        UDP_DELIVERED.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -304,6 +354,55 @@ pub fn ping_loopback_selftest() -> bool {
     ok
 }
 
+/// Stage 19a-2 self-test of the full UDP path with no external peer, mirroring [`ping_loopback_selftest`].
+/// With PHY loopback on, send a datagram addressed to ourselves on [`UDP_ECHO_PORT`]. The stack
+/// receives it, the echo server bounces it back (still in loopback), and — because that echo is now
+/// aimed at our source port, not the echo port — it is *delivered* to us. So success exercises both
+/// directions: building and parsing the datagram, the echo we generate, and receiving that echo with
+/// its payload intact. Returns whether an echo was both sent and delivered back with the same bytes.
+pub fn udp_echo_loopback_selftest() -> bool {
+    let mac = our_mac();
+    let payload = b"aether udp echo loopback selftest";
+    let src_port: u16 = 40000;
+    // Addressed to ourselves at every layer, on the echo port, so our generated echo returns to us.
+    let dg = udp::build(OUR_IP, OUR_IP, src_port, UDP_ECHO_PORT, payload);
+    let ip_pkt = ipv4::build(OUR_IP, OUR_IP, udp::PROTO_UDP, &dg);
+    let frame = ether::build(mac, mac, ether::ETHERTYPE_IPV4, &ip_pkt);
+
+    e1000::set_loopback(true);
+    // Drain stale frames so the counters reflect only this exchange.
+    let mut sink = [0u8; 2048];
+    while e1000::poll_frame(&mut sink).is_some() {}
+    let echoed_before = UDP_ECHOES_SENT.load(Ordering::Relaxed);
+    let delivered_before = UDP_DELIVERED.load(Ordering::Acquire);
+
+    let mut ok = false;
+    for _ in 0..1000 {
+        e1000::transmit(&frame);
+        // First poll receives the echo request (and transmits our echo, which loops back); a second
+        // poll receives that echo and delivers it.
+        poll();
+        poll();
+        if UDP_ECHOES_SENT.load(Ordering::Relaxed) > echoed_before
+            && UDP_DELIVERED.load(Ordering::Acquire) > delivered_before
+            && LAST_UDP_PAYLOAD.lock().as_slice() == &payload[..]
+        {
+            ok = true;
+            break;
+        }
+        crate::apic::pit_sleep_us(2000);
+    }
+    e1000::set_loopback(false);
+
+    serial_println!(
+        "[net] UDP echo loopback selftest: echoes sent {}, delivered {}, ok = {}",
+        udp_echoes_sent(),
+        udp_delivered(),
+        ok,
+    );
+    ok
+}
+
 /// ICMP echo requests we have answered (times we were pinged), Stage 18c.
 pub fn icmp_requests_handled() -> u64 {
     ICMP_REQUESTS_HANDLED.load(Ordering::Relaxed)
@@ -312,6 +411,38 @@ pub fn icmp_requests_handled() -> u64 {
 /// ICMP echo replies we have received (pings that came back), Stage 18c.
 pub fn icmp_replies_received() -> u64 {
     ICMP_REPLIES_RECEIVED.load(Ordering::Acquire)
+}
+
+/// UDP datagrams addressed to us that we have parsed (Stage 19a-2).
+pub fn udp_received() -> u64 {
+    UDP_RECEIVED.load(Ordering::Relaxed)
+}
+
+/// UDP echo replies we have sent (times our echo server bounced a datagram back), Stage 19a-2.
+pub fn udp_echoes_sent() -> u64 {
+    UDP_ECHOES_SENT.load(Ordering::Relaxed)
+}
+
+/// UDP datagrams delivered to us on a non-echo port (data/replies we kept), Stage 19a-2.
+pub fn udp_delivered() -> u64 {
+    UDP_DELIVERED.load(Ordering::Acquire)
+}
+
+/// Stage 19a-2: send a UDP datagram to `dst_ip:dst_port` from `src_port`, carrying `payload`. Resolves
+/// the destination MAC via ARP (so it reaches a real peer over the wire, or SLIRP's gateway/servers),
+/// builds UDP-in-IPv4-in-Ethernet, and transmits. Returns `false` if the MAC could not be resolved.
+/// Fire-and-forget: UDP is unreliable, so there is no delivery confirmation.
+#[allow(dead_code)] // the send path a live peer / the Stage 19b DNS query will drive
+pub fn udp_send(dst_ip: [u8; 4], dst_port: u16, src_port: u16, payload: &[u8]) -> bool {
+    let mac = match arp_resolve(dst_ip) {
+        Some(m) => m,
+        None => return false,
+    };
+    let dg = udp::build(OUR_IP, dst_ip, src_port, dst_port, payload);
+    let ip = ipv4::build(OUR_IP, dst_ip, udp::PROTO_UDP, &dg);
+    let frame = ether::build(mac, our_mac(), ether::ETHERTYPE_IPV4, &ip);
+    e1000::transmit(&frame);
+    true
 }
 
 /// Stage 18d: parse a dotted-decimal IPv4 address (`"10.0.2.2"`) into four octets, or `None` if it is
