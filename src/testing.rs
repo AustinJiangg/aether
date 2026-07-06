@@ -999,6 +999,39 @@ fn icmp_echo_parses_and_builds() {
     assert!(icmp::Echo::parse(&[0u8; 4]).is_none(), "a runt must not parse as ICMP echo");
 }
 
+/// Stage 19a: the UDP layer parses and builds datagrams, with a correct pseudo-header checksum. Build
+/// a datagram, confirm it self-checksums to zero (recomputing over a valid datagram yields 0, since
+/// the pseudo-header inputs are the same), and round-trip the ports and payload.
+#[test_case]
+fn udp_datagram_parses_and_builds() {
+    use crate::net::udp;
+
+    let src_ip = [10, 0, 2, 15];
+    let dst_ip = [10, 0, 2, 2];
+    let payload = b"aether udp payload";
+    let dg = udp::build(src_ip, dst_ip, 40000, 53, payload);
+    assert_eq!(dg.len(), udp::HEADER_LEN + payload.len());
+    assert_eq!(
+        udp::checksum(src_ip, dst_ip, &dg),
+        0,
+        "built datagram must carry a valid pseudo-header checksum"
+    );
+
+    let parsed = udp::Datagram::parse(&dg).expect("built datagram should parse");
+    assert_eq!(parsed.src_port, 40000);
+    assert_eq!(parsed.dst_port, 53);
+    assert_eq!(parsed.payload, payload);
+
+    // The checksum genuinely covers the pseudo-header: verifying with a different dst IP must fail.
+    assert_ne!(
+        udp::checksum(src_ip, [10, 0, 2, 3], &dg),
+        0,
+        "checksum must depend on the destination IP (the pseudo-header)"
+    );
+
+    assert!(udp::Datagram::parse(&[0u8; 4]).is_none(), "a runt must not parse as UDP");
+}
+
 /// Stage 18c: the full ICMP path bidirectionally, via loopback (no external peer). Send an echo
 /// request to ourselves; the stack answers it and receives its own reply — exercising build, parse,
 /// checksum, dispatch, the reply we generate, and receiving that reply.
