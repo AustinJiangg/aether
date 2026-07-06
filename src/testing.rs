@@ -1032,6 +1032,57 @@ fn udp_datagram_parses_and_builds() {
     assert!(udp::Datagram::parse(&[0u8; 4]).is_none(), "a runt must not parse as UDP");
 }
 
+/// Stage 19b-1: the DNS layer builds a query and parses a response. Pure logic (no network): build a
+/// query and check its header + label-encoded question, then hand-craft a response that exercises the
+/// two tricky parts — a compression pointer for the answer name, and a CNAME record before the A
+/// record — and confirm the parser skips to the IPv4 address.
+#[test_case]
+fn dns_query_and_response_parse() {
+    use crate::net::dns;
+    use alloc::vec::Vec;
+
+    // A query for example.com: 12-byte header, then the name as labels + QTYPE(A) + QCLASS(IN).
+    let query = dns::build_query(0x1234, "example.com").expect("hostname should encode");
+    assert_eq!(&query[0..2], &[0x12, 0x34], "transaction id");
+    assert_eq!(&query[2..4], &[0x01, 0x00], "flags: recursion desired");
+    assert_eq!(&query[4..6], &[0x00, 0x01], "one question");
+    assert_eq!(
+        &query[12..],
+        b"\x07example\x03com\x00\x00\x01\x00\x01",
+        "label-encoded name + QTYPE/QCLASS"
+    );
+
+    // Malformed hostnames are rejected: empty, and a single label longer than 63 bytes.
+    assert!(dns::build_query(1, "").is_none(), "empty hostname");
+    let long = core::str::from_utf8(&[b'a'; 64]).unwrap();
+    assert!(dns::build_query(1, long).is_none(), "label longer than 63 bytes");
+
+    // Hand-craft a response: id 0x1234, flags QR+RD+RA (RCODE 0), one question echoed back, and two
+    // answers — a CNAME then the A record — whose names are compression pointers to offset 12.
+    let mut resp: Vec<u8> = Vec::new();
+    resp.extend_from_slice(&[0x12, 0x34]); // transaction id
+    resp.extend_from_slice(&[0x81, 0x80]); // flags: QR=1, RD=1, RA=1, RCODE=0
+    resp.extend_from_slice(&[0x00, 0x01]); // QDCOUNT = 1
+    resp.extend_from_slice(&[0x00, 0x02]); // ANCOUNT = 2
+    resp.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // NSCOUNT, ARCOUNT
+    resp.extend_from_slice(b"\x07example\x03com\x00"); // echoed question name (at offset 12)
+    resp.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // QTYPE = A, QCLASS = IN
+    // Answer 1: a CNAME. name = pointer to offset 12; TYPE=5; CLASS=1; TTL=300; RDLENGTH=2; RDATA.
+    resp.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x05, 0x00, 0x01, 0x00, 0x00, 0x01, 0x2C, 0x00, 0x02]);
+    resp.extend_from_slice(&[0xC0, 0x0C]); // CNAME RDATA: a (compressed) name
+    // Answer 2: the A record. name = pointer; TYPE=1; CLASS=1; TTL=300; RDLENGTH=4; RDATA = address.
+    resp.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x01, 0x2C, 0x00, 0x04]);
+    resp.extend_from_slice(&[93, 184, 216, 34]); // the resolved IPv4 address
+
+    assert_eq!(
+        dns::parse_response(&resp, 0x1234),
+        Some([93, 184, 216, 34]),
+        "parser should skip the CNAME and return the A record's address"
+    );
+    assert_eq!(dns::parse_response(&resp, 0x9999), None, "a response with the wrong id is rejected");
+    assert_eq!(dns::parse_response(&[0u8; 4], 0x1234), None, "a runt is rejected");
+}
+
 /// Stage 18c: the full ICMP path bidirectionally, via loopback (no external peer). Send an echo
 /// request to ourselves; the stack answers it and receives its own reply — exercising build, parse,
 /// checksum, dispatch, the reply we generate, and receiving that reply.

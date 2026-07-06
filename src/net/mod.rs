@@ -42,6 +42,7 @@
 //! the IP header and the ICMP message.
 
 pub mod arp;
+pub mod dns;
 pub mod ether;
 pub mod icmp;
 pub mod ipv4;
