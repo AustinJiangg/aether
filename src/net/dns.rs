@@ -34,7 +34,6 @@
 //!
 //! The **transaction id** ties a response to its query: UDP is unreliable and unordered, so the
 //! resolver stamps a 16-bit id on the query and only accepts a response echoing it.
-#![allow(dead_code)] // the resolver that drives this (`net::dns_resolve`) is wired up in Stage 19b-2
 
 use alloc::vec::Vec;
 

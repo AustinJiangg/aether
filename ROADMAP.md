@@ -537,9 +537,24 @@ unify later.
 > UDP-in-IPv4-in-Ethernet), and `udp_echo_loopback_selftest` proves both directions with no peer (send to
 > our own echo port, echo it, receive the echo). The shell's `ifconfig` gained UDP counters. Verified by
 > 64 tests (`udp_datagram_parses_and_builds` — pure build/parse + pseudo-header checksum — and
-> `net_udp_echoes_over_loopback` — the live loopback round-trip) and the boot self-test. Remaining
-> optional follow-ons: **DNS over UDP** (query SLIRP's server at `10.0.2.3` — the first thing UDP does for
-> real), DHCP for a leased address, or TCP for a reliable transport.
+> `net_udp_echoes_over_loopback` — the live loopback round-trip) and the boot self-test.
+>
+> **Stage 19b is also done** — DNS over UDP: the kernel can **resolve a hostname to an IP**, the first
+> real application UDP carries. `net/dns.rs` builds a query and parses a response, introducing two DNS
+> wire ideas: **name encoding** (a hostname is length-prefixed labels ended by a zero byte —
+> `example.com` → `\x07example\x03com\x00`) and **compression pointers** (a name in a response is often a
+> 2-byte pointer, top bits `11`/`0xC0`, giving an offset back into the message; `skip_name` steps over
+> names — and a preceding CNAME — to reach the A record). The **transaction id** ties a response to its
+> query, since UDP is unordered. 19b-1 was that pure module; **19b-2** wired the live resolver:
+> `net::dns_resolve(hostname)` stamps a fresh id, sends the query to `DNS_SERVER` (`10.0.2.3`) via
+> `udp_send`, and pumps `poll` until the reply is delivered (reusing the 19a-2 UDP receive path —
+> `LAST_UDP_PAYLOAD` / `UDP_DELIVERED`), then parses out the address. The shell gained `nslookup <host>`,
+> and the boot self-test resolves a name (non-fatal, since it needs the host's upstream DNS — SLIRP just
+> forwards). Live proof: `dns_resolve("example.com")` returns a real address over the wire. Verified by 66
+> tests (`dns_query_and_response_parse` — pure, with a hand-crafted response exercising a compression
+> pointer and a CNAME — and the lenient live `net_resolves_a_hostname`). Remaining optional follow-ons:
+> **DHCP** (also UDP — lease an address instead of hardcoding `10.0.2.15`) or **TCP** (a reliable,
+> connection-oriented transport — the big one).
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

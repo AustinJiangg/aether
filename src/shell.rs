@@ -133,10 +133,11 @@ fn dispatch(cwd: &mut String, line: &str) {
         "rm" => cmd_rm(cwd, args),
         "cd" => cmd_cd(cwd, args),
 
-        // --- network commands (Stage 18d) ---
+        // --- network commands (Stage 18d, 19b) ---
         "ifconfig" => cmd_ifconfig(),
         "arp" => cmd_arp(),
         "ping" => cmd_ping(args),
+        "nslookup" => cmd_nslookup(args),
 
         other => sh_println!("unknown command: '{}' (try 'help')", other),
     }
@@ -160,6 +161,7 @@ fn help() {
     sh_println!("  ifconfig              show the network interface + stats");
     sh_println!("  arp                   show the ARP cache");
     sh_println!("  ping <a.b.c.d>        send an ICMP echo to an IPv4 address");
+    sh_println!("  nslookup <hostname>   resolve a hostname to an IPv4 address via DNS");
 }
 
 /// `ls [path]` — list a directory (the cwd if no path is given).
@@ -295,6 +297,19 @@ fn cmd_ping(args: &str) {
             ip[0], ip[1], ip[2], ip[3], seq
         ),
         None => sh_println!("  no reply from {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]),
+    }
+}
+
+/// `nslookup <hostname>` — resolve a hostname to an IPv4 address via DNS (Stage 19b-2).
+fn cmd_nslookup(args: &str) {
+    let host = args.trim();
+    if host.is_empty() {
+        sh_println!("usage: nslookup <hostname>");
+        return;
+    }
+    match net::dns_resolve(host) {
+        Some(ip) => sh_println!("  {} has address {}.{}.{}.{}", host, ip[0], ip[1], ip[2], ip[3]),
+        None => sh_println!("  could not resolve {}", host),
     }
 }
 

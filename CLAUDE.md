@@ -273,8 +273,14 @@ routing UDP to a `handle_udp` that runs a tiny **echo server** on port 7 (bounce
 sender, ports swapped — the UDP analog of answering a ping) and *delivers* datagrams on other ports;
 `net::udp_send` is the outbound path (ARP-resolves the MAC, builds UDP-in-IPv4-in-Ethernet) and
 `udp_echo_loopback_selftest` proves both directions with no peer. `ifconfig` gained UDP counters.
-`ROADMAP.md` records the full staged history (stages 0-19a); remaining optional follow-ons are DNS over
-UDP (the first real use), DHCP, or TCP.
+**Stage 19b is also done — DNS over UDP, the first real application UDP carries: the kernel resolves a
+hostname to an IP.** `net/dns.rs` builds a query and parses a response, handling DNS **name encoding**
+(length-prefixed labels ended by a zero byte) and **compression pointers** (a 2-byte `0xC0`-tagged
+back-reference; `skip_name` steps over names and a preceding CNAME to reach the A record); a
+**transaction id** matches a response to its query. `net::dns_resolve(hostname)` sends the query to
+`DNS_SERVER` (`10.0.2.3`) via `udp_send` and waits on the 19a-2 UDP delivery path, then parses the
+address; the shell gained `nslookup <host>`. `ROADMAP.md` records the full staged history (stages
+0-19b); remaining optional follow-ons are DHCP (also UDP) or TCP.
 
 ## Language and writing conventions
 
@@ -714,7 +720,13 @@ Exit QEMU: `Ctrl-A` then `X`.
   routing UDP to `handle_udp` — a tiny echo server on `UDP_ECHO_PORT` (7) that bounces a datagram back to
   its sender, ports swapped, while other-port datagrams are recorded as *delivered* (`LAST_UDP_PAYLOAD`).
   `net::udp_send` sends UDP-in-IPv4-in-Ethernet to a peer (ARP-resolving the MAC), and
-  `udp_echo_loopback_selftest` proves both directions with no peer.
+  `udp_echo_loopback_selftest` proves both directions with no peer. `net/dns.rs` (Stage 19b) adds DNS,
+  the first application-layer protocol: `build_query` encodes the 12-byte header + question with a
+  hostname as length-prefixed labels, and `parse_response` walks a response for the first A record —
+  `skip_name` steps over names, recognizing a **compression pointer** (`0xC0`-tagged 2-byte
+  back-reference) vs a literal label, and non-A records (a CNAME) are skipped. `net::dns_resolve(hostname)`
+  stamps a transaction id, `udp_send`s the query to `DNS_SERVER` (`10.0.2.3`), and pumps `poll` until the
+  reply is delivered (via `LAST_UDP_PAYLOAD`), matching by id; the shell's `nslookup` drives it.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

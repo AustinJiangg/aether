@@ -1110,6 +1110,31 @@ fn net_udp_echoes_over_loopback() {
     assert!(net::udp_delivered() > 0, "we received no echoed datagram back");
 }
 
+/// Stage 19b-2: the live DNS resolver — resolve a hostname through SLIRP's DNS server over the wire.
+/// Unlike the SLIRP-internal gateway ping, this depends on the *host* having working upstream DNS
+/// (SLIRP forwards to it), so the test is lenient: it always exercises the full path (build the query,
+/// ARP the server, send, poll, parse) and asserts a sane address when one comes back, but only notes a
+/// timeout (an offline host) instead of failing. The deterministic parsing is covered by
+/// `dns_query_and_response_parse`.
+#[test_case]
+fn net_resolves_a_hostname() {
+    use crate::net;
+
+    assert!(crate::e1000::present(), "e1000 not initialized");
+    // The DNS server must be reachable on the link — this part is SLIRP-internal, so always true.
+    assert!(net::arp_resolve(net::DNS_SERVER).is_some(), "DNS server did not answer ARP");
+
+    match net::dns_resolve("example.com") {
+        Some(ip) => {
+            assert_ne!(ip, [0, 0, 0, 0], "resolved address must not be all-zeros");
+            assert_ne!(ip, [255, 255, 255, 255], "resolved address must not be broadcast");
+        }
+        None => crate::serial_println!(
+            "[test] dns_resolve got no answer (host likely has no upstream DNS); skipping assert"
+        ),
+    }
+}
+
 /// Stage 18c: the headline — ping SLIRP's gateway over the (emulated) wire and get an echo reply.
 /// `net::ping` resolves the MAC, sends ICMP-in-IPv4-in-Ethernet, and matches the returning reply by
 /// identifier and sequence number.

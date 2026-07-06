@@ -836,6 +836,21 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 net::udp_echoes_sent(),
                 net::udp_delivered(),
             );
+
+            // Stage 19b (networking): DNS over UDP — the first thing UDP does for real. Resolve a
+            // hostname through SLIRP's DNS server (10.0.2.3), which forwards to the host's resolver.
+            // Non-fatal: it needs working upstream DNS, so a failure only logs (like a ping timeout).
+            let host = "example.com";
+            match net::dns_resolve(host) {
+                Some(ip) => serial_println!(
+                    "[ OK ] net 19b: DNS {} -> {}.{}.{}.{}",
+                    host, ip[0], ip[1], ip[2], ip[3],
+                ),
+                None => serial_println!(
+                    "[net] net 19b: DNS {} did not resolve (no upstream DNS?)",
+                    host,
+                ),
+            }
             match net::ping(gw) {
                 Some(seq) => {
                     serial_println!(

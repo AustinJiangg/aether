@@ -66,6 +66,13 @@ pub const OUR_IP: [u8; 4] = [10, 0, 2, 15];
 /// SLIRP's virtual gateway (it answers our ARP and — in 18c — our pings).
 pub const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
 
+/// SLIRP's virtual DNS server (Stage 19b): it answers DNS queries by forwarding them to the host's
+/// resolver, so `dns_resolve` can turn a hostname into an address without us implementing a resolver.
+pub const DNS_SERVER: [u8; 4] = [10, 0, 2, 3];
+/// The (fixed, ephemeral) UDP source port our DNS queries go out from. A response comes back to it, so
+/// `handle_udp` delivers it (it is not the echo port); `dns_resolve` matches by transaction id anyway.
+const DNS_CLIENT_PORT: u16 = 50000;
+
 /// The UDP port on which we run a tiny echo server (Stage 19a-2): a datagram that arrives here is
 /// sent straight back to its sender, with the ports swapped. Port 7 is the well-known Echo Protocol
 /// (RFC 862). This makes the kernel a *live* UDP service — a peer, or our own loopback self-test, can
@@ -93,6 +100,8 @@ static LAST_REPLY_ID: AtomicU32 = AtomicU32::new(0);
 static LAST_REPLY_SEQ: AtomicU32 = AtomicU32::new(0);
 /// Monotonic sequence number stamped on successive outgoing pings.
 static PING_SEQ: AtomicU32 = AtomicU32::new(0);
+/// Counter feeding the transaction id stamped on successive DNS queries (Stage 19b).
+static DNS_XID: AtomicU32 = AtomicU32::new(0);
 /// Source MAC of the most recently received frame, for the loopback self-test.
 static LAST_SRC: Mutex<MacAddr> = Mutex::new([0; 6]);
 
@@ -433,7 +442,6 @@ pub fn udp_delivered() -> u64 {
 /// the destination MAC via ARP (so it reaches a real peer over the wire, or SLIRP's gateway/servers),
 /// builds UDP-in-IPv4-in-Ethernet, and transmits. Returns `false` if the MAC could not be resolved.
 /// Fire-and-forget: UDP is unreliable, so there is no delivery confirmation.
-#[allow(dead_code)] // the send path a live peer / the Stage 19b DNS query will drive
 pub fn udp_send(dst_ip: [u8; 4], dst_port: u16, src_port: u16, payload: &[u8]) -> bool {
     let mac = match arp_resolve(dst_ip) {
         Some(m) => m,
@@ -444,6 +452,38 @@ pub fn udp_send(dst_ip: [u8; 4], dst_port: u16, src_port: u16, payload: &[u8]) -
     let frame = ether::build(mac, our_mac(), ether::ETHERTYPE_IPV4, &ip);
     e1000::transmit(&frame);
     true
+}
+
+/// Stage 19b-2: resolve `hostname` to an IPv4 address via DNS — the first thing UDP does for real.
+/// Builds a DNS query stamped with a fresh transaction id, sends it to [`DNS_SERVER`] with [`udp_send`],
+/// and pumps [`poll`] until the reply is *delivered* (the same UDP receive path the echo server uses:
+/// the response lands in `LAST_UDP_PAYLOAD` and bumps `UDP_DELIVERED`), then parses out the address.
+/// Returns `None` on a bad hostname, if the server's MAC cannot be resolved, or on timeout. Bounded and
+/// re-sending periodically, since UDP may drop a datagram and there is no retransmit underneath us.
+pub fn dns_resolve(hostname: &str) -> Option<[u8; 4]> {
+    let id = 0xA000u16.wrapping_add(DNS_XID.fetch_add(1, Ordering::Relaxed) as u16);
+    let query = dns::build_query(id, hostname)?;
+
+    // Match a response by the *count* of delivered datagrams changing, then check its transaction id.
+    let mut seen = UDP_DELIVERED.load(Ordering::Acquire);
+    // Up to ~3 s total, re-sending every ~300 ms; returns the instant a matching reply is parsed.
+    for i in 0..3000 {
+        if i % 300 == 0 && !udp_send(DNS_SERVER, dns::DNS_PORT, DNS_CLIENT_PORT, &query) {
+            return None; // could not resolve the DNS server's MAC (no route to it)
+        }
+        poll(); // drain and dispatch; a delivered DNS reply updates LAST_UDP_PAYLOAD
+        let delivered = UDP_DELIVERED.load(Ordering::Acquire);
+        if delivered != seen {
+            seen = delivered;
+            // Clone out from under the lock, then parse — matching on our transaction id.
+            let payload = LAST_UDP_PAYLOAD.lock().clone();
+            if let Some(ip) = dns::parse_response(&payload, id) {
+                return Some(ip);
+            }
+        }
+        crate::apic::pit_sleep_us(1000);
+    }
+    None
 }
 
 /// Stage 18d: parse a dotted-decimal IPv4 address (`"10.0.2.2"`) into four octets, or `None` if it is
