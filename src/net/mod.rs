@@ -49,7 +49,7 @@ pub mod icmp;
 pub mod ipv4;
 pub mod udp;
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use alloc::vec::Vec;
 use spin::Mutex;
@@ -62,10 +62,16 @@ const PING_ID: u16 = 0xAE71;
 /// The payload our pings carry (echoed back by the target unchanged).
 const PING_PAYLOAD: &[u8] = b"aether ping 0123456789abcdef";
 
-/// Our static IPv4 address on QEMU's SLIRP network (the default guest lease).
+/// The address SLIRP leases us by default — used as a **static fallback** if DHCP (Stage 20b) fails,
+/// and still the value the ARP/ping/DNS tests expect. Since 20b our *live* address is dynamic (leased
+/// via DHCP into [`CURRENT_IP`]); read it through [`our_ip`], not this constant.
 pub const OUR_IP: [u8; 4] = [10, 0, 2, 15];
 /// SLIRP's virtual gateway (it answers our ARP and — in 18c — our pings).
 pub const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
+/// The limited broadcast address (255.255.255.255). A DHCP client has no address of its own yet, so it
+/// sends to this and — with the broadcast flag set — the server broadcasts its reply back here; [`receive`]
+/// accepts IPv4 packets addressed to it (Stage 20b), the way any host accepts limited-broadcast traffic.
+pub const LIMITED_BROADCAST: [u8; 4] = [255, 255, 255, 255];
 
 /// SLIRP's virtual DNS server (Stage 19b): it answers DNS queries by forwarding them to the host's
 /// resolver, so `dns_resolve` can turn a hostname into an address without us implementing a resolver.
@@ -118,12 +124,35 @@ static UDP_DELIVERED: AtomicU64 = AtomicU64::new(0);
 /// a socket layer — can inspect what arrived. A `Vec` in a `Mutex` (`Vec::new` is a const fn).
 static LAST_UDP_PAYLOAD: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
-/// Bring the stack up: record our MAC and log our identity. Call once, after the e1000 is up.
+/// Our live IPv4 address (Stage 20b). Unconfigured (`0.0.0.0`) until DHCP leases one — the whole point
+/// of DHCP is that this is *negotiated*, not hardcoded. [`our_ip`] reads it; [`dhcp_configure`] (or the
+/// [`use_static_fallback`] path) writes it. Behind a `Mutex` so it can be a mutable `static`.
+static CURRENT_IP: Mutex<[u8; 4]> = Mutex::new([0, 0, 0, 0]);
+/// The gateway/router, DNS server, and subnet mask the DHCP server handed us (Stage 20b), for display
+/// by `ifconfig`. The gateway/DNS happen to match the [`GATEWAY_IP`]/[`DNS_SERVER`] constants the older
+/// stages still use directly; these record what the *lease* actually said.
+static LEASED_GATEWAY: Mutex<[u8; 4]> = Mutex::new([0, 0, 0, 0]);
+static LEASED_DNS: Mutex<[u8; 4]> = Mutex::new([0, 0, 0, 0]);
+static LEASED_MASK: Mutex<[u8; 4]> = Mutex::new([0, 0, 0, 0]);
+/// The DHCP server that granted our lease (option 54), and the lease duration in seconds (option 51).
+static DHCP_SERVER: Mutex<[u8; 4]> = Mutex::new([0, 0, 0, 0]);
+static LEASE_SECS: AtomicU32 = AtomicU32::new(0);
+/// Set once DHCP has installed a lease (so `ifconfig` can say whether the address is DHCP or fallback).
+static DHCP_CONFIGURED: AtomicBool = AtomicBool::new(false);
+/// A DHCP reply (OFFER/ACK) delivered to us on the client port — bumped by [`handle_udp`], watched by
+/// [`dhcp_configure`]. `Release`/`Acquire`-ordered so seeing the bump implies seeing the payload write.
+static DHCP_DELIVERED: AtomicU64 = AtomicU64::new(0);
+/// The payload (raw DHCP message) of the most recent reply delivered on the client port.
+static LAST_DHCP_PAYLOAD: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+/// Counter feeding the transaction id stamped on a DHCP exchange (like [`DNS_XID`]).
+static DHCP_XID: AtomicU32 = AtomicU32::new(0);
+
+/// Bring the stack up: record our MAC and log our identity. Call once, after the e1000 is up. Our IP
+/// is still unconfigured here (`0.0.0.0`) — DHCP (Stage 20b) leases one immediately after.
 pub fn init(mac: MacAddr) {
     *OUR_MAC.lock() = mac;
     serial_println!(
-        "[net] stack up: IP {}.{}.{}.{}, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        OUR_IP[0], OUR_IP[1], OUR_IP[2], OUR_IP[3],
+        "[net] stack up: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, IP unconfigured (pending DHCP)",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
     );
 }
@@ -133,10 +162,11 @@ pub fn our_mac() -> MacAddr {
     *OUR_MAC.lock()
 }
 
-/// Our static IPv4 address.
-#[allow(dead_code)] // used by the ARP/IP layers in 18b/18c
+/// Our live IPv4 address — the DHCP lease (Stage 20b), or `0.0.0.0` before one is installed. Every
+/// layer reads its source/own address through this, so the moment DHCP writes [`CURRENT_IP`] the whole
+/// stack (ARP replies, ping, UDP, ...) uses the leased address.
 pub fn our_ip() -> [u8; 4] {
-    OUR_IP
+    *CURRENT_IP.lock()
 }
 
 /// Drain and dispatch every frame the NIC currently has waiting. Returns how many it processed.
@@ -166,7 +196,7 @@ fn receive(bytes: &[u8]) {
             ARP_SEEN.fetch_add(1, Ordering::Relaxed);
             // Stage 18b: learn the sender's IP->MAC, and reply if it is asking for us.
             if let Some(pkt) = arp::ArpPacket::parse(frame.payload) {
-                if let Some(reply) = arp::process(our_mac(), OUR_IP, &pkt) {
+                if let Some(reply) = arp::process(our_mac(), our_ip(), &pkt) {
                     // Unicast the reply back to the requester (Ethernet src = us).
                     let eth = ether::build(pkt.sha, our_mac(), ether::ETHERTYPE_ARP, &reply);
                     e1000::transmit(&eth);
@@ -176,9 +206,11 @@ fn receive(bytes: &[u8]) {
         }
         ether::ETHERTYPE_IPV4 => {
             IPV4_SEEN.fetch_add(1, Ordering::Relaxed);
-            // Stage 18c/19a-2: handle IPv4 packets addressed to us, dispatched by protocol.
+            // Stage 18c/19a-2: handle IPv4 packets addressed to us, dispatched by protocol. Since
+            // Stage 20b we also accept limited broadcast (255.255.255.255) so a DHCP reply — sent
+            // before we own an address — reaches `handle_udp` on the client port.
             if let Some(pkt) = ipv4::Ipv4Packet::parse(frame.payload) {
-                if pkt.dst == OUR_IP {
+                if pkt.dst == our_ip() || pkt.dst == LIMITED_BROADCAST {
                     match pkt.protocol {
                         ipv4::PROTO_ICMP => handle_icmp(&pkt, frame.src),
                         udp::PROTO_UDP => handle_udp(&pkt, frame.src),
@@ -204,7 +236,7 @@ fn handle_icmp(pkt: &ipv4::Ipv4Packet, src_mac: MacAddr) {
         icmp::TYPE_ECHO_REQUEST => {
             // Answer: swap the addresses and send an echo reply back to the requester.
             let reply = icmp::build_echo_reply(echo.id, echo.seq, echo.data);
-            let ip = ipv4::build(OUR_IP, pkt.src, ipv4::PROTO_ICMP, &reply);
+            let ip = ipv4::build(our_ip(), pkt.src, ipv4::PROTO_ICMP, &reply);
             let frame = ether::build(src_mac, our_mac(), ether::ETHERTYPE_IPV4, &ip);
             e1000::transmit(&frame);
             ICMP_REQUESTS_HANDLED.fetch_add(1, Ordering::Relaxed);
@@ -229,11 +261,18 @@ fn handle_udp(pkt: &ipv4::Ipv4Packet, src_mac: MacAddr) {
         None => return,
     };
     UDP_RECEIVED.fetch_add(1, Ordering::Relaxed);
-    if dg.dst_port == UDP_ECHO_PORT {
+    if dg.dst_port == dhcp::CLIENT_PORT {
+        // Stage 20b: a DHCP reply (OFFER/ACK) from a server on port 67, arriving as broadcast (accepted
+        // by `receive` above). Record it — `dhcp_configure` is pumping `poll` and matches it by the
+        // transaction id it stamped. Keep it out of the generic delivery slot so a lease exchange and a
+        // concurrent DNS/UDP conversation cannot clobber each other.
+        *LAST_DHCP_PAYLOAD.lock() = dg.payload.to_vec();
+        DHCP_DELIVERED.fetch_add(1, Ordering::Release);
+    } else if dg.dst_port == UDP_ECHO_PORT {
         // Echo server: reply with the same payload, swapping the ports (our echo port -> their port)
         // and the addresses (us -> them). The reply is a fresh UDP-in-IPv4-in-Ethernet frame.
-        let reply = udp::build(OUR_IP, pkt.src, UDP_ECHO_PORT, dg.src_port, dg.payload);
-        let ip = ipv4::build(OUR_IP, pkt.src, udp::PROTO_UDP, &reply);
+        let reply = udp::build(our_ip(), pkt.src, UDP_ECHO_PORT, dg.src_port, dg.payload);
+        let ip = ipv4::build(our_ip(), pkt.src, udp::PROTO_UDP, &reply);
         let frame = ether::build(src_mac, our_mac(), ether::ETHERTYPE_IPV4, &ip);
         e1000::transmit(&frame);
         UDP_ECHOES_SENT.fetch_add(1, Ordering::Relaxed);
@@ -275,7 +314,7 @@ pub fn arp_resolve(ip: [u8; 4]) -> Option<MacAddr> {
     if let Some(mac) = arp::cache_lookup(ip) {
         return Some(mac);
     }
-    let request = arp::build_request(our_mac(), OUR_IP, ip);
+    let request = arp::build_request(our_mac(), our_ip(), ip);
     let frame = ether::build(ether::BROADCAST, our_mac(), ether::ETHERTYPE_ARP, &request);
     // Up to ~2 s total, re-broadcasting every ~200 ms; returns the instant the reply is cached.
     for i in 0..2000 {
@@ -300,7 +339,7 @@ pub fn ping(ip: [u8; 4]) -> Option<u16> {
     let mac = arp_resolve(ip)?;
     let seq = (PING_SEQ.fetch_add(1, Ordering::Relaxed) + 1) as u16;
     let icmp = icmp::build_echo_request(PING_ID, seq, PING_PAYLOAD);
-    let ip_pkt = ipv4::build(OUR_IP, ip, ipv4::PROTO_ICMP, &icmp);
+    let ip_pkt = ipv4::build(our_ip(), ip, ipv4::PROTO_ICMP, &icmp);
     let frame = ether::build(mac, our_mac(), ether::ETHERTYPE_IPV4, &ip_pkt);
 
     let replies_before = ICMP_REPLIES_RECEIVED.load(Ordering::Acquire);
@@ -329,7 +368,7 @@ pub fn ping_loopback_selftest() -> bool {
     let mac = our_mac();
     let icmp = icmp::build_echo_request(PING_ID, 0xFFFF, b"aether icmp loopback selftest");
     // Addressed to ourselves at every layer, so our generated reply also returns to us.
-    let ip_pkt = ipv4::build(OUR_IP, OUR_IP, ipv4::PROTO_ICMP, &icmp);
+    let ip_pkt = ipv4::build(our_ip(), our_ip(), ipv4::PROTO_ICMP, &icmp);
     let frame = ether::build(mac, mac, ether::ETHERTYPE_IPV4, &ip_pkt);
 
     e1000::set_loopback(true);
@@ -376,8 +415,8 @@ pub fn udp_echo_loopback_selftest() -> bool {
     let payload = b"aether udp echo loopback selftest";
     let src_port: u16 = 40000;
     // Addressed to ourselves at every layer, on the echo port, so our generated echo returns to us.
-    let dg = udp::build(OUR_IP, OUR_IP, src_port, UDP_ECHO_PORT, payload);
-    let ip_pkt = ipv4::build(OUR_IP, OUR_IP, udp::PROTO_UDP, &dg);
+    let dg = udp::build(our_ip(), our_ip(), src_port, UDP_ECHO_PORT, payload);
+    let ip_pkt = ipv4::build(our_ip(), our_ip(), udp::PROTO_UDP, &dg);
     let frame = ether::build(mac, mac, ether::ETHERTYPE_IPV4, &ip_pkt);
 
     e1000::set_loopback(true);
@@ -448,8 +487,8 @@ pub fn udp_send(dst_ip: [u8; 4], dst_port: u16, src_port: u16, payload: &[u8]) -
         Some(m) => m,
         None => return false,
     };
-    let dg = udp::build(OUR_IP, dst_ip, src_port, dst_port, payload);
-    let ip = ipv4::build(OUR_IP, dst_ip, udp::PROTO_UDP, &dg);
+    let dg = udp::build(our_ip(), dst_ip, src_port, dst_port, payload);
+    let ip = ipv4::build(our_ip(), dst_ip, udp::PROTO_UDP, &dg);
     let frame = ether::build(mac, our_mac(), ether::ETHERTYPE_IPV4, &ip);
     e1000::transmit(&frame);
     true
@@ -485,6 +524,126 @@ pub fn dns_resolve(hostname: &str) -> Option<[u8; 4]> {
         crate::apic::pit_sleep_us(1000);
     }
     None
+}
+
+/// Stage 20b: obtain our IPv4 configuration from a DHCP server by running the four-step **DORA**
+/// exchange — DISCOVER, OFFER, REQUEST, ACK — and install the lease (address, gateway, DNS, mask) so the
+/// rest of the stack uses the *leased* address instead of a hardcoded one. Returns `true` if a lease was
+/// installed. Bounded and re-sending, like [`arp_resolve`]/[`dns_resolve`], since UDP may drop a message.
+///
+/// Everything goes out as broadcast from `0.0.0.0` (we have no address yet), and the reply comes back as
+/// broadcast because we set the broadcast flag; `receive` accepts it and `handle_udp` records it. We
+/// match a reply to our request by the transaction id we stamp on the exchange.
+pub fn dhcp_configure() -> bool {
+    let mac = our_mac();
+    let xid = 0xAE7C_0000u32.wrapping_add(DHCP_XID.fetch_add(1, Ordering::Relaxed));
+
+    // DISCOVER -> OFFER: find a server and the address it will give us.
+    let discover = dhcp::build_discover(xid, mac);
+    let offer = match dhcp_exchange(&discover, xid, dhcp::OFFER) {
+        Some(o) => o,
+        None => return false, // no server answered
+    };
+
+    // REQUEST -> ACK: formally request that address from that server, and get the confirmed lease.
+    let request = dhcp::build_request(xid, mac, offer.your_ip, offer.server_id);
+    let ack = match dhcp_exchange(&request, xid, dhcp::ACK) {
+        Some(a) => a,
+        None => return false, // the server never confirmed (or sent a NAK)
+    };
+
+    install_lease(&ack);
+    true
+}
+
+/// One request/response leg of the DORA exchange: broadcast `msg`, then pump [`poll`] until a DHCP reply
+/// carrying our transaction id `xid` and message type `want` is delivered, or time out. Re-broadcasts
+/// periodically. Returns the parsed [`dhcp::Reply`], or `None` on timeout.
+fn dhcp_exchange(msg: &[u8], xid: u32, want: u8) -> Option<dhcp::Reply> {
+    let mut seen = DHCP_DELIVERED.load(Ordering::Acquire);
+    // Up to ~3 s, re-sending every ~300 ms; returns the instant a matching reply is parsed.
+    for i in 0..3000 {
+        if i % 300 == 0 {
+            send_dhcp(msg);
+        }
+        poll(); // drain and dispatch; a delivered DHCP reply updates LAST_DHCP_PAYLOAD
+        let delivered = DHCP_DELIVERED.load(Ordering::Acquire);
+        if delivered != seen {
+            seen = delivered;
+            let payload = LAST_DHCP_PAYLOAD.lock().clone();
+            if let Some(reply) = dhcp::parse_reply(&payload, xid) {
+                if reply.msg_type == want {
+                    return Some(reply);
+                }
+            }
+        }
+        crate::apic::pit_sleep_us(1000);
+    }
+    None
+}
+
+/// Broadcast a raw DHCP message: UDP `68 -> 67` from `0.0.0.0` to `255.255.255.255`, in an Ethernet
+/// frame to the broadcast MAC. No ARP is possible (we have no address and the destination is broadcast),
+/// so this bypasses [`udp_send`] and frames the datagram directly.
+fn send_dhcp(payload: &[u8]) {
+    let dg = udp::build(
+        [0, 0, 0, 0],
+        LIMITED_BROADCAST,
+        dhcp::CLIENT_PORT,
+        dhcp::SERVER_PORT,
+        payload,
+    );
+    let ip = ipv4::build([0, 0, 0, 0], LIMITED_BROADCAST, udp::PROTO_UDP, &dg);
+    let frame = ether::build(ether::BROADCAST, our_mac(), ether::ETHERTYPE_IPV4, &ip);
+    e1000::transmit(&frame);
+}
+
+/// Install a lease from an ACK: set our live address and record the gateway/DNS/mask/server/lease time.
+fn install_lease(ack: &dhcp::Reply) {
+    *CURRENT_IP.lock() = ack.your_ip;
+    *DHCP_SERVER.lock() = ack.server_id;
+    if let Some(gw) = ack.router {
+        *LEASED_GATEWAY.lock() = gw;
+    }
+    if let Some(dns) = ack.dns {
+        *LEASED_DNS.lock() = dns;
+    }
+    if let Some(mask) = ack.subnet_mask {
+        *LEASED_MASK.lock() = mask;
+    }
+    LEASE_SECS.store(ack.lease_secs.unwrap_or(0), Ordering::Relaxed);
+    DHCP_CONFIGURED.store(true, Ordering::Release);
+}
+
+/// Fall back to the static [`OUR_IP`] if DHCP did not answer, so the rest of the stack still has a usable
+/// address (the boot self-tests, the shell). A real host might instead pick a link-local address.
+pub fn use_static_fallback() {
+    *CURRENT_IP.lock() = OUR_IP;
+}
+
+/// Whether a DHCP lease has been installed (vs. the static fallback), for `ifconfig`.
+pub fn dhcp_configured() -> bool {
+    DHCP_CONFIGURED.load(Ordering::Acquire)
+}
+
+/// The gateway/router the DHCP lease named (Stage 20b), or `0.0.0.0` if not configured.
+pub fn leased_gateway() -> [u8; 4] {
+    *LEASED_GATEWAY.lock()
+}
+
+/// The DNS server the DHCP lease named (Stage 20b), or `0.0.0.0` if not configured.
+pub fn leased_dns() -> [u8; 4] {
+    *LEASED_DNS.lock()
+}
+
+/// The subnet mask the DHCP lease named (Stage 20b), or `0.0.0.0` if not configured.
+pub fn leased_mask() -> [u8; 4] {
+    *LEASED_MASK.lock()
+}
+
+/// The lease duration in seconds the DHCP server granted (Stage 20b), or 0 if not configured.
+pub fn lease_secs() -> u32 {
+    LEASE_SECS.load(Ordering::Relaxed)
 }
 
 /// Stage 18d: parse a dotted-decimal IPv4 address (`"10.0.2.2"`) into four octets, or `None` if it is

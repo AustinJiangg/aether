@@ -241,7 +241,8 @@ fn cmd_cd(cwd: &mut String, args: &str) {
     }
 }
 
-/// `ifconfig` — show our network interface (IP + MAC) and traffic counters (Stage 18d).
+/// `ifconfig` — show our network interface (IP + MAC), the DHCP lease, and traffic counters
+/// (Stage 18d; the lease line is Stage 20b).
 fn cmd_ifconfig() {
     let ip = net::our_ip();
     let mac = net::our_mac();
@@ -250,6 +251,20 @@ fn cmd_ifconfig() {
         ip[0], ip[1], ip[2], ip[3],
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
     );
+    if net::dhcp_configured() {
+        let mask = net::leased_mask();
+        let gw = net::leased_gateway();
+        let dns = net::leased_dns();
+        sh_println!(
+            "  DHCP lease: mask {}.{}.{}.{}  gateway {}.{}.{}.{}  dns {}.{}.{}.{}  ({} s)",
+            mask[0], mask[1], mask[2], mask[3],
+            gw[0], gw[1], gw[2], gw[3],
+            dns[0], dns[1], dns[2], dns[3],
+            net::lease_secs(),
+        );
+    } else {
+        sh_println!("  DHCP: not configured (static address)");
+    }
     sh_println!(
         "  RX frames {}  ARP replies sent {}  pings sent-back {}  answered {}",
         net::frames_received(),

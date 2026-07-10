@@ -279,8 +279,13 @@ hostname to an IP.** `net/dns.rs` builds a query and parses a response, handling
 back-reference; `skip_name` steps over names and a preceding CNAME to reach the A record); a
 **transaction id** matches a response to its query. `net::dns_resolve(hostname)` sends the query to
 `DNS_SERVER` (`10.0.2.3`) via `udp_send` and waits on the 19a-2 UDP delivery path, then parses the
-address; the shell gained `nslookup <host>`. `ROADMAP.md` records the full staged history (stages
-0-19b); remaining optional follow-ons are DHCP (also UDP) or TCP.
+address; the shell gained `nslookup <host>`. **Stage 20 is also done — DHCP**: the kernel *leases* its
+IPv4 address instead of hardcoding it. `net/dhcp.rs` builds/parses the BOOTP-based messages (Stage 20a),
+and `net::dhcp_configure` runs the four-step DORA exchange (DISCOVER/OFFER/REQUEST/ACK) against SLIRP's
+built-in server, making our address **dynamic** (`OUR_IP` is now a runtime `CURRENT_IP` read via
+`our_ip()`, `0.0.0.0` until leased) — boot leases `10.0.2.15` (gateway `10.0.2.2`, DNS `10.0.2.3`) over
+the wire, and `ifconfig` shows the lease (Stage 20b). `ROADMAP.md` records the full staged history (stages
+0-20); the remaining optional follow-on is TCP.
 
 ## Language and writing conventions
 
@@ -727,6 +732,22 @@ Exit QEMU: `Ctrl-A` then `X`.
   back-reference) vs a literal label, and non-A records (a CNAME) are skipped. `net::dns_resolve(hostname)`
   stamps a transaction id, `udp_send`s the query to `DNS_SERVER` (`10.0.2.3`), and pumps `poll` until the
   reply is delivered (via `LAST_UDP_PAYLOAD`), matching by id; the shell's `nslookup` drives it.
+  `net/dhcp.rs` (Stage 20) adds DHCP, which *leases* our IPv4 address instead of hardcoding it. It must
+  run before the stack has an address, so a client sends from `0.0.0.0` to broadcast `255.255.255.255`
+  (UDP `68 -> 67`) and sets the **broadcast flag** so the server broadcasts the reply back. `build_discover`/
+  `build_request` emit the BOOTP layout — a fixed 236-byte header (`op`, `xid`, `yiaddr`, `chaddr` = our
+  MAC), the magic cookie `0x63825363`, then TLV **options** (message type 53, requested IP 50, server id
+  54, param-request list 55) — and `parse_reply` validates a BOOTREPLY with our `xid` + cookie, reads
+  `yiaddr`, and walks the options (subnet mask/router/DNS/lease time), all bounds-checked (Stage 20a, the
+  pure module). Stage 20b wires it live and makes the address **dynamic**: `net::OUR_IP` becomes a runtime
+  `CURRENT_IP` (`0.0.0.0` until leased), read everywhere via `our_ip()`, so the leased address flows
+  through the whole stack the moment the ACK lands. `net::dhcp_configure` runs the four-step **DORA**
+  (DISCOVER/OFFER/REQUEST/ACK) against SLIRP's built-in server — broadcasting via a raw `send_dhcp` (ARP is
+  impossible with no address), matching replies by transaction id — and `install_lease` stores the
+  address/gateway/DNS/mask/lease-time; `receive` now also accepts limited broadcast so the reply reaches
+  `handle_udp`, which routes the client port (68) to a dedicated delivery slot (`LAST_DHCP_PAYLOAD`). Boot
+  leases the address before the other net self-tests (falling back to the static `10.0.2.15` via
+  `use_static_fallback` only if DHCP fails), and the shell's `ifconfig` shows the lease.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

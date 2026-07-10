@@ -552,8 +552,37 @@ unify later.
 > and the boot self-test resolves a name (non-fatal, since it needs the host's upstream DNS — SLIRP just
 > forwards). Live proof: `dns_resolve("example.com")` returns a real address over the wire. Verified by 66
 > tests (`dns_query_and_response_parse` — pure, with a hand-crafted response exercising a compression
-> pointer and a CNAME — and the lenient live `net_resolves_a_hostname`). Remaining optional follow-ons:
-> **DHCP** (also UDP — lease an address instead of hardcoding `10.0.2.15`) or **TCP** (a reliable,
+> pointer and a CNAME — and the lenient live `net_resolves_a_hostname`).
+>
+> **Stage 20 is also done — DHCP: the kernel *leases* its IPv4 address instead of hardcoding it.** DHCP
+> (the Dynamic Host Configuration Protocol) is another application protocol carried in UDP, but where DNS
+> runs *after* we have an address, DHCP is how a real host *gets* one at link-up — so it must work before
+> the stack has any identity beyond its MAC. That drives its two defining quirks: a client with no address
+> sends from `0.0.0.0` to the broadcast `255.255.255.255` (UDP `68 -> 67`), and it sets the **broadcast
+> flag** so the server *broadcasts* the reply back (there is no address yet to unicast to). The exchange is
+> the four-step **DORA**: DISCOVER (client broadcast: "any server out there?"), OFFER (server: "you can
+> have 10.0.2.15; I am 10.0.2.2"), REQUEST (client broadcast: "I formally request 10.0.2.15 from that
+> server" — broadcast on purpose, so any *other* server that offered can reclaim its reservation), ACK
+> (server: "confirmed; lease N seconds, mask/router/DNS are ..."). The packet reuses the older **BOOTP**
+> layout: a fixed 236-byte header (`op`, `xid`, `yiaddr` = "your" address, `chaddr` = our MAC), a 4-byte
+> **magic cookie** (`0x63825363`), then a variable list of **options** (`code, length, value` TLVs — the
+> message type, requested IP, server id, lease time, subnet mask, router, DNS — terminated by option 255).
+>
+> **Stage 20a** is the pure message module `net/dhcp.rs` (like 19b-1): `build_discover` / `build_request`
+> emit the BOOTP header + cookie + options, and `parse_reply` validates a BOOTREPLY carrying our
+> transaction id and the cookie, reads `yiaddr`, and walks the TLV options (all bounds-checked). **Stage
+> 20b** wires it live and — the headline — makes our address **dynamic**: `OUR_IP` becomes a runtime
+> `CURRENT_IP` (unconfigured `0.0.0.0` until leased), read everywhere through `our_ip()`, so the moment the
+> ACK lands the whole stack (ARP replies, ping, UDP) runs on the *leased* address. `net::dhcp_configure`
+> runs DORA against SLIRP's built-in DHCP server (broadcasting via a raw `send_dhcp`, since ARP is
+> impossible with no address), matching each reply by transaction id; `receive` now also accepts limited
+> broadcast (`255.255.255.255`) so the reply reaches `handle_udp`, which routes the client port (68) to a
+> dedicated delivery slot. Boot leases the address before the other net self-tests (falling back to the
+> static `10.0.2.15` only if DHCP fails, so boot always proceeds), and `ifconfig` shows the lease
+> (mask/gateway/DNS/time). Live proof: boot logs "DHCP lease 10.0.2.15 (gw 10.0.2.2, dns 10.0.2.3,
+> 86400 s)". Verified by 68 tests (`dhcp_message_builds_and_parses` — pure build/parse of a DISCOVER,
+> REQUEST, and a hand-crafted OFFER — and the live `dhcp_leases_an_address`, which asserts the boot-time
+> DORA installed SLIRP's deterministic lease). Remaining optional follow-on: **TCP** (a reliable,
 > connection-oriented transport — the big one).
 
 | Stage | Track | What to build | OS concepts |

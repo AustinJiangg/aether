@@ -778,6 +778,36 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     if e1000::present() {
         if let Some(dev) = e1000::device() {
             net::init(dev.mac());
+
+            // Stage 20b (networking): DHCP. Before doing anything else, lease our IPv4 configuration
+            // from SLIRP's built-in DHCP server via the four-step DORA exchange, instead of hardcoding
+            // 10.0.2.15. On success the whole stack (ARP/ping/UDP below) runs on the *leased* address;
+            // on failure we fall back to the static address so boot still proceeds.
+            if net::dhcp_configure() {
+                let ip = net::our_ip();
+                let gw = net::leased_gateway();
+                let dns = net::leased_dns();
+                serial_println!(
+                    "[ OK ] net 20b: DHCP lease {}.{}.{}.{} (gw {}.{}.{}.{}, dns {}.{}.{}.{}, {} s)",
+                    ip[0], ip[1], ip[2], ip[3],
+                    gw[0], gw[1], gw[2], gw[3],
+                    dns[0], dns[1], dns[2], dns[3],
+                    net::lease_secs(),
+                );
+                println!(
+                    "Network: DHCP leased {}.{}.{}.{} (gateway {}.{}.{}.{}).",
+                    ip[0], ip[1], ip[2], ip[3], gw[0], gw[1], gw[2], gw[3],
+                );
+            } else {
+                net::use_static_fallback();
+                let ip = net::our_ip();
+                serial_println!(
+                    "[net] net 20b: DHCP got no lease; using static fallback {}.{}.{}.{}",
+                    ip[0], ip[1], ip[2], ip[3],
+                );
+                println!("Network: DHCP failed; using static address.");
+            }
+
             let framing_ok = net::loopback_selftest();
             serial_println!(
                 "[ OK ] net 18a: Ethernet framing over loopback = {} ({} frame(s) parsed)",

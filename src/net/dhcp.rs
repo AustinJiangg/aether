@@ -56,7 +56,7 @@
 //! server — all lives in the **options** as `code, length, value` triples (a couple have no length:
 //! PAD = 0 and END = 255). Everything multi-byte is big-endian, as always on the wire.
 
-#![allow(dead_code)] // the client that drives this (`net::dhcp_configure`) is wired up in Stage 20b
+#![allow(dead_code)] // a few completeness items (e.g. the NAK message type) are defined but unused
 
 use alloc::vec::Vec;
 

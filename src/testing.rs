@@ -1212,6 +1212,25 @@ fn pings_the_gateway() {
     assert!(seq >= 1, "ping returned an invalid sequence number");
 }
 
+/// Stage 20b: the live DHCP client leased our address during boot, over the wire. `kernel_main` runs
+/// the DORA exchange against SLIRP's built-in DHCP server before the test harness starts, so by now we
+/// must hold a lease: our live address is configured (not 0.0.0.0), and — because SLIRP's server is
+/// deterministic — it is exactly the address/gateway/DNS SLIRP always hands out, learned dynamically
+/// rather than hardcoded. (A DHCP server is SLIRP-internal, so this is reliable, unlike upstream DNS.)
+#[test_case]
+fn dhcp_leases_an_address() {
+    use crate::net;
+
+    assert!(crate::e1000::present(), "e1000 not initialized");
+    assert_ne!(net::our_ip(), [0, 0, 0, 0], "the interface has no address after boot");
+    assert!(net::dhcp_configured(), "DHCP did not install a lease from SLIRP");
+    // SLIRP always leases the default guest address 10.0.2.15, gateway 10.0.2.2, DNS 10.0.2.3.
+    assert_eq!(net::our_ip(), net::OUR_IP, "DHCP leased an unexpected address");
+    assert_eq!(net::leased_gateway(), net::GATEWAY_IP, "DHCP router option mismatch");
+    assert_eq!(net::leased_dns(), net::DNS_SERVER, "DHCP DNS option mismatch");
+    assert!(net::lease_secs() > 0, "DHCP lease time should be positive");
+}
+
 /// Stage 18d: the `ping` command's dotted-decimal IPv4 parser. Pure logic: accept well-formed
 /// addresses and reject malformed ones (wrong part count, out-of-range octet, non-numeric).
 #[test_case]
