@@ -1083,6 +1083,71 @@ fn dns_query_and_response_parse() {
     assert_eq!(dns::parse_response(&[0u8; 4], 0x1234), None, "a runt is rejected");
 }
 
+/// Stage 20a: the DHCP layer builds DISCOVER/REQUEST messages and parses an OFFER/ACK. Pure logic (no
+/// network): build a DISCOVER and check its BOOTP header, magic cookie, and message-type option, then
+/// hand-craft an OFFER — exercising the TLV option walk (message type, server id, and the address
+/// options subnet mask / router / DNS, plus the lease time) — and confirm the parser recovers `yiaddr`
+/// and every option, rejecting a wrong transaction id and a runt.
+#[test_case]
+fn dhcp_message_builds_and_parses() {
+    use crate::net::dhcp;
+    use alloc::vec::Vec;
+
+    let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+    let xid = 0xAABBCCDD;
+
+    // A DISCOVER: op = 1 (client request), the transaction id at 4..8, our MAC in chaddr at 28..34,
+    // the magic cookie at 236..240, and option 53 = DISCOVER right after it.
+    let disc = dhcp::build_discover(xid, mac);
+    assert!(disc.len() >= 240, "a DHCP message spans at least the fixed header + cookie");
+    assert_eq!(disc[0], 1, "op = BOOTREQUEST");
+    assert_eq!(&disc[4..8], &xid.to_be_bytes(), "transaction id");
+    assert_eq!(&disc[28..34], &mac, "chaddr carries our MAC");
+    assert_eq!(&disc[236..240], &[0x63, 0x82, 0x53, 0x63], "magic cookie");
+    assert_eq!(&disc[240..243], &[53, 1, dhcp::DISCOVER], "option 53 = DISCOVER");
+
+    // A REQUEST additionally carries option 50 (requested IP) and option 54 (server id).
+    let req = dhcp::build_request(xid, mac, [10, 0, 2, 15], [10, 0, 2, 2]);
+    assert!(
+        req.windows(6).any(|w| w == [50, 4, 10, 0, 2, 15]),
+        "REQUEST includes the requested IP (option 50)"
+    );
+    assert!(
+        req.windows(6).any(|w| w == [54, 4, 10, 0, 2, 2]),
+        "REQUEST names the server (option 54)"
+    );
+
+    // Hand-craft an OFFER: BOOTREPLY (op = 2), our xid, yiaddr = 10.0.2.15, the magic cookie, then
+    // options — message type OFFER, server id, subnet mask, router, DNS, and a 24h lease.
+    let mut offer: Vec<u8> = Vec::new();
+    offer.push(2); // op = BOOTREPLY
+    offer.extend_from_slice(&[1, 6, 0]); // htype, hlen, hops
+    offer.extend_from_slice(&xid.to_be_bytes()); // xid at 4..8
+    offer.extend_from_slice(&[0; 8]); // secs, flags, (start of addrs)
+    offer.extend_from_slice(&[10, 0, 2, 15]); // yiaddr at 16..20
+    offer.extend_from_slice(&[0u8; 216]); // siaddr..file, zero-filled (offset 20 up to the cookie at 236)
+    offer.extend_from_slice(&[0x63, 0x82, 0x53, 0x63]); // magic cookie
+    offer.extend_from_slice(&[53, 1, dhcp::OFFER]); // option 53 = OFFER
+    offer.extend_from_slice(&[54, 4, 10, 0, 2, 2]); // option 54 = server id
+    offer.extend_from_slice(&[1, 4, 255, 255, 255, 0]); // option 1 = subnet mask
+    offer.extend_from_slice(&[3, 4, 10, 0, 2, 2]); // option 3 = router
+    offer.extend_from_slice(&[6, 4, 10, 0, 2, 3]); // option 6 = DNS
+    offer.extend_from_slice(&[51, 4, 0, 0x01, 0x51, 0x80]); // option 51 = lease 86400s
+    offer.push(255); // END
+
+    let r = dhcp::parse_reply(&offer, xid).expect("hand-crafted OFFER should parse");
+    assert_eq!(r.msg_type, dhcp::OFFER);
+    assert_eq!(r.your_ip, [10, 0, 2, 15], "yiaddr — the offered address");
+    assert_eq!(r.server_id, [10, 0, 2, 2]);
+    assert_eq!(r.subnet_mask, Some([255, 255, 255, 0]));
+    assert_eq!(r.router, Some([10, 0, 2, 2]));
+    assert_eq!(r.dns, Some([10, 0, 2, 3]));
+    assert_eq!(r.lease_secs, Some(86400));
+
+    assert!(dhcp::parse_reply(&offer, 0x99999999).is_none(), "wrong transaction id is rejected");
+    assert!(dhcp::parse_reply(&[0u8; 8], xid).is_none(), "a runt is rejected");
+}
+
 /// Stage 18c: the full ICMP path bidirectionally, via loopback (no external peer). Send an echo
 /// request to ourselves; the stack answers it and receives its own reply — exercising build, parse,
 /// checksum, dispatch, the reply we generate, and receiving that reply.
