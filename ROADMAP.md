@@ -582,8 +582,36 @@ unify later.
 > (mask/gateway/DNS/time). Live proof: boot logs "DHCP lease 10.0.2.15 (gw 10.0.2.2, dns 10.0.2.3,
 > 86400 s)". Verified by 68 tests (`dhcp_message_builds_and_parses` — pure build/parse of a DISCOVER,
 > REQUEST, and a hand-crafted OFFER — and the live `dhcp_leases_an_address`, which asserts the boot-time
-> DORA installed SLIRP's deterministic lease). Remaining optional follow-on: **TCP** (a reliable,
-> connection-oriented transport — the big one).
+> DORA installed SLIRP's deterministic lease).
+>
+> **Stage 21 (TCP) has begun** — TCP (the Transmission Control Protocol), the stack's first *reliable*
+> transport and the big final follow-on. Where UDP is connectionless "send and forget", TCP is a
+> connection-oriented, reliable, ordered byte stream: every byte is numbered (a **sequence number**), the
+> receiver **acknowledges** the next byte it expects, control **flags** (SYN/ACK/FIN/RST) run the
+> connection, and a **window** does flow control. Being large and stateful, it is split into many
+> sub-steps (like the SMP track), each `cargo test`-verifiable.
+>
+> **Stage 21a** is the pure segment layer `net/tcp.rs` (mirroring `net/udp.rs`): `Segment::parse` reads the
+> 20-byte header — ports, seq, ack, flags, window — and honors the **data offset** (header length in
+> 32-bit words) so it skips any options to return the real payload; `build` emits a no-options header; and
+> `checksum` is the same pseudo-header Internet checksum UDP uses but over protocol 6, with no "computed 0
+> becomes 0xFFFF" rule (TCP's checksum is mandatory). **Stage 21b** adds the **connection state machine and
+> the three-way handshake**. A **TCB** (Transmission Control Block) per connection tracks its `State`
+> (`Closed`/`Listen`/`SynSent`/`SynReceived`/`Established`) and the send/receive **sequence bookkeeping**
+> (`snd_una`/`snd_nxt`/`iss`, `rcv_nxt`/`irs` — a SYN consumes one sequence number, so the peer
+> acknowledges `iss + 1`). `tcp::open_active` starts an active open (SYN_SENT + the SYN to send),
+> `open_passive` registers a listener, and `on_segment` drives both halves: a listener answers a SYN with a
+> SYN-ACK (SYN_RECEIVED), an active opener answers a SYN-ACK with the final ACK (ESTABLISHED), and the
+> listener reaches ESTABLISHED on that ACK. `net::receive` now dispatches IPv4 protocol 6 to `handle_tcp`,
+> which transmits any response the state machine emits; `net::tcp_connect` creates the TCB, sends the SYN,
+> and pumps `poll` until ESTABLISHED (using our own MAC for a loopback destination, so no ARP). Proved
+> deterministically with no peer via PHY loopback: `tcp_handshake_loopback_selftest` listens on a port and
+> connects to *ourselves*, so a client TCB and a server TCB complete SYN / SYN-ACK / ACK and **both** reach
+> ESTABLISHED — boot logs "TCP handshake over loopback = true (3 segment(s) parsed)". Verified by 70 tests
+> (`tcp_segment_builds_and_parses` — pure build/parse incl. an options-skip and bad-offset rejection — and
+> the live `tcp_completes_handshake_over_loopback`). Still to come: **21c** data transfer (send/receive
+> stream bytes with ACKs and a sliding window), **21d** teardown (the FIN handshake, TIME_WAIT), and
+> **21e** retransmission timers.
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

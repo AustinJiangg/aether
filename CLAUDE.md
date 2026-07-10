@@ -284,8 +284,11 @@ IPv4 address instead of hardcoding it. `net/dhcp.rs` builds/parses the BOOTP-bas
 and `net::dhcp_configure` runs the four-step DORA exchange (DISCOVER/OFFER/REQUEST/ACK) against SLIRP's
 built-in server, making our address **dynamic** (`OUR_IP` is now a runtime `CURRENT_IP` read via
 `our_ip()`, `0.0.0.0` until leased) — boot leases `10.0.2.15` (gateway `10.0.2.2`, DNS `10.0.2.3`) over
-the wire, and `ifconfig` shows the lease (Stage 20b). `ROADMAP.md` records the full staged history (stages
-0-20); the remaining optional follow-on is TCP.
+the wire, and `ifconfig` shows the lease (Stage 20b). **Stage 21 (TCP) has begun** — the stack's first
+*reliable* transport: `net/tcp.rs` holds the pure segment layer (Stage 21a) and the connection state
+machine + three-way handshake (Stage 21b), proved by a PHY-loopback self-connect where a client and a
+server TCB both reach ESTABLISHED (SYN/SYN-ACK/ACK); data transfer, teardown, and retransmission are the
+remaining sub-steps. `ROADMAP.md` records the full staged history (stages 0-21b).
 
 ## Language and writing conventions
 
@@ -747,7 +750,20 @@ Exit QEMU: `Ctrl-A` then `X`.
   address/gateway/DNS/mask/lease-time; `receive` now also accepts limited broadcast so the reply reaches
   `handle_udp`, which routes the client port (68) to a dedicated delivery slot (`LAST_DHCP_PAYLOAD`). Boot
   leases the address before the other net self-tests (falling back to the static `10.0.2.15` via
-  `use_static_fallback` only if DHCP fails), and the shell's `ifconfig` shows the lease.
+  `use_static_fallback` only if DHCP fails), and the shell's `ifconfig` shows the lease. `net/tcp.rs`
+  (Stage 21) adds TCP, the stack's first *reliable* transport (connection-oriented, ordered, acknowledged).
+  Stage 21a is the pure segment layer (like `udp.rs`): `Segment::parse`/`build` handle the 20-byte header
+  (ports, seq, ack, flags, window) honoring the **data offset** (so options are skipped), and `checksum` is
+  the pseudo-header Internet checksum over protocol 6 (mandatory, no UDP `0->0xFFFF` rule). Stage 21b adds
+  the **connection state machine + three-way handshake**: a `Tcb` per connection holds its `State`
+  (`Closed`/`Listen`/`SynSent`/`SynReceived`/`Established`) and sequence bookkeeping (`snd_una`/`snd_nxt`/
+  `iss`, `rcv_nxt`/`irs`); `open_active`/`open_passive` start an active/passive open and `on_segment` drives
+  both halves (listener: SYN -> SYN-ACK -> ESTABLISHED on the ACK; active: SYN-ACK -> ACK -> ESTABLISHED),
+  all behind a `Mutex<Vec<Tcb>>` connection table. `net::receive` dispatches IPv4 protocol 6 to `handle_tcp`
+  (which transmits any response), and `net::tcp_connect` sends the SYN and pumps `poll` until ESTABLISHED
+  (our own MAC for a loopback destination, no ARP). `tcp_handshake_loopback_selftest` connects to ourselves
+  over PHY loopback so a client and a server TCB both reach ESTABLISHED (SYN/SYN-ACK/ACK). Still to come:
+  data transfer (21c), teardown (21d), retransmission (21e).
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

@@ -148,6 +148,12 @@ static LAST_DHCP_PAYLOAD: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 /// Counter feeding the transaction id stamped on a DHCP exchange (like [`DNS_XID`]).
 static DHCP_XID: AtomicU32 = AtomicU32::new(0);
 
+/// TCP segments addressed to us that we have parsed (Stage 21b).
+static TCP_SEGMENTS_RECEIVED: AtomicU64 = AtomicU64::new(0);
+/// The next ephemeral local port an outgoing TCP connection will use (Stage 21b). Bumped per connect,
+/// wrapping within the ephemeral range so successive connections do not collide.
+static TCP_EPHEMERAL: AtomicU32 = AtomicU32::new(49152);
+
 /// Bring the stack up: record our MAC and log our identity. Call once, after the e1000 is up. Our IP
 /// is still unconfigured here (`0.0.0.0`) — DHCP (Stage 20b) leases one immediately after.
 pub fn init(mac: MacAddr) {
@@ -215,7 +221,8 @@ fn receive(bytes: &[u8]) {
                     match pkt.protocol {
                         ipv4::PROTO_ICMP => handle_icmp(&pkt, frame.src),
                         udp::PROTO_UDP => handle_udp(&pkt, frame.src),
-                        _ => {} // some other IP protocol (e.g. TCP) — ignored for now
+                        tcp::PROTO_TCP => handle_tcp(&pkt, frame.src),
+                        _ => {} // some other IP protocol — ignored for now
                     }
                 }
             }
@@ -282,6 +289,25 @@ fn handle_udp(pkt: &ipv4::Ipv4Packet, src_mac: MacAddr) {
         // record its payload so a self-test — or a future socket layer — can consume it.
         *LAST_UDP_PAYLOAD.lock() = dg.payload.to_vec();
         UDP_DELIVERED.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// Stage 21b: handle a TCP segment addressed to us. Parse it, run it through the connection state
+/// machine ([`tcp::on_segment`]), and if that produces a response (a SYN-ACK or an ACK during the
+/// handshake) wrap it back through IP and Ethernet to the sender and transmit it. `src_mac` is the
+/// frame's source — where the response goes, exactly as ICMP/UDP replies do (no ARP needed to answer
+/// whoever addressed us).
+fn handle_tcp(pkt: &ipv4::Ipv4Packet, src_mac: MacAddr) {
+    let seg = match tcp::Segment::parse(pkt.payload) {
+        Some(s) => s,
+        None => return,
+    };
+    TCP_SEGMENTS_RECEIVED.fetch_add(1, Ordering::Relaxed);
+    // The state machine may hand us a segment to send back (checksummed for our_ip -> pkt.src).
+    if let Some(resp) = tcp::on_segment(our_ip(), pkt.src, &seg) {
+        let ip = ipv4::build(our_ip(), pkt.src, tcp::PROTO_TCP, &resp);
+        let frame = ether::build(src_mac, our_mac(), ether::ETHERTYPE_IPV4, &ip);
+        e1000::transmit(&frame);
     }
 }
 
@@ -645,6 +671,92 @@ pub fn leased_mask() -> [u8; 4] {
 /// The lease duration in seconds the DHCP server granted (Stage 20b), or 0 if not configured.
 pub fn lease_secs() -> u32 {
     LEASE_SECS.load(Ordering::Relaxed)
+}
+
+/// TCP segments addressed to us that we have parsed (Stage 21b).
+pub fn tcp_segments_received() -> u64 {
+    TCP_SEGMENTS_RECEIVED.load(Ordering::Relaxed)
+}
+
+/// The next-hop MAC for reaching `dst_ip`: our own MAC when it *is* our own address (a loopback
+/// connection — the frame must be addressed to our MAC to pass the receive filter), otherwise resolved
+/// via ARP. SLIRP puts every guest on one `/24`, so an on-link peer's own MAC works; a real router would
+/// resolve the gateway for an off-subnet destination. Returns `None` if ARP cannot resolve it.
+fn tcp_next_hop(dst_ip: [u8; 4]) -> Option<MacAddr> {
+    if dst_ip == our_ip() {
+        return Some(our_mac());
+    }
+    arp_resolve(dst_ip)
+}
+
+/// Pick the next ephemeral local port for an outgoing connection (49152..=65535, wrapping).
+fn next_ephemeral_port() -> u16 {
+    let n = TCP_EPHEMERAL.fetch_add(1, Ordering::Relaxed);
+    49152 + (n % (65536 - 49152)) as u16
+}
+
+/// Stage 21b: actively open a TCP connection to `remote_ip:remote_port` by performing the three-way
+/// handshake. Returns the local port on success (the connection is then ESTABLISHED), or `None` on
+/// timeout. Resolves the next-hop MAC, creates a SYN_SENT TCB and its SYN (`tcp::open_active`),
+/// transmits it, and pumps [`poll`] — where the SYN-ACK is received and the state machine emits the final
+/// ACK — until the connection reaches ESTABLISHED. Bounded and re-sending the SYN periodically, since a
+/// segment may be lost and (this sub-step) there is no retransmission timer yet.
+pub fn tcp_connect(remote_ip: [u8; 4], remote_port: u16) -> Option<u16> {
+    let mac = tcp_next_hop(remote_ip)?;
+    let local_port = next_ephemeral_port();
+    let syn = tcp::open_active(our_ip(), remote_ip, local_port, remote_port);
+    let frame = ether::build(
+        mac,
+        our_mac(),
+        ether::ETHERTYPE_IPV4,
+        &ipv4::build(our_ip(), remote_ip, tcp::PROTO_TCP, &syn),
+    );
+    for i in 0..2000 {
+        if i % 200 == 0 {
+            e1000::transmit(&frame);
+        }
+        poll(); // the SYN-ACK arrives here; the state machine transmits the final ACK
+        if tcp::connection_state(local_port, remote_port) == Some(tcp::State::Established) {
+            return Some(local_port);
+        }
+        crate::apic::pit_sleep_us(1000);
+    }
+    None
+}
+
+/// Stage 21b self-test of the three-way handshake with no external peer, via PHY loopback. Listen on a
+/// port, then actively connect to *ourselves* on it: our SYN loops back, the listener answers SYN-ACK,
+/// that loops back and we answer ACK, which loops back to the listener — so both a client TCB and a
+/// server TCB reach ESTABLISHED. Success exercises both halves of the handshake plus segment build/parse
+/// and the checksum. Returns whether the connect succeeded and both ends established.
+pub fn tcp_handshake_loopback_selftest() -> bool {
+    tcp::reset_connections();
+    let port: u16 = 7777;
+    tcp::open_passive(port); // a listener to accept our own SYN
+
+    e1000::set_loopback(true);
+    // Drain stale frames so the handshake sees a clean ring.
+    let mut sink = [0u8; 2048];
+    while e1000::poll_frame(&mut sink).is_some() {}
+
+    let connected = tcp_connect(our_ip(), port).is_some();
+    // The client reaches ESTABLISHED when it sends the final ACK; pump a little more so the listener
+    // receives that ACK (looped back) and reaches ESTABLISHED too.
+    for _ in 0..200 {
+        if tcp::established_count() >= 2 {
+            break;
+        }
+        poll();
+        crate::apic::pit_sleep_us(500);
+    }
+    e1000::set_loopback(false);
+
+    let established = tcp::established_count();
+    serial_println!(
+        "[net] TCP handshake loopback selftest: connect = {}, established connections = {}",
+        connected, established,
+    );
+    connected && established >= 2
 }
 
 /// Stage 18d: parse a dotted-decimal IPv4 address (`"10.0.2.2"`) into four octets, or `None` if it is

@@ -881,6 +881,18 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     host,
                 ),
             }
+
+            // Stage 21b (networking): TCP three-way handshake. TCP is the first *reliable* transport —
+            // connection-oriented, with sequence numbers and acknowledgements. Prove the handshake
+            // deterministically via PHY loopback: listen on a port and connect to ourselves, so a
+            // client TCB and a server TCB complete SYN / SYN-ACK / ACK and both reach ESTABLISHED.
+            let tcp_ok = net::tcp_handshake_loopback_selftest();
+            serial_println!(
+                "[ OK ] net 21b: TCP handshake over loopback = {} ({} segment(s) parsed)",
+                tcp_ok,
+                net::tcp_segments_received(),
+            );
+
             match net::ping(gw) {
                 Some(seq) => {
                     serial_println!(

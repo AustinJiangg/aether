@@ -1221,6 +1221,23 @@ fn net_udp_echoes_over_loopback() {
     assert!(net::udp_delivered() > 0, "we received no echoed datagram back");
 }
 
+/// Stage 21b: the TCP three-way handshake bidirectionally, via loopback (no external peer). Listen on a
+/// port and connect to ourselves: the SYN / SYN-ACK / ACK exchange loops back so a client TCB and a
+/// server TCB both reach ESTABLISHED — exercising the active and passive opens, the sequence-number
+/// bookkeeping, and the segment build/parse + checksum on the wire.
+#[test_case]
+fn tcp_completes_handshake_over_loopback() {
+    use crate::net;
+
+    assert!(crate::e1000::present(), "e1000 not initialized");
+    assert!(net::tcp_handshake_loopback_selftest(), "TCP handshake over loopback failed");
+    assert_eq!(
+        crate::net::tcp::established_count(),
+        2,
+        "both the client and server TCBs should be ESTABLISHED"
+    );
+}
+
 /// Stage 19b-2: the live DNS resolver — resolve a hostname through SLIRP's DNS server over the wire.
 /// Unlike the SLIRP-internal gateway ping, this depends on the *host* having working upstream DNS
 /// (SLIRP forwards to it), so the test is lenient: it always exercises the full path (build the query,

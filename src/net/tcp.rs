@@ -41,9 +41,12 @@
 //! 20-byte header with no options. Everything multi-byte is big-endian. Unlike UDP, the TCP checksum is
 //! **mandatory** and there is no "0 becomes 0xFFFF" rule (a zero field would just be a wrong checksum).
 
-#![allow(dead_code)] // the connection state machine that drives this is wired up in Stage 21b+
+#![allow(dead_code)] // a few completeness items (states/flags) are unused until later sub-steps
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
+
+use spin::Mutex;
 
 use super::ipv4;
 
@@ -153,4 +156,248 @@ pub fn checksum(src_ip: [u8; 4], dst_ip: [u8; 4], segment: &[u8]) -> u16 {
     buf.extend_from_slice(&(segment.len() as u16).to_be_bytes()); // TCP length (header + data)
     buf.extend_from_slice(segment);
     ipv4::checksum(&buf)
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Stage 21b: the connection state machine (the three-way handshake).
+//
+// TCP is a *stateful* protocol: unlike UDP, each side keeps a small record — a **Transmission Control
+// Block (TCB)** — per connection, tracking where it is in the connection's lifecycle and the sequence
+// numbers that make the byte stream reliable. Opening a connection is the **three-way handshake**:
+//
+// ```text
+//   active opener (client)                     passive opener (server)
+//     CLOSED                                       LISTEN
+//       |  --- SYN, seq=x ------------------------->  |
+//       |                                    SYN_RECEIVED
+//     SYN_SENT                                        |
+//       |  <-- SYN, ACK, seq=y, ack=x+1 ------------  |
+//       |  --- ACK, seq=x+1, ack=y+1 -------------->  |
+//     ESTABLISHED                                 ESTABLISHED
+// ```
+//
+// A **SYN consumes one sequence number** (so the client's next byte is x+1), which is why the peer
+// acknowledges x+1. The initial sequence numbers (x, y) are each side's ISS (initial send sequence).
+// ---------------------------------------------------------------------------------------------------
+
+/// The receive window we advertise, in bytes. Fixed for now; real flow control comes in a later step.
+const DEFAULT_WINDOW: u16 = 64240;
+
+/// The connection lifecycle states this sub-step needs (a subset of RFC 793's eleven — teardown states
+/// arrive with the FIN handshake later).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum State {
+    Closed,
+    Listen,
+    SynSent,
+    SynReceived,
+    Established,
+}
+
+/// A Transmission Control Block: everything TCP tracks for one connection. Stage 21b uses only what the
+/// handshake needs — the state, the port/address tuple identifying the connection, and the send/receive
+/// **sequence bookkeeping** (RFC 793's send and receive sequence spaces). Data buffers, real windows,
+/// and retransmission timers come in later sub-steps.
+struct Tcb {
+    state: State,
+    local_port: u16,
+    remote_port: u16,
+    remote_ip: [u8; 4],
+    /// Send space: `una` = oldest unacknowledged seq, `nxt` = next seq to send, `iss` = our initial seq.
+    snd_una: u32,
+    snd_nxt: u32,
+    iss: u32,
+    /// Receive space: `nxt` = next seq we expect from the peer, `irs` = the peer's initial seq.
+    rcv_nxt: u32,
+    irs: u32,
+}
+
+/// The connection table. Small and linear — one entry per connection (and one per listener). A real
+/// stack keys a hash map by the 4-tuple; a `Vec` scanned by port is plenty for our handful of
+/// connections. Behind a `Mutex`, since `poll` (hence `on_segment`) can run from more than one thread.
+static CONNECTIONS: Mutex<Vec<Tcb>> = Mutex::new(Vec::new());
+
+/// Generates a distinct initial sequence number per connection. A real stack derives the ISN from a
+/// clock so a stale duplicate from an old connection cannot look current; a striding counter suffices
+/// here (each connection's sequence space starts far from its neighbors').
+static ISN_GEN: AtomicU32 = AtomicU32::new(0x0001_0000);
+fn next_isn() -> u32 {
+    ISN_GEN.fetch_add(0x0001_0000, Ordering::Relaxed)
+}
+
+/// Register a passive open (a **listener**) on `local_port`: a TCB in [`State::Listen`] that will accept
+/// an incoming SYN. Idempotent — a second listen on the same port is ignored. (Minimal model: the
+/// listener itself becomes the connection on the first SYN, rather than forking a fresh TCB and staying
+/// open for more, which is all the loopback handshake test needs.)
+pub fn open_passive(local_port: u16) {
+    let mut table = CONNECTIONS.lock();
+    if table.iter().any(|c| c.state == State::Listen && c.local_port == local_port) {
+        return;
+    }
+    table.push(Tcb {
+        state: State::Listen,
+        local_port,
+        remote_port: 0,
+        remote_ip: [0; 4],
+        snd_una: 0,
+        snd_nxt: 0,
+        iss: 0,
+        rcv_nxt: 0,
+        irs: 0,
+    });
+}
+
+/// Start an active open: create a TCB in [`State::SynSent`] for the `local_port -> remote_ip:remote_port`
+/// connection and return the **SYN segment** to transmit (built with the pseudo-header checksum, so the
+/// caller needs `local_ip` for it). The SYN carries our ISS and consumes one sequence number.
+pub fn open_active(
+    local_ip: [u8; 4],
+    remote_ip: [u8; 4],
+    local_port: u16,
+    remote_port: u16,
+) -> Vec<u8> {
+    let iss = next_isn();
+    let mut table = CONNECTIONS.lock();
+    table.push(Tcb {
+        state: State::SynSent,
+        local_port,
+        remote_port,
+        remote_ip,
+        snd_una: iss,
+        snd_nxt: iss.wrapping_add(1), // SYN consumes one sequence number
+        iss,
+        rcv_nxt: 0, // unknown until the SYN-ACK tells us the peer's ISN
+        irs: 0,
+    });
+    build(local_ip, remote_ip, local_port, remote_port, iss, 0, SYN, DEFAULT_WINDOW, &[])
+}
+
+/// Process one received TCP segment against the connection table, advancing the relevant TCB's state
+/// machine and returning an optional **response segment** to transmit (a SYN-ACK or ACK during the
+/// handshake). `local_ip` is our address and `remote_ip` is the segment's source (both needed for the
+/// response checksum). Returns `None` when no segment need be sent. The response is built while the lock
+/// is held but the lock is released before this returns, so the caller transmits without holding it.
+pub fn on_segment(local_ip: [u8; 4], remote_ip: [u8; 4], seg: &Segment) -> Option<Vec<u8>> {
+    let mut table = CONNECTIONS.lock();
+
+    // 1. An existing (non-listening) connection for this exact 4-tuple? Advance its state machine.
+    if let Some(idx) = table.iter().position(|c| {
+        c.state != State::Listen
+            && c.local_port == seg.dst_port
+            && c.remote_port == seg.src_port
+            && c.remote_ip == remote_ip
+    }) {
+        return step(&mut table[idx], local_ip, remote_ip, seg);
+    }
+
+    // 2. Otherwise, a listener on the destination port accepting a fresh SYN (passive open).
+    if let Some(idx) = table
+        .iter()
+        .position(|c| c.state == State::Listen && c.local_port == seg.dst_port)
+    {
+        // Only a bare SYN (not SYN-ACK) opens a connection; anything else to a listener is ignored.
+        if seg.flags & SYN != 0 && seg.flags & ACK == 0 {
+            let iss = next_isn();
+            let tcb = &mut table[idx];
+            tcb.remote_ip = remote_ip;
+            tcb.remote_port = seg.src_port;
+            tcb.irs = seg.seq;
+            tcb.rcv_nxt = seg.seq.wrapping_add(1); // the peer's SYN consumes one seq
+            tcb.iss = iss;
+            tcb.snd_una = iss;
+            tcb.snd_nxt = iss.wrapping_add(1); // our SYN consumes one seq
+            tcb.state = State::SynReceived;
+            return Some(build(
+                local_ip,
+                remote_ip,
+                tcb.local_port,
+                tcb.remote_port,
+                iss,
+                tcb.rcv_nxt,
+                SYN | ACK,
+                DEFAULT_WINDOW,
+                &[],
+            ));
+        }
+    }
+
+    // 3. No connection and no listener — a real stack would reply RST; we simply drop it for now.
+    None
+}
+
+/// Advance one established-or-half-open connection by one received segment. Handshake-only for Stage
+/// 21b: complete the active open (SYN-ACK -> send ACK, ESTABLISHED) and the passive open (final ACK ->
+/// ESTABLISHED). Data segments in [`State::Established`] are ignored until the data-transfer sub-step.
+fn step(tcb: &mut Tcb, local_ip: [u8; 4], remote_ip: [u8; 4], seg: &Segment) -> Option<Vec<u8>> {
+    match tcb.state {
+        State::SynSent => {
+            // Expect the SYN-ACK: it must acknowledge our SYN (ack == snd_nxt == iss + 1).
+            if seg.flags & SYN != 0 && seg.flags & ACK != 0 && seg.ack == tcb.snd_nxt {
+                tcb.irs = seg.seq;
+                tcb.rcv_nxt = seg.seq.wrapping_add(1);
+                tcb.snd_una = seg.ack;
+                tcb.state = State::Established;
+                // Complete the handshake with the final ACK.
+                return Some(build(
+                    local_ip,
+                    remote_ip,
+                    tcb.local_port,
+                    tcb.remote_port,
+                    tcb.snd_nxt,
+                    tcb.rcv_nxt,
+                    ACK,
+                    DEFAULT_WINDOW,
+                    &[],
+                ));
+            }
+            None
+        }
+        State::SynReceived => {
+            // A retransmitted SYN (the peer never got our SYN-ACK): resend the SYN-ACK, same ISN.
+            if seg.flags & SYN != 0 && seg.flags & ACK == 0 && seg.seq == tcb.irs {
+                return Some(build(
+                    local_ip,
+                    remote_ip,
+                    tcb.local_port,
+                    tcb.remote_port,
+                    tcb.iss,
+                    tcb.rcv_nxt,
+                    SYN | ACK,
+                    DEFAULT_WINDOW,
+                    &[],
+                ));
+            }
+            // Otherwise expect the final ACK that acknowledges our SYN-ACK.
+            if seg.flags & ACK != 0 && seg.ack == tcb.snd_nxt {
+                tcb.snd_una = seg.ack;
+                tcb.state = State::Established;
+            }
+            None
+        }
+        _ => None, // Established (data) and teardown states are handled in later sub-steps
+    }
+}
+
+/// The state of the connection identified by `(local_port, remote_port)`, or `None` if there is no such
+/// TCB. Used by the connection driver in `net` to wait for [`State::Established`], and by tests.
+pub fn connection_state(local_port: u16, remote_port: u16) -> Option<State> {
+    CONNECTIONS
+        .lock()
+        .iter()
+        .find(|c| c.local_port == local_port && c.remote_port == remote_port)
+        .map(|c| c.state)
+}
+
+/// How many connections are currently [`State::Established`] (both ends of a loopback handshake count).
+pub fn established_count() -> usize {
+    CONNECTIONS
+        .lock()
+        .iter()
+        .filter(|c| c.state == State::Established)
+        .count()
+}
+
+/// Drop all connections (and listeners). Used to isolate the loopback self-test/tests from each other.
+pub fn reset_connections() {
+    CONNECTIONS.lock().clear();
 }
