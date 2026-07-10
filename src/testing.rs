@@ -1148,6 +1148,52 @@ fn dhcp_message_builds_and_parses() {
     assert!(dhcp::parse_reply(&[0u8; 8], xid).is_none(), "a runt is rejected");
 }
 
+/// Stage 21a: the TCP layer builds and parses segments, with a correct pseudo-header checksum. Pure
+/// logic (no connection): build a SYN, check its header fields (seq, data offset, flags) and that it
+/// self-checksums to zero, round-trip the fields, parse a segment that carries options (data offset > 5)
+/// to confirm the payload starts after them, and reject a runt and a bogus data offset.
+#[test_case]
+fn tcp_segment_builds_and_parses() {
+    use crate::net::tcp;
+
+    let src_ip = [10, 0, 2, 15];
+    let dst_ip = [10, 0, 2, 2];
+    // A pure SYN (no payload): our initial sequence number, an advertised window, the SYN flag.
+    let seq = 0x1122_3344;
+    let syn = tcp::build(src_ip, dst_ip, 40000, 80, seq, 0, tcp::SYN, 64240, &[]);
+    assert_eq!(syn.len(), tcp::HEADER_LEN, "a flags-only segment is just the header");
+    assert_eq!(&syn[4..8], &seq.to_be_bytes(), "sequence number");
+    assert_eq!(syn[12] >> 4, 5, "data offset = 5 words (20-byte header, no options)");
+    assert_eq!(syn[13], tcp::SYN, "only the SYN flag is set");
+    assert_eq!(
+        tcp::checksum(src_ip, dst_ip, &syn),
+        0,
+        "a built segment must carry a valid pseudo-header checksum"
+    );
+
+    let s = tcp::Segment::parse(&syn).expect("built SYN should parse");
+    assert_eq!(s.src_port, 40000);
+    assert_eq!(s.dst_port, 80);
+    assert_eq!(s.seq, seq);
+    assert_eq!(s.flags, tcp::SYN);
+    assert_eq!(s.window, 64240);
+    assert!(s.payload.is_empty(), "a SYN carries no stream data");
+
+    // A segment with a data offset of 6 words (24-byte header): 4 option bytes then the payload "hi".
+    // The parser must skip the options and return just "hi".
+    let mut with_opts = tcp::build(src_ip, dst_ip, 80, 40000, 0, seq + 1, tcp::ACK, 100, b"hi");
+    with_opts[12] = 6 << 4; // claim a 24-byte header ...
+    with_opts.splice(tcp::HEADER_LEN..tcp::HEADER_LEN, [0x02, 0x04, 0x05, 0xB4]); // ... insert an MSS option
+    let s2 = tcp::Segment::parse(&with_opts).expect("segment with options should parse");
+    assert_eq!(s2.flags, tcp::ACK);
+    assert_eq!(s2.payload, b"hi", "payload must start after the options");
+
+    assert!(tcp::Segment::parse(&[0u8; 10]).is_none(), "a runt must not parse as TCP");
+    let mut bad = syn.clone();
+    bad[12] = 0xF0; // data offset 15 words = 60 bytes, past this 20-byte buffer
+    assert!(tcp::Segment::parse(&bad).is_none(), "a data offset past the buffer is rejected");
+}
+
 /// Stage 18c: the full ICMP path bidirectionally, via loopback (no external peer). Send an echo
 /// request to ourselves; the stack answers it and receives its own reply — exercising build, parse,
 /// checksum, dispatch, the reply we generate, and receiving that reply.

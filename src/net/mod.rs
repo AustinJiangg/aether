@@ -47,6 +47,7 @@ pub mod dns;
 pub mod ether;
 pub mod icmp;
 pub mod ipv4;
+pub mod tcp;
 pub mod udp;
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
