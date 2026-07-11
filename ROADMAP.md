@@ -691,10 +691,30 @@ unify later.
 > bytes, and confirms the refused data is finally **admitted** once there is room (redelivered by the Stage
 > 21e retransmission timer) — boot logs "TCP flow control over loopback = true". Verified by 75 tests (the
 > new `tcp_enforces_receive_window`). Simplifications kept for teaching clarity: the out-of-order
-> reassembly queue is not charged against the window, and reopening relies on the peer's retransmission
-> rather than a proactive window-update ACK or a zero-window persist timer. (The **sender** honoring the
-> peer's advertised window — the other half of the sliding window — is Stage 22c; congestion control is
-> 22d.)
+> reassembly queue is not charged against the window, and reopening relies on the sender's retransmission
+> (Stage 22c's probe) rather than a proactive window-update ACK.
+>
+> **Stage 22c is done — the sender's sliding window (the other half of flow control).** Stage 22b made the
+> *receiver* advertise an honest window; 22c makes the *sender* obey it. The `Tcb` grows `snd_wnd` (the
+> peer's most recently advertised window, learned from the `window` field of every acceptable segment) and
+> `snd_buf` (a **send buffer** of queued-but-unsent bytes). The send path splits in two: `queue_send`
+> appends application bytes to `snd_buf`, and `flush` transmits as many as the window admits —
+> `usable = snd_wnd - inflight` — in `MSS`-sized segments, leaving the rest buffered. `flush` runs right
+> after a `queue_send` and once per `net::poll`, so a window that reopens (an ACK advancing the peer's
+> window, or the peer reading its buffer) is promptly used. The hard part is the **zero-window deadlock**:
+> if the peer advertises zero and we have nothing in flight to prompt a fresh ACK, we would stall forever
+> (this minimal stack sends no proactive window update). The fix is the classic **zero-window probe** — a
+> one-byte segment sent past `snd_una` that the peer drops-and-re-ACKs until its window reopens, when it
+> accepts the byte and its ACK carries the new window; the probe rides the ordinary retransmit queue, so
+> the **Stage 21e timer resends it — doubling as the persist timer**, no new clock. Proved deterministically
+> with no peer via PHY loopback: `tcp_sender_window_loopback_selftest` hands the sender more than the peer's
+> window, confirms it caps in-flight data at the window and buffers the excess (segmented into ≥2 MSS
+> pieces), then drains the receiver so the buffered remainder flows out — via the probe — until all bytes
+> arrive **in order** and acknowledged — boot logs "TCP sender window over loopback = true (... delivered
+> 2560/2560 in order)". Verified by 76 tests (the new `tcp_sender_obeys_peer_window`). This completes the
+> bidirectional sliding window (receiver advertises, sender obeys, zero-window probe). (**Congestion
+> control** — slow start / congestion avoidance / fast retransmit, pacing the sender to the *network*
+> rather than the peer — is the remaining refinement, Stage 22d.)
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

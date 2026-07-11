@@ -197,6 +197,12 @@ fn recv_window(tcb: &Tcb) -> u16 {
     window_for(tcb.rx.len())
 }
 
+/// Stage 22c: the **maximum segment size** — the most stream data we put in one segment. Capped well under
+/// the link's frame budget (an e1000 receive buffer is 2048 bytes, minus the 14+20+20-byte Ethernet/IP/TCP
+/// headers), so a segment always fits one frame; it also forces a large send to be *segmented*, exercising
+/// the sender's windowing. A real stack learns the peer's MSS from a SYN option; we fix it.
+const MSS: usize = 1024;
+
 // Stage 21e: retransmission-timer constants. Time is measured in timer ticks (`interrupts::timer_ticks`,
 // 100 Hz, so 1 tick = 10 ms). A real stack estimates the retransmission timeout from measured round-trip
 // times (RFC 6298); fixed, short values are enough to *demonstrate* recovery deterministically.
@@ -262,6 +268,15 @@ pub fn out_of_order_buffered() -> u64 {
     OOO_BUFFERED.load(Ordering::Relaxed)
 }
 
+/// Stage 22c: how many data-carrying segments [`flush`] has emitted, over the whole run — a test reads it
+/// to confirm a large send was actually *segmented* into multiple MSS-sized pieces (not sent whole).
+static DATA_SEGMENTS_SENT: AtomicU64 = AtomicU64::new(0);
+
+/// Total data segments the sender has emitted since boot (Stage 22c; see [`DATA_SEGMENTS_SENT`]).
+pub fn data_segments_sent() -> u64 {
+    DATA_SEGMENTS_SENT.load(Ordering::Relaxed)
+}
+
 /// The connection lifecycle states (RFC 793). The opening subset — `Closed`/`Listen`/`SynSent`/
 /// `SynReceived`/`Established` — is the three-way handshake (Stage 21b); the rest are the **teardown**
 /// states of the FIN handshake (Stage 21d). TCP is full-duplex, so each direction closes independently:
@@ -302,6 +317,13 @@ struct Tcb {
     snd_una: u32,
     snd_nxt: u32,
     iss: u32,
+    /// Stage 22c: the peer's most recently advertised **receive window** — how many bytes past `snd_una`
+    /// the peer is currently willing to accept. The sender never puts more than this many bytes in flight
+    /// (`snd_nxt - snd_una <= snd_wnd`). Learned from the `window` field of every acceptable segment.
+    snd_wnd: u32,
+    /// Stage 22c: the **send buffer** — application bytes queued to send but not yet transmitted (because
+    /// the window had no room). [`flush`] drains it into segments as the window allows.
+    snd_buf: Vec<u8>,
     /// Receive space: `nxt` = next seq we expect from the peer, `irs` = the peer's initial seq.
     rcv_nxt: u32,
     irs: u32,
@@ -349,6 +371,8 @@ pub fn open_passive(local_port: u16) {
         snd_una: 0,
         snd_nxt: 0,
         iss: 0,
+        snd_wnd: 0,
+        snd_buf: Vec::new(),
         rcv_nxt: 0,
         irs: 0,
         rx: Vec::new(),
@@ -377,6 +401,8 @@ pub fn open_active(
         snd_una: iss,
         snd_nxt: iss.wrapping_add(1), // SYN consumes one sequence number
         iss,
+        snd_wnd: 0, // unknown until the SYN-ACK advertises the peer's window
+        snd_buf: Vec::new(),
         rcv_nxt: 0, // unknown until the SYN-ACK tells us the peer's ISN
         irs: 0,
         rx: Vec::new(),
@@ -421,6 +447,7 @@ pub fn on_segment(local_ip: [u8; 4], remote_ip: [u8; 4], seg: &Segment) -> Optio
             tcb.iss = iss;
             tcb.snd_una = iss;
             tcb.snd_nxt = iss.wrapping_add(1); // our SYN consumes one seq
+            tcb.snd_wnd = seg.window as u32; // learn the peer's receive window from its SYN (Stage 22c)
             tcb.state = State::SynReceived;
             return Some(build(
                 local_ip,
@@ -451,6 +478,7 @@ fn step(tcb: &mut Tcb, local_ip: [u8; 4], remote_ip: [u8; 4], seg: &Segment) -> 
                 tcb.irs = seg.seq;
                 tcb.rcv_nxt = seg.seq.wrapping_add(1);
                 tcb.snd_una = seg.ack;
+                tcb.snd_wnd = seg.window as u32; // learn the peer's window from its SYN-ACK (Stage 22c)
                 tcb.state = State::Established;
                 // Complete the handshake with the final ACK.
                 return Some(build(
@@ -485,6 +513,7 @@ fn step(tcb: &mut Tcb, local_ip: [u8; 4], remote_ip: [u8; 4], seg: &Segment) -> 
             // Otherwise expect the final ACK that acknowledges our SYN-ACK.
             if seg.flags & ACK != 0 && seg.ack == tcb.snd_nxt {
                 tcb.snd_una = seg.ack;
+                tcb.snd_wnd = seg.window as u32; // learn the peer's window from the final ACK (Stage 22c)
                 tcb.state = State::Established;
             }
             None
@@ -601,6 +630,9 @@ fn process_ack(tcb: &mut Tcb, seg: &Segment) {
     if seg.flags & ACK == 0 {
         return;
     }
+    // Stage 22c: track the peer's advertised window from every acceptable ACK (including a pure
+    // window-update / duplicate ACK), so the sender's [`flush`] paces to it.
+    tcb.snd_wnd = seg.window as u32;
     let acked = seg.ack.wrapping_sub(tcb.snd_una);
     let outstanding = tcb.snd_nxt.wrapping_sub(tcb.snd_una);
     if acked <= outstanding {
@@ -741,22 +773,31 @@ fn drain_ooo(tcb: &mut Tcb) {
     }
 }
 
-/// Stage 21c: queue application data to send on the ESTABLISHED connection `(local_port -> remote_port)`,
-/// and return the **data segment** to transmit together with the peer's IP (which the caller needs to
-/// frame it). The segment carries `seq = snd_nxt` (the next unsent stream position), acknowledges the
-/// peer up to `rcv_nxt`, and sets `PSH | ACK` ("deliver this data now"); `snd_nxt` then advances over the
-/// bytes. `local_ip` is needed for the pseudo-header checksum. Returns `None` if there is no such
-/// established connection. (No retransmission buffer yet — Stage 21e keeps the unacked bytes for resend.)
-pub fn send_data(
-    local_ip: [u8; 4],
-    local_port: u16,
-    remote_port: u16,
-    data: &[u8],
-) -> Option<(Vec<u8>, [u8; 4])> {
+/// Stage 22c: queue application data to send on the ESTABLISHED connection `(local_port -> remote_port)`.
+/// The bytes go into the connection's **send buffer**; [`flush`] then transmits as many as the peer's
+/// advertised window admits. Returns `false` if there is no such established connection. Splitting "queue"
+/// from "transmit" is what lets the sender obey flow control — the buffer holds bytes the window has no
+/// room for yet, and they leave later as ACKs open the window.
+pub fn queue_send(local_port: u16, remote_port: u16, data: &[u8]) -> bool {
     let mut table = CONNECTIONS.lock();
-    let tcb = table.iter_mut().find(|c| {
+    match table.iter_mut().find(|c| {
         c.state == State::Established && c.local_port == local_port && c.remote_port == remote_port
-    })?;
+    }) {
+        Some(tcb) => {
+            tcb.snd_buf.extend_from_slice(data);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Stage 22c: build and record one data segment carrying the next `n` bytes of the send buffer, and return
+/// it for transmission. Drains `n` bytes from `snd_buf`, stamps `seq = snd_nxt` (advancing it), sets
+/// `PSH | ACK`, and queues the segment on the retransmit list so a lost data segment is recovered (Stage
+/// 21e). `n` must be `> 0` and `<= snd_buf.len()`.
+fn emit_segment(tcb: &mut Tcb, local_ip: [u8; 4], n: usize) -> Vec<u8> {
+    let chunk: Vec<u8> = tcb.snd_buf.drain(..n).collect();
+    let win = recv_window(tcb);
     let seg = build(
         local_ip,
         tcb.remote_ip,
@@ -765,20 +806,57 @@ pub fn send_data(
         tcb.snd_nxt,
         tcb.rcv_nxt,
         PSH | ACK,
-        recv_window(tcb),
-        data,
+        win,
+        &chunk,
     );
-    tcb.snd_nxt = tcb.snd_nxt.wrapping_add(data.len() as u32);
-    // Stage 21e: queue this segment for retransmission until the peer acknowledges it.
-    if !data.is_empty() {
-        tcb.retransmit.push(Unacked {
-            end_seq: tcb.snd_nxt,
-            deadline: now_ticks() + RTO_TICKS,
-            tries: 0,
-            segment: seg.clone(),
-        });
+    tcb.snd_nxt = tcb.snd_nxt.wrapping_add(n as u32);
+    tcb.retransmit.push(Unacked {
+        end_seq: tcb.snd_nxt,
+        deadline: now_ticks() + RTO_TICKS,
+        tries: 0,
+        segment: seg.clone(),
+    });
+    DATA_SEGMENTS_SENT.fetch_add(1, Ordering::Relaxed);
+    seg
+}
+
+/// Stage 22c: the sender's half of the **sliding window** — for every established connection, transmit as
+/// much queued data as the peer's advertised window ([`Tcb::snd_wnd`]) allows, in [`MSS`]-sized segments,
+/// leaving the rest in the send buffer for a later call. Returns the segments to transmit (with each
+/// peer's IP), built under the lock and sent by the caller after it is released. Call once per [`super::poll`]
+/// (so a window that reopens is promptly used) and right after [`queue_send`].
+///
+/// **Zero-window probe.** If the peer advertised a window of zero and we have nothing in flight to prompt a
+/// fresh ACK, we would otherwise stall forever (the peer, in this minimal stack, sends no window update
+/// when its buffer drains). So we send a **one-byte probe** past `snd_una`: the peer drops it and re-ACKs
+/// (still zero) until its window reopens, when it accepts the byte and its ACK carries the new window. The
+/// probe rides the ordinary retransmit queue, so the Stage 21e timer resends it — serving as our persist
+/// timer, no separate clock needed.
+pub fn flush(local_ip: [u8; 4]) -> Vec<(Vec<u8>, [u8; 4])> {
+    let mut out = Vec::new();
+    let mut table = CONNECTIONS.lock();
+    for tcb in table.iter_mut() {
+        if tcb.state != State::Established {
+            continue;
+        }
+        while !tcb.snd_buf.is_empty() {
+            let inflight = tcb.snd_nxt.wrapping_sub(tcb.snd_una);
+            let usable = tcb.snd_wnd.saturating_sub(inflight);
+            if usable == 0 {
+                // Window-blocked. On a true zero window with nothing in flight, send a one-byte probe to
+                // keep the connection moving; otherwise wait for the in-flight data's ACKs to open it.
+                if tcb.snd_wnd == 0 && inflight == 0 {
+                    let seg = emit_segment(tcb, local_ip, 1);
+                    out.push((seg, tcb.remote_ip));
+                }
+                break;
+            }
+            let n = core::cmp::min(usable as usize, tcb.snd_buf.len()).min(MSS);
+            let seg = emit_segment(tcb, local_ip, n);
+            out.push((seg, tcb.remote_ip));
+        }
     }
-    Some((seg, tcb.remote_ip))
+    out
 }
 
 /// Stage 21d: close our end of the connection `(local_port -> remote_port)` — the application is done
@@ -856,14 +934,35 @@ pub fn receive_window(local_port: u16, remote_port: u16) -> Option<u16> {
         .map(recv_window)
 }
 
-/// Stage 21c: whether every byte we have sent on `(local_port, remote_port)` has been acknowledged by the
-/// peer (`snd_una == snd_nxt`, i.e. nothing outstanding). `None` if no such connection.
+/// Stage 21c: whether every byte the application has handed us on `(local_port, remote_port)` has been
+/// sent *and* acknowledged — nothing outstanding (`snd_una == snd_nxt`) and nothing still queued to send
+/// (`snd_buf` empty, Stage 22c). `None` if no such connection.
 pub fn all_data_acked(local_port: u16, remote_port: u16) -> Option<bool> {
     CONNECTIONS
         .lock()
         .iter()
         .find(|c| c.local_port == local_port && c.remote_port == remote_port)
-        .map(|c| c.snd_una == c.snd_nxt)
+        .map(|c| c.snd_una == c.snd_nxt && c.snd_buf.is_empty())
+}
+
+/// Stage 22c: bytes currently **in flight** on `(local_port, remote_port)` — sent but not yet acknowledged
+/// (`snd_nxt - snd_una`). Never exceeds the peer's advertised window; the flow-control self-test checks it.
+pub fn bytes_in_flight(local_port: u16, remote_port: u16) -> Option<u32> {
+    CONNECTIONS
+        .lock()
+        .iter()
+        .find(|c| c.local_port == local_port && c.remote_port == remote_port)
+        .map(|c| c.snd_nxt.wrapping_sub(c.snd_una))
+}
+
+/// Stage 22c: bytes still queued in the **send buffer** of `(local_port, remote_port)` — handed to us by
+/// the application but not yet transmitted because the window had no room. `None` if no such connection.
+pub fn send_buffered(local_port: u16, remote_port: u16) -> Option<usize> {
+    CONNECTIONS
+        .lock()
+        .iter()
+        .find(|c| c.local_port == local_port && c.remote_port == remote_port)
+        .map(|c| c.snd_buf.len())
 }
 
 /// The state of the connection identified by `(local_port, remote_port)`, or `None` if there is no such

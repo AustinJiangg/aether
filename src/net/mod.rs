@@ -208,6 +208,10 @@ pub fn poll() -> usize {
         }
     }
 
+    // Stage 22c: send any queued data the peer's window now admits — a window that reopened (via an ACK
+    // processed on a previous poll, or a read that drained our own receive buffer) is used here.
+    transmit_tcp_flush(tcp::flush(our_ip()));
+
     let mut buf = [0u8; 2048];
     let mut n = 0;
     while let Some(len) = e1000::poll_frame(&mut buf) {
@@ -782,27 +786,34 @@ pub fn tcp_connect(remote_ip: [u8; 4], remote_port: u16) -> Option<u16> {
     None
 }
 
-/// Stage 21c: send application `data` on the established TCP connection `(local_port -> remote_port)`.
-/// Builds a data segment ([`tcp::send_data`], which advances the connection's send sequence), frames it
-/// as TCP-in-IPv4-in-Ethernet to the peer, and transmits. Returns `false` if there is no such established
-/// connection, or the peer's MAC cannot be resolved. The peer's ACK is processed by [`poll`]/[`handle_tcp`]
-/// when it arrives; there is no retransmission if this segment is lost (Stage 21e adds the timer).
+/// Stage 22c: transmit the segments a [`tcp::flush`] produced (queued data the window now admits, or a
+/// zero-window probe), each framed as TCP-in-IPv4-in-Ethernet to its peer. Uses the cache-only next-hop
+/// (an established connection's peer MAC is already resolved, or is our own for loopback) and goes through
+/// [`tx_tcp`] so the loss/reorder fault hooks still apply.
+fn transmit_tcp_flush(segments: Vec<(Vec<u8>, [u8; 4])>) {
+    for (seg, remote_ip) in segments {
+        if let Some(mac) = tcp_resend_next_hop(remote_ip) {
+            let frame = ether::build(
+                mac,
+                our_mac(),
+                ether::ETHERTYPE_IPV4,
+                &ipv4::build(our_ip(), remote_ip, tcp::PROTO_TCP, &seg),
+            );
+            tx_tcp(&frame);
+        }
+    }
+}
+
+/// Stage 21c/22c: send application `data` on the established TCP connection `(local_port -> remote_port)`.
+/// The bytes are **queued** ([`tcp::queue_send`]); [`tcp::flush`] then transmits as many as the peer's
+/// advertised window admits, leaving any excess buffered to leave later (as ACKs open the window, driven
+/// by [`poll`]). Returns `false` if there is no such established connection. A lost segment is recovered by
+/// the Stage 21e retransmission timer.
 pub fn tcp_send(local_port: u16, remote_port: u16, data: &[u8]) -> bool {
-    let (seg, remote_ip) = match tcp::send_data(our_ip(), local_port, remote_port, data) {
-        Some(x) => x,
-        None => return false, // no established connection with this port pair
-    };
-    let mac = match tcp_next_hop(remote_ip) {
-        Some(m) => m,
-        None => return false, // cannot resolve the peer's MAC (no route)
-    };
-    let frame = ether::build(
-        mac,
-        our_mac(),
-        ether::ETHERTYPE_IPV4,
-        &ipv4::build(our_ip(), remote_ip, tcp::PROTO_TCP, &seg),
-    );
-    tx_tcp(&frame); // Stage 21e: droppable, so the retransmission timer can be exercised
+    if !tcp::queue_send(local_port, remote_port, data) {
+        return false; // no established connection with this port pair
+    }
+    transmit_tcp_flush(tcp::flush(our_ip()));
     true
 }
 
@@ -1156,6 +1167,84 @@ pub fn tcp_flow_control_loopback_selftest() -> bool {
     serial_println!(
         "[net] TCP flow-control loopback selftest: filled rx {} window {}, refused-beyond {}, read {} -> window {}, re-admitted {}, ok = {}",
         filled_rx, filled_window, refused, drained, reopened_window, admitted, ok,
+    );
+    ok
+}
+
+/// Stage 22c self-test of the **sender's sliding window** with no external peer, via PHY loopback — the
+/// send-side counterpart to [`tcp_flow_control_loopback_selftest`]. Establish a loopback connection, then
+/// hand the sender **more data than the peer's window** in one call and check three things:
+///
+/// 1. **The sender respects the window.** Right after the send, no more than the peer's advertised window
+///    is in flight (the rest is buffered), and the send was **segmented** into MSS-sized pieces (not sent
+///    whole) — so a slow receiver cannot be overrun.
+/// 2. **The excess is buffered, not lost.** The bytes the window had no room for wait in the send buffer.
+/// 3. **It all arrives, in order.** As the application reads (reopening the window), the buffered remainder
+///    flows out — via the zero-window probe once the window had closed — until every byte has arrived in
+///    the original order and been acknowledged.
+///
+/// Returns whether all three held.
+pub fn tcp_sender_window_loopback_selftest() -> bool {
+    tcp::reset_connections();
+    let port: u16 = 7783;
+    tcp::open_passive(port);
+
+    e1000::set_loopback(true);
+    let mut sink = [0u8; 2048];
+    while e1000::poll_frame(&mut sink).is_some() {}
+
+    let client_port = match tcp_connect(our_ip(), port) {
+        Some(p) => p,
+        None => {
+            e1000::set_loopback(false);
+            serial_println!("[net] TCP sender-window loopback selftest: handshake failed");
+            return false;
+        }
+    };
+    for _ in 0..200 {
+        if tcp::established_count() >= 2 {
+            break;
+        }
+        poll();
+        crate::apic::pit_sleep_us(500);
+    }
+
+    // Hand the sender more than the peer's window in one call. A distinct byte pattern lets us verify the
+    // bytes arrive in the original order after being segmented, buffered, and probed out.
+    let window = tcp::receive_window(port, client_port).unwrap_or(0) as usize;
+    let total = window + 512;
+    let data: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+
+    let segs_before = tcp::data_segments_sent();
+    tcp_send(client_port, port, &data);
+
+    // 1 & 2: immediately (before any ACK is processed) the sender has put at most one window in flight and
+    // buffered the rest, and it segmented the send into at least two MSS pieces.
+    let in_flight = tcp::bytes_in_flight(client_port, port).unwrap_or(0) as usize;
+    let buffered = tcp::send_buffered(client_port, port).unwrap_or(0);
+    let segmented = tcp::data_segments_sent() - segs_before >= 2;
+    let respected = in_flight <= window && buffered > 0 && in_flight + buffered == total;
+
+    // 3: drain the receiver as data arrives, reopening the window so the buffered remainder flows out (the
+    // zero-window probe redelivers it once the window had closed), until every byte has arrived in order.
+    let mut got: Vec<u8> = Vec::new();
+    for _ in 0..8000 {
+        poll();
+        if let Some(chunk) = tcp_read(port, client_port, 4096) {
+            got.extend_from_slice(&chunk);
+        }
+        if got.len() >= total && tcp::all_data_acked(client_port, port) == Some(true) {
+            break;
+        }
+        crate::apic::pit_sleep_us(300);
+    }
+    e1000::set_loopback(false);
+
+    let in_order = got == data;
+    let ok = respected && segmented && in_order && got.len() == total;
+    serial_println!(
+        "[net] TCP sender-window loopback selftest: window {}, sent-then-in-flight {}, buffered {}, segmented {}, delivered {}/{} in order {}, ok = {}",
+        window, in_flight, buffered, segmented, got.len(), total, in_order, ok,
     );
     ok
 }

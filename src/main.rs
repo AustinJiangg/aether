@@ -941,6 +941,14 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             let tcp_flow_ok = net::tcp_flow_control_loopback_selftest();
             serial_println!("[ OK ] net 22b: TCP flow control over loopback = {}", tcp_flow_ok);
 
+            // Stage 22c (networking): the sender's sliding window. The sender now paces to the peer's
+            // advertised window — segmenting a large send, buffering what the window has no room for, and
+            // probing a zero window — so a slow receiver is never overrun. Prove it via loopback: hand the
+            // sender more than the window, confirm it caps in-flight data and buffers the rest, then read
+            // to reopen the window and watch every byte arrive in order.
+            let tcp_snd_ok = net::tcp_sender_window_loopback_selftest();
+            serial_println!("[ OK ] net 22c: TCP sender window over loopback = {}", tcp_snd_ok);
+
             match net::ping(gw) {
                 Some(seq) => {
                     serial_println!(

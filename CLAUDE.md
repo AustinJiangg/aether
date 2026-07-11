@@ -304,7 +304,14 @@ space (`recv_window`, capped at `RCV_WINDOW_MAX`), so it shrinks as unread data 
 full, and reopens when the app `read`s; the receive path enforces it (an in-order segment that does not fit
 the free window is dropped), and it is proved via loopback by filling the window to zero, confirming a
 further segment is refused, then reading to reopen it and watching the refused data get re-admitted.
-`ROADMAP.md` records the full staged history (stages 0-22b).
+**Stage 22c is also done**: the *sender's* sliding window — the `Tcb` grows `snd_wnd` (the peer's advertised
+window, learned from every acceptable segment) and `snd_buf` (a send buffer); `queue_send` buffers
+application bytes and `flush` (run after each `queue_send` and once per `poll`) transmits only as many as
+the window admits, in `MSS`-sized segments, sending a one-byte **zero-window probe** (recovered by the 21e
+timer, so it doubles as the persist timer) to break a zero-window deadlock. Proved via loopback by sending
+more than the peer's window and confirming the sender caps in-flight data, buffers the excess, and
+ultimately delivers everything in order once the receiver reads. `ROADMAP.md` records the full staged
+history (stages 0-22c).
 
 ## Language and writing conventions
 
@@ -806,7 +813,16 @@ Exit QEMU: `Ctrl-A` then `X`.
   dropped, keeping `rx` bounded), and `tcp::read`/`tcp::receive_window` (with `net::tcp_read`/
   `net::tcp_receive_window` wrappers) let the application drain data and observe the window.
   `net::tcp_flow_control_loopback_selftest` fills the window to zero, confirms a further segment is refused,
-  reads to reopen it, and confirms the refused data is then admitted (redelivered by the 21e timer).
+  reads to reopen it, and confirms the refused data is then admitted (redelivered by the 21e timer). **Stage
+  22c** adds the **sender's** half: the `Tcb` grows `snd_wnd` (the peer's advertised window, updated from
+  every acceptable segment in `process_ack` and at the handshake) and `snd_buf` (the send buffer); the old
+  `send_data` is replaced by `queue_send` (buffer application bytes) + `flush` (emit `MSS`-sized segments up
+  to `usable = snd_wnd - inflight`, run after each `queue_send` and once per `net::poll`). A closed window
+  with buffered data and nothing in flight triggers a one-byte **zero-window probe** that rides the 21e
+  retransmit queue (the persist timer). `net::tcp_send` now queues-then-flushes; accessors `bytes_in_flight`/
+  `send_buffered`/`data_segments_sent` back `net::tcp_sender_window_loopback_selftest`, which sends more than
+  the window and confirms the sender caps in-flight data, buffers the excess (segmented), and delivers it all
+  in order once the receiver reads.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

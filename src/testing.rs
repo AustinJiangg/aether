@@ -1304,6 +1304,19 @@ fn tcp_enforces_receive_window() {
     assert!(net::tcp_flow_control_loopback_selftest(), "TCP flow control over loopback failed");
 }
 
+/// Stage 22c: the TCP sender's sliding window via loopback (no external peer). Hand the sender more data
+/// than the peer's window in one call, confirm it caps in-flight data at the window and buffers the rest
+/// (segmented into MSS pieces), then drain the receiver so the buffered remainder flows out and confirm
+/// every byte arrives in order. Exercises the send buffer, window-limited flushing, MSS segmentation, and
+/// the zero-window probe.
+#[test_case]
+fn tcp_sender_obeys_peer_window() {
+    use crate::net;
+
+    assert!(crate::e1000::present(), "e1000 not initialized");
+    assert!(net::tcp_sender_window_loopback_selftest(), "TCP sender window over loopback failed");
+}
+
 /// Stage 19b-2: the live DNS resolver — resolve a hostname through SLIRP's DNS server over the wire.
 /// Unlike the SLIRP-internal gateway ping, this depends on the *host* having working upstream DNS
 /// (SLIRP forwards to it), so the test is lenient: it always exercises the full path (build the query,
