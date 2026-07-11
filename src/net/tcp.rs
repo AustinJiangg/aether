@@ -401,6 +401,9 @@ fn seq_lt(a: u32, b: u32) -> bool {
 /// Stage 21e: one unacknowledged outbound segment, retained so the retransmission timer can resend it if
 /// its ACK does not arrive in time. Dropped from the connection's queue once `snd_una` reaches `end_seq`.
 struct Unacked {
+    /// Stage 23d-2b: the send sequence number of this segment's first byte — its start edge, needed to test
+    /// whether an incoming SACK block (`[left, right)`) fully covers this segment.
+    start_seq: u32,
     /// The send sequence number just past this segment (its data/flags end); acknowledged once `snd_una`
     /// reaches or passes it (a FIN, like a SYN, contributes one to this beyond any data).
     end_seq: u32,
@@ -411,6 +414,10 @@ struct Unacked {
     /// Stage 23a: the tick at which this segment was *first* sent. When the segment is acknowledged and was
     /// never retransmitted (`tries == 0`, Karn's algorithm), `now - sent_at` is a clean RTT sample.
     sent_at: u64,
+    /// Stage 23d-2b: whether the peer has **selectively acknowledged** this segment (a SACK block covers it),
+    /// so it reached the peer even though the cumulative ACK has not yet advanced past it. A SACKed segment is
+    /// never retransmitted — the retransmit path skips it and resends only the gaps between SACKed data.
+    sacked: bool,
     /// The exact segment bytes (already checksummed) to retransmit verbatim.
     segment: Vec<u8>,
 }
@@ -466,6 +473,17 @@ static SACK_ACKS_SENT: AtomicU64 = AtomicU64::new(0);
 /// Total SACK-carrying ACKs built since boot (Stage 23d-2a; see [`SACK_ACKS_SENT`]).
 pub fn sack_acks_sent() -> u64 {
     SACK_ACKS_SENT.load(Ordering::Relaxed)
+}
+
+/// Stage 23d-2b: how many **extra** holes SACK guidance retransmitted — segments resent in a fast-retransmit
+/// event *beyond* the single one the pre-SACK sender would have resent. Nonzero only when SACK revealed more
+/// than one gap at once, so a test reads it to confirm the sender used the SACK blocks to recover multiple
+/// losses in one round trip (rather than one per RTT).
+static SACK_RETRANSMITS: AtomicU64 = AtomicU64::new(0);
+
+/// Total extra SACK-guided hole retransmissions since boot (Stage 23d-2b; see [`SACK_RETRANSMITS`]).
+pub fn sack_retransmits() -> u64 {
+    SACK_RETRANSMITS.load(Ordering::Relaxed)
 }
 
 /// The connection lifecycle states (RFC 793). The opening subset — `Closed`/`Listen`/`SynSent`/
@@ -566,6 +584,10 @@ struct Tcb {
     /// Stage 21e: the **retransmission queue** — outbound segments sent but not yet acknowledged, oldest
     /// first, kept so the timer can resend them if an ACK is late. Emptied as `snd_una` advances.
     retransmit: Vec<Unacked>,
+    /// Stage 23d-2b: extra hole segments to resend *now* from a SACK-guided fast retransmit, beyond the one
+    /// the state machine returns inline. When SACK reveals several gaps at once, they are all retransmitted in
+    /// one recovery event (not one per round trip); [`take_sack_resends`] drains this each [`super::poll`].
+    sack_resend: Vec<Vec<u8>>,
     /// Stage 21e: the tick at which a TIME_WAIT connection may finally close (set on entering TIME_WAIT).
     time_wait_deadline: u64,
 }
@@ -619,6 +641,7 @@ pub fn open_passive(local_port: u16) {
         rx: Vec::new(),
         ooo: Vec::new(),
         retransmit: Vec::new(),
+        sack_resend: Vec::new(),
         time_wait_deadline: 0,
     });
 }
@@ -661,6 +684,7 @@ pub fn open_active(
         rx: Vec::new(),
         ooo: Vec::new(),
         retransmit: Vec::new(),
+        sack_resend: Vec::new(),
         time_wait_deadline: 0,
     });
     // Offer SACK on the SYN (Stage 23d-1); the peer enables it only by echoing the option in its SYN-ACK.
@@ -959,6 +983,9 @@ fn process_ack(tcb: &mut Tcb, seg: &Segment) -> bool {
     // Stage 22c: track the peer's advertised window from every acceptable ACK (including a pure
     // window-update / duplicate ACK), so the sender's [`flush`] paces to it.
     tcb.snd_wnd = seg.window as u32;
+    // Stage 23d-2b: fold in any SACK blocks the ACK carries — mark each queued segment the peer reports it
+    // already holds, so the retransmit path will not resend it (and can find the gaps between).
+    mark_sacked(tcb, seg);
     let acked = seg.ack.wrapping_sub(tcb.snd_una);
     let outstanding = tcb.snd_nxt.wrapping_sub(tcb.snd_una);
     let mss = MSS as u32;
@@ -1016,6 +1043,63 @@ fn process_ack(tcb: &mut Tcb, seg: &Segment) -> bool {
         tcb.retransmit.retain(|u| !seq_leq(u.end_seq, una));
     }
     false
+}
+
+/// Stage 23d-2b: apply an incoming ACK's SACK blocks — mark every queued segment the blocks fully cover as
+/// selectively acknowledged, so the retransmit path skips it. A segment `[start, end)` is covered when some
+/// block `[left, right)` has `left <= start` and `end <= right` (wrapping comparisons). A no-op unless SACK
+/// was negotiated and the ACK actually carries blocks.
+fn mark_sacked(tcb: &mut Tcb, seg: &Segment) {
+    if !tcb.sack_permitted {
+        return;
+    }
+    let blocks = seg.sack_blocks();
+    if blocks.is_empty() {
+        return;
+    }
+    for u in tcb.retransmit.iter_mut() {
+        if !u.sacked
+            && blocks
+                .iter()
+                .any(|&(left, right)| seq_leq(left, u.start_seq) && seq_leq(u.end_seq, right))
+        {
+            u.sacked = true;
+        }
+    }
+}
+
+/// Stage 23d-2b: the segments to retransmit on a fast retransmit, **guided by SACK** — every unacknowledged,
+/// not-yet-SACKed segment lying below the highest SACKed sequence (the peer holds data beyond it, a strong
+/// sign it was lost, RFC 6675). The chosen holes' deadlines are pushed out so the RTO timer does not also
+/// resend them. With no SACK information this reduces to just the oldest unacked segment — the classic
+/// single-hole fast retransmit. Returned oldest-first: the caller sends the first inline and queues the rest.
+fn sack_holes(tcb: &mut Tcb) -> Vec<Vec<u8>> {
+    let now = now_ticks();
+    let rto = tcb.rto as u64;
+    let una = tcb.snd_una;
+    // The furthest byte any SACK block has acknowledged (as distance past `snd_una`, so it is wrap-correct);
+    // `None` when nothing is SACKed yet.
+    let high = tcb
+        .retransmit
+        .iter()
+        .filter(|u| u.sacked)
+        .map(|u| u.end_seq)
+        .max_by_key(|&e| e.wrapping_sub(una));
+    let mut out = Vec::new();
+    for u in tcb.retransmit.iter_mut() {
+        if u.sacked {
+            continue;
+        }
+        let lost = match high {
+            Some(h) => seq_lt(u.start_seq, h), // a gap below SACKed data — retransmit it
+            None => out.is_empty(),            // no SACK: only the oldest segment (the duplicate-ACK'd hole)
+        };
+        if lost {
+            u.deadline = now + rto; // push the RTO out so on_tick does not double-resend this hole
+            out.push(u.segment.clone());
+        }
+    }
+    out
 }
 
 /// Stage 22d: grow the congestion window after an ACK confirmed `acked` new bytes, per RFC 5681. Two modes,
@@ -1122,14 +1206,20 @@ fn on_established(
     remote_ip: [u8; 4],
     seg: &Segment,
 ) -> Option<Vec<u8>> {
-    // Stage 22d-3: a third duplicate ACK fires a fast retransmit — resend the missing segment (the head of
-    // the retransmit queue) immediately instead of waiting for the RTO. A dup ACK carries no data or FIN, so
-    // there is nothing else to process for this segment; return the resent segment as the response.
+    // Stage 22d-3: a third duplicate ACK fires a fast retransmit — resend the missing segment immediately
+    // instead of waiting for the RTO. Stage 23d-2b: guided by SACK, resend *every* gap the peer has revealed
+    // (a segment with SACKed data beyond it), not just the oldest, so several losses recover in one round
+    // trip. The first hole is returned inline (the response to this segment); the rest ride `sack_resend`,
+    // drained by the next poll. A dup ACK carries no data or FIN, so nothing else is processed here.
     if process_ack(tcb, seg) {
-        let rto = tcb.rto as u64;
-        if let Some(u) = tcb.retransmit.first_mut() {
-            u.deadline = now_ticks() + rto; // push the RTO out so on_tick does not also resend it
-            return Some(u.segment.clone());
+        let holes = sack_holes(tcb);
+        if !holes.is_empty() {
+            // Count the *extra* holes SACK let us recover beyond the single one the pre-SACK sender resent.
+            SACK_RETRANSMITS.fetch_add((holes.len() - 1) as u64, Ordering::Relaxed);
+            let mut it = holes.into_iter();
+            let first = it.next().unwrap();
+            tcb.sack_resend.extend(it);
+            return Some(first);
         }
     }
 
@@ -1340,10 +1430,12 @@ fn emit_segment(tcb: &mut Tcb, local_ip: [u8; 4], n: usize) -> Vec<u8> {
     );
     tcb.snd_nxt = tcb.snd_nxt.wrapping_add(n as u32);
     tcb.retransmit.push(Unacked {
+        start_seq: tcb.snd_nxt.wrapping_sub(n as u32),
         end_seq: tcb.snd_nxt,
         deadline: now_ticks() + tcb.rto as u64,
         tries: 0,
         sent_at: now_ticks(),
+        sacked: false,
         segment: seg.clone(),
     });
     DATA_SEGMENTS_SENT.fetch_add(1, Ordering::Relaxed);
@@ -1433,10 +1525,12 @@ pub fn close(local_ip: [u8; 4], local_port: u16, remote_port: u16) -> Option<(Ve
     tcb.snd_nxt = tcb.snd_nxt.wrapping_add(1); // the FIN consumes one sequence number
     // Stage 21e: queue the FIN for retransmission too — a lost FIN would otherwise stall teardown.
     tcb.retransmit.push(Unacked {
+        start_seq: tcb.snd_nxt.wrapping_sub(1),
         end_seq: tcb.snd_nxt,
         deadline: now_ticks() + tcb.rto as u64,
         tries: 0,
         sent_at: now_ticks(),
+        sacked: false,
         segment: seg.clone(),
     });
     tcb.state = next_state;
@@ -1627,6 +1721,23 @@ pub fn on_tick() -> Vec<(Vec<u8>, [u8; 4])> {
         }
     }
     resends
+}
+
+/// Stage 23d-2b: drain the extra SACK-guided fast-retransmit segments queued across all connections (see
+/// [`Tcb::sack_resend`]), each paired with its peer IP for framing. Call once per [`super::poll`] after
+/// dispatching received frames. These are transmitted through the ordinary path and are **not** counted as
+/// RTO retransmissions — they are fast-retransmit recovery (the fast-retransmit test asserts the RTO timer
+/// never fired), and the head hole of the same event already went out inline as a segment's response.
+pub fn take_sack_resends() -> Vec<(Vec<u8>, [u8; 4])> {
+    let mut out = Vec::new();
+    let mut table = CONNECTIONS.lock();
+    for tcb in table.iter_mut() {
+        let ip = tcb.remote_ip;
+        for seg in tcb.sack_resend.drain(..) {
+            out.push((seg, ip));
+        }
+    }
+    out
 }
 
 /// Stage 23b: send any **delayed ACK** whose deadline has elapsed — call once per [`super::poll`] (like the

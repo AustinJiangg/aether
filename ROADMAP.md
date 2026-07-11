@@ -797,7 +797,7 @@ unify later.
 
 ## Post-roadmap tracks (Stage 23+)
 
-> **Status: in progress — Stage 23a-23c and 23d-1/23d-2a done.** With the original roadmap complete (stages 0-22d-3), four independent
+> **Status: in progress — Stage 23 complete (23a-23d); Stages 24-26 remain.** With the original roadmap complete (stages 0-22d-3), four independent
 > follow-on tracks extend it. They are **not** strictly ordered by dependency, but the recommended sequence
 > is **23 → 24 → 25 → 26**, chosen by risk and blast radius: do the isolated TCP polish first (it rides the
 > momentum of the just-finished TCP work), then the socket capstone that makes the stack usable, then the
@@ -890,6 +890,26 @@ Isolated to `net/tcp.rs` plus a few `net/mod.rs` self-tests; no new subsystems, 
 > by 87 tests (the pure `tcp_sack_option_round_trips` — two ranges round-trip through build/parse with a valid
 > checksum and the enlarged data offset — and the live `tcp_advertises_sack_blocks`). (Remaining: Stage 23d-2b,
 > the sender consuming the blocks to retransmit only the holes.)
+>
+> **Stage 23d-2b is done — the sender consumes SACK blocks, completing Stage 23d (SACK), Stage 23 (TCP
+> refinements), and the TCP-refinements track.** Now the *sender* acts on the SACK blocks the receiver
+> advertises (23d-2a): it learns exactly which out-of-order segments the peer already holds and, on a loss,
+> retransmits **only the gaps between them** — recovering several losses in one round trip instead of one per
+> RTT. In `net/tcp.rs`: each `Unacked` grows a `start_seq` and a `sacked` flag; `mark_sacked` (called from
+> `process_ack` on every ACK) sets `sacked` on each queued segment a SACK block fully covers; and `sack_holes`
+> selects the segments to fast-retransmit — every not-yet-SACKed segment below the highest SACKed sequence
+> (RFC 6675's "data acknowledged beyond it, so it is lost"), falling back to just the oldest segment when there
+> is no SACK information (the classic single-hole fast retransmit, unchanged). The fast-retransmit path
+> (`on_established`) resends the first hole inline and queues the rest on a new `Tcb::sack_resend`, drained by
+> `take_sack_resends` each `net::poll` through the ordinary (uncounted) transmit path — so the RTO counter is
+> untouched and the existing fast-retransmit test's "rto-resends 0" still holds. Proved deterministically with
+> no peer via PHY loopback and a **bitmask loss hook** (`DROP_TCP_TX_MASK`, dropping *non-adjacent* frames,
+> unlike the consecutive Stage 21e `DROP_NEXT_TCP_TX`): `tcp_sack_recovery_loopback_selftest` bursts five
+> MSS-sized segments with the **first and third dropped**; the three that arrive draw three SACK-carrying dup
+> ACKs, and one fast retransmit recovers **both** holes at once — boot logs "fast-retransmits 1,
+> extra-sack-holes 1, rto-resends 0, delivered 11264/11264 in order true". Verified by 88 tests (the new
+> `tcp_recovers_multiple_holes_with_sack`). **This completes the from-scratch TCP-refinements track (Stage 23):
+> adaptive RTO, delayed ACKs, Nagle, and SACK — atop the Stage 21/22 reliable, congestion-controlled TCP.**
 
 | Sub-step | What to build | OS concepts | Smallest verifiable step |
 |----------|---------------|-------------|--------------------------|

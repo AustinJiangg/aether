@@ -350,9 +350,13 @@ it, and each end records the result on `Tcb::sack_permitted` (so SACK is on only
 **Stage 23d-2a is also done**: the receiver advertises **SACK blocks** — when SACK is negotiated and
 out-of-order data is buffered, `build_ack` attaches an RFC 2018 SACK option (`kind 5`) whose `[left, right)`
 ranges (`sack_blocks` coalesces `Tcb::ooo`) tell the sender exactly which segments already arrived, so a
-duplicate ACK now names the received range; the sender does not yet act on it (that is 23d-2b), so behavior is
-unchanged. `ROADMAP.md` records the full staged history (stages 0-22d-3 complete, Stage 23a-23c and
-23d-1/23d-2a done).
+duplicate ACK now names the received range. **Stage 23d-2b is also done — completing Stage 23d (SACK) and
+Stage 23 (TCP refinements)**: the *sender* consumes those blocks — each `Unacked` gains a `start_seq` and a
+`sacked` flag, `mark_sacked` (from `process_ack`) marks every queued segment a SACK block covers, and on a
+fast retransmit `sack_holes` resends **only the gaps** below the highest SACKed sequence (skipping segments
+the peer already holds), recovering several losses in one round trip (extra holes ride `Tcb::sack_resend`,
+drained by `take_sack_resends` each poll). `ROADMAP.md` records the full staged history (stages 0-22d-3
+complete, Stage 23 complete (23a-23d); Stages 24-26 remain).
 
 ## Language and writing conventions
 
@@ -914,8 +918,13 @@ Exit QEMU: `Ctrl-A` then `X`.
   `sack_blocks` coalesces the out-of-order queue (`Tcb::ooo`) into `[left, right)` ranges, `build_sack_option`
   encodes them, `Segment::sack_blocks`/`parse_sack_blocks` decode them, and `build_ack` attaches the option
   whenever SACK is negotiated and out-of-order data is buffered — so a dup ACK reports exactly what arrived
-  (`sack_acks_sent` counts them). The sender ignores the blocks until 23d-2b.
-  `net::tcp_sack_blocks_loopback_selftest` reorders two segments and confirms the dup ACK carried SACK.
+  (`sack_acks_sent` counts them). `net::tcp_sack_blocks_loopback_selftest` reorders two segments and confirms
+  the dup ACK carried SACK. Stage 23d-2b then has the **sender** consume the blocks: `Unacked` gains
+  `start_seq`/`sacked`, `mark_sacked` (from `process_ack`) flags every queued segment a SACK block covers, and
+  `sack_holes` fast-retransmits only the gaps below the highest SACKed sequence (extra holes via
+  `Tcb::sack_resend`, drained by `take_sack_resends`), so multiple losses recover in one round trip.
+  `net::tcp_sack_recovery_loopback_selftest` drops two non-adjacent segments (the `DROP_TCP_TX_MASK` bitmask
+  hook) and confirms one fast retransmit recovered both holes with no RTO.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

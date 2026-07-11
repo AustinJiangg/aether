@@ -1507,6 +1507,20 @@ fn tcp_advertises_sack_blocks() {
     );
 }
 
+/// Stage 23d-2b: the sender consumes SACK blocks, via loopback — a five-segment burst with two non-adjacent
+/// segments dropped is recovered by a single SACK-guided fast retransmit (both holes at once, the arrived
+/// segments never resent), the RTO timer never firing and the bytes arriving in order.
+#[test_case]
+fn tcp_recovers_multiple_holes_with_sack() {
+    use crate::net;
+
+    assert!(crate::e1000::present(), "e1000 not initialized");
+    assert!(
+        net::tcp_sack_recovery_loopback_selftest(),
+        "TCP SACK-guided multi-hole recovery over loopback failed"
+    );
+}
+
 /// Stage 19b-2: the live DNS resolver — resolve a hostname through SLIRP's DNS server over the wire.
 /// Unlike the SLIRP-internal gateway ping, this depends on the *host* having working upstream DNS
 /// (SLIRP forwards to it), so the test is lenient: it always exercises the full path (build the query,

@@ -1012,6 +1012,13 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             let tcp_sack_blk_ok = net::tcp_sack_blocks_loopback_selftest();
             serial_println!("[ OK ] net 23d-2a: TCP SACK blocks advertised = {}", tcp_sack_blk_ok);
 
+            // Stage 23d-2b (networking): the sender consumes SACK blocks to recover several losses in one
+            // round trip. When an ACK reports out-of-order data, the sender marks those segments received and,
+            // on a fast retransmit, resends only the gaps between them. Prove it via loopback: burst five
+            // segments with two non-adjacent ones dropped and confirm both holes recover in one event.
+            let tcp_sack_rec_ok = net::tcp_sack_recovery_loopback_selftest();
+            serial_println!("[ OK ] net 23d-2b: TCP SACK-guided recovery = {}", tcp_sack_rec_ok);
+
             match net::ping(gw) {
                 Some(seq) => {
                     serial_println!(

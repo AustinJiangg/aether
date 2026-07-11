@@ -159,6 +159,11 @@ static TCP_RETRANSMITS: AtomicU64 = AtomicU64::new(0);
 /// instead of transmitted, simulating packet loss so the retransmission timer must recover it. Test-only
 /// (armed by `tcp_retransmit_loopback_selftest`); zero in normal operation.
 static DROP_NEXT_TCP_TX: AtomicU32 = AtomicU32::new(0);
+/// Stage 23d-2b fault-injection hook: a **bitmask** dropping specific frames of an upcoming burst — bit `k`
+/// (from the LSB) drops the `k`-th frame handed to [`tx_tcp`] after arming, consuming one bit per frame and
+/// disarming at zero. Unlike the consecutive [`DROP_NEXT_TCP_TX`], this can lose *non-adjacent* segments, so
+/// the SACK test can open two holes in one burst. Test-only (armed by `tcp_sack_recovery_loopback_selftest`).
+static DROP_TCP_TX_MASK: AtomicU32 = AtomicU32::new(0);
 /// Stage 22a fault-injection hook: when armed, [`tx_tcp`] holds the next TCP frame back and sends it only
 /// *after* the following one, so two consecutive sends leave in reversed order — exercising the receiver's
 /// out-of-order reassembly with no real network reordering. Test-only (armed by
@@ -222,6 +227,11 @@ pub fn poll() -> usize {
         receive(&buf[..len]);
         n += 1;
     }
+
+    // Stage 23d-2b: send any extra holes a SACK-guided fast retransmit queued while dispatching the ACKs
+    // above (the head hole already went out inline as a segment's response). Through the ordinary path, so —
+    // like the inline fast retransmit — these are not counted as RTO retransmissions.
+    transmit_tcp_flush(tcp::take_sack_resends());
     n
 }
 
@@ -743,6 +753,14 @@ fn tx_tcp(frame: &[u8]) {
         DROP_NEXT_TCP_TX.fetch_sub(1, Ordering::AcqRel);
         return; // "lost" on the wire
     }
+    // Stage 23d-2b: the bitmask drop hook — consume one bit per frame; drop this one if its bit is set.
+    let mask = DROP_TCP_TX_MASK.load(Ordering::Acquire);
+    if mask != 0 {
+        DROP_TCP_TX_MASK.store(mask >> 1, Ordering::Release);
+        if mask & 1 != 0 {
+            return; // this frame of the burst is "lost"
+        }
+    }
     // Stage 22a: if the reorder hook is armed, hold this frame back and let the *next* one go first, then
     // release the held one behind it — so two consecutive sends arrive reversed for the reassembly test.
     if REORDER_NEXT_TCP_TX.swap(false, Ordering::AcqRel) {
@@ -1140,6 +1158,99 @@ pub fn tcp_sack_blocks_loopback_selftest() -> bool {
         "[net] TCP SACK blocks loopback selftest: sack-acks {}, reassembled {}, ok = {}",
         tcp::sack_acks_sent() - sack_before,
         reassembled,
+        ok,
+    );
+    ok
+}
+
+/// Stage 23d-2b self-test of the sender **consuming SACK blocks** to recover several losses in one round
+/// trip, via PHY loopback. Grow `cwnd` so five MSS-sized segments fit in flight, then send five with the
+/// **first and third dropped** (the bitmask hook — two non-adjacent holes). The three that arrive
+/// (segments 2, 4, 5) are out of order, so the receiver dup-ACKs each *with SACK blocks* naming them; on the
+/// third dup ACK the sender fast-retransmits, and — guided by SACK — resends **both** holes at once (skipping
+/// the three it now knows arrived) rather than one per round trip. Returns whether the extra hole was
+/// SACK-recovered (`sack_retransmits` rose), the fast path ran, the RTO timer never fired, and all bytes
+/// arrived in order.
+pub fn tcp_sack_recovery_loopback_selftest() -> bool {
+    tcp::reset_connections();
+    let port: u16 = 7784;
+    tcp::open_passive(port);
+
+    DROP_TCP_TX_MASK.store(0, Ordering::Release);
+    e1000::set_loopback(true);
+    let mut sink = [0u8; 2048];
+    while e1000::poll_frame(&mut sink).is_some() {}
+
+    let client_port = match tcp_connect(our_ip(), port) {
+        Some(p) => p,
+        None => {
+            e1000::set_loopback(false);
+            serial_println!("[net] TCP SACK recovery loopback selftest: handshake failed");
+            return false;
+        }
+    };
+    for _ in 0..200 {
+        if tcp::established_count() >= 2 {
+            break;
+        }
+        poll();
+        crate::apic::pit_sleep_us(500);
+    }
+
+    // Phase 1: grow cwnd above five MSS so a five-segment burst goes out at once. Stream a batch and drain it.
+    let warmup = 6144usize;
+    let d1: Vec<u8> = (0..warmup).map(|i| (i % 251) as u8).collect();
+    tcp_send(client_port, port, &d1);
+    let mut got: Vec<u8> = Vec::new();
+    for _ in 0..8000 {
+        poll();
+        if let Some(chunk) = tcp_read(port, client_port, 8192) {
+            got.extend_from_slice(&chunk);
+        }
+        if got.len() >= warmup && tcp::all_data_acked(client_port, port) == Some(true) {
+            break;
+        }
+        crate::apic::pit_sleep_us(300);
+    }
+
+    // Phase 2: five MSS-sized segments in one burst with the first and third dropped (mask 0b00101 = 5).
+    let fast_before = tcp::fast_retransmits();
+    let sack_before = tcp::sack_retransmits();
+    let rto_before = tcp_retransmits();
+    DROP_TCP_TX_MASK.store(0b0_0101, Ordering::Release);
+    let payload_len = 5 * 1024usize; // 5 * MSS
+    let d2: Vec<u8> = (0..payload_len).map(|i| ((i + 7) % 251) as u8).collect();
+    tcp_send(client_port, port, &d2);
+
+    let total = warmup + payload_len;
+    for _ in 0..6000 {
+        poll();
+        if let Some(chunk) = tcp_read(port, client_port, 8192) {
+            got.extend_from_slice(&chunk);
+        }
+        if got.len() >= total && tcp::all_data_acked(client_port, port) == Some(true) {
+            break;
+        }
+        crate::apic::pit_sleep_us(300);
+    }
+    DROP_TCP_TX_MASK.store(0, Ordering::Release);
+    e1000::set_loopback(false);
+
+    let mut expected = d1.clone();
+    expected.extend_from_slice(&d2);
+    let fast_fired = tcp::fast_retransmits() > fast_before; // a fast retransmit fired
+    let extra_hole = tcp::sack_retransmits() > sack_before; // SACK recovered a second hole in the same event
+    let no_rto = tcp_retransmits() == rto_before; // recovery beat the RTO timer
+    let in_order = got == expected && got.len() == total;
+    let ok = fast_fired && extra_hole && no_rto && in_order;
+    serial_println!(
+        "[net] TCP SACK recovery loopback selftest: fast-retransmits {}, extra-sack-holes {}, rto-resends {}, delivered {}/{} in order {}, ok = {}",
+        tcp::fast_retransmits() - fast_before,
+        tcp::sack_retransmits() - sack_before,
+        tcp_retransmits() - rto_before,
+        got.len(),
+        total,
+        got == expected,
         ok,
     );
     ok
