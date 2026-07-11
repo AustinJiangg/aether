@@ -797,7 +797,7 @@ unify later.
 
 ## Post-roadmap tracks (Stage 23+)
 
-> **Status: in progress — Stage 23a done.** With the original roadmap complete (stages 0-22d-3), four independent
+> **Status: in progress — Stage 23a-23b done.** With the original roadmap complete (stages 0-22d-3), four independent
 > follow-on tracks extend it. They are **not** strictly ordered by dependency, but the recommended sequence
 > is **23 → 24 → 25 → 26**, chosen by risk and blast radius: do the isolated TCP polish first (it rides the
 > momentum of the just-finished TCP work), then the socket capstone that makes the stack usable, then the
@@ -824,6 +824,21 @@ Isolated to `net/tcp.rs` plus a few `net/mod.rs` self-tests; no new subsystems, 
 > a live loopback transfer (`tcp_rtt_estimation_loopback_selftest`) confirms the sender actually sampled an
 > RTT (its estimator went valid) and landed on a sane RTO while the data arrived in order. Verified by 81
 > tests (the new `tcp_rtt_estimator_known_answer` and `tcp_estimates_rtt_over_loopback`).
+>
+> **Stage 23b is done — delayed ACKs (RFC 1122).** The receiver no longer ACKs every data segment. In-order
+> data is now classified by `accept_segment_data` (returning an `Accept` verdict): plain in-order bytes are
+> **delayable**, while an out-of-order segment (its immediate duplicate ACK is the fast-retransmit trigger),
+> a gap-filling segment, an old duplicate, or a window-refused segment must be **ACKed now**. `on_established`
+> acknowledges delayable data only on **every second** in-order segment (the RFC 1122 rule), otherwise arming
+> a per-connection delayed-ACK timer (`DELAYED_ACK_TICKS` = 5, i.e. 50 ms — well under the RTO, so the ACK
+> always beats the sender's timeout); `flush_delayed_acks`, serviced once per `net::poll` like the retransmit
+> timer but through the ordinary (uncounted) transmit path, sends any ACK whose timer elapsed. A companion
+> change adopts **byte-counting slow start** (RFC 3465 "ABC", `grow_cwnd` grows by `min(bytes_acked, 2*MSS)`
+> per ACK) so halving the ACK count does not halve the slow-start ramp — the Stage 22d cwnd numbers are
+> unchanged. Proved via loopback: `tcp_delayed_ack_loopback_selftest` warms up `cwnd` so the sender bursts
+> several segments (which arrive paired), then sends eight in-order segments and confirms they drew only four
+> ACKs (coalesced) with the bytes still in order; the Stage 22a/22d-3 tests keep passing, confirming
+> out-of-order segments are still ACKed immediately. Verified by 82 tests (the new `tcp_coalesces_acks`).
 
 | Sub-step | What to build | OS concepts | Smallest verifiable step |
 |----------|---------------|-------------|--------------------------|

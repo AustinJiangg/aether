@@ -212,6 +212,10 @@ pub fn poll() -> usize {
     // processed on a previous poll, or a read that drained our own receive buffer) is used here.
     transmit_tcp_flush(tcp::flush(our_ip()));
 
+    // Stage 23b: send any delayed ACK whose timer has elapsed. Through the ordinary path, so — unlike a
+    // retransmission — it is not counted as one.
+    transmit_tcp_flush(tcp::flush_delayed_acks(our_ip()));
+
     let mut buf = [0u8; 2048];
     let mut n = 0;
     while let Some(len) = e1000::poll_frame(&mut buf) {
@@ -1584,6 +1588,83 @@ pub fn tcp_rtt_estimation_loopback_selftest() -> bool {
     serial_println!(
         "[net] TCP RTT-estimation loopback selftest: formula {}, sampled {}, rto {} ticks, delivered {}/{} in order {}, ok = {}",
         formula_ok, sampled, rto, got.len(), total, in_order, ok,
+    );
+    ok
+}
+
+/// Stage 23b self-test of **delayed ACKs** (RFC 1122) via PHY loopback. The receiver no longer ACKs every
+/// data segment: it ACKs at most every *second* in-order segment (or after a short timer), so a stream of N
+/// segments draws **fewer than N** ACKs. This warms up `cwnd` so the sender bursts several segments at once
+/// (they then arrive paired at the receiver and the "every second segment" rule coalesces them), then sends
+/// a batch of in-order data and confirms the receiver sent fewer ACKs than it received data segments, with
+/// the bytes still delivered in order. (Out-of-order segments still draw an *immediate* dup ACK — verified
+/// by the Stage 22a/22d-3 tests, which keep passing — so fast retransmit is unaffected.)
+pub fn tcp_delayed_ack_loopback_selftest() -> bool {
+    tcp::reset_connections();
+    let port: u16 = 7788;
+    tcp::open_passive(port);
+
+    e1000::set_loopback(true);
+    let mut sink = [0u8; 2048];
+    while e1000::poll_frame(&mut sink).is_some() {}
+
+    let client_port = match tcp_connect(our_ip(), port) {
+        Some(p) => p,
+        None => {
+            e1000::set_loopback(false);
+            serial_println!("[net] TCP delayed-ACK loopback selftest: handshake failed");
+            return false;
+        }
+    };
+    for _ in 0..200 {
+        if tcp::established_count() >= 2 {
+            break;
+        }
+        poll();
+        crate::apic::pit_sleep_us(500);
+    }
+
+    // Warm up: grow cwnd (and drain fully, so no delayed ACK is left pending) before measuring, so the
+    // sender can burst several segments at once in the measured phase.
+    let warmup: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+    tcp_send(client_port, port, &warmup);
+    for _ in 0..8000 {
+        poll();
+        let _ = tcp_read(port, client_port, 8192);
+        if tcp::all_data_acked(client_port, port) == Some(true) {
+            break;
+        }
+        crate::apic::pit_sleep_us(300);
+    }
+
+    // Measure: send a batch of in-order segments and count the ACKs the receiver produces against them.
+    let total = 8192usize;
+    let data: Vec<u8> = (0..total).map(|i| ((i + 3) % 251) as u8).collect();
+    let acks_before = tcp::acks_sent();
+    let segs_before = tcp::data_segments_sent();
+    tcp_send(client_port, port, &data);
+
+    let mut got: Vec<u8> = Vec::new();
+    for _ in 0..8000 {
+        poll();
+        if let Some(chunk) = tcp_read(port, client_port, 8192) {
+            got.extend_from_slice(&chunk);
+        }
+        if got.len() >= total && tcp::all_data_acked(client_port, port) == Some(true) {
+            break;
+        }
+        crate::apic::pit_sleep_us(300);
+    }
+    e1000::set_loopback(false);
+
+    let acks = tcp::acks_sent() - acks_before;
+    let segs = tcp::data_segments_sent() - segs_before;
+    let coalesced = acks < segs && acks > 0; // fewer ACKs than data segments -> delayed ACK worked
+    let in_order = got == data;
+    let ok = coalesced && in_order && got.len() == total;
+    serial_println!(
+        "[net] TCP delayed-ACK loopback selftest: {} data segments drew {} ACK(s), coalesced {}, delivered {}/{} in order {}, ok = {}",
+        segs, acks, coalesced, got.len(), total, in_order, ok,
     );
     ok
 }

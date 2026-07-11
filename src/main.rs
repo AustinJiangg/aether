@@ -984,6 +984,13 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             let tcp_rtt_ok = net::tcp_rtt_estimation_loopback_selftest();
             serial_println!("[ OK ] net 23a: TCP adaptive RTO over loopback = {}", tcp_rtt_ok);
 
+            // Stage 23b (networking): delayed ACKs — the receiver acknowledges at most every second in-order
+            // segment (or after a short timer) instead of every one, halving ACK traffic; out-of-order
+            // segments are still ACKed immediately so fast retransmit is unaffected. Prove it via loopback:
+            // a batch of in-order segments draws fewer ACKs than there were segments, still in order.
+            let tcp_dack_ok = net::tcp_delayed_ack_loopback_selftest();
+            serial_println!("[ OK ] net 23b: TCP delayed ACK over loopback = {}", tcp_dack_ok);
+
             match net::ping(gw) {
                 Some(seq) => {
                     serial_println!(

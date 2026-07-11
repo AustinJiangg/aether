@@ -243,6 +243,12 @@ const RTO_MIN_TICKS: u32 = 15;
 const RTO_MAX_TICKS: u32 = 6000;
 /// Give up (abort the connection) after resending the same segment this many times.
 const MAX_RETRIES: u32 = 5;
+
+/// Stage 23b: how long a **delayed ACK** may wait before it must be sent. RFC 1122 caps this at 500 ms; we
+/// use a shorter 50 ms so it stays well under the RTO (a delayed ACK must arrive before the sender times
+/// out) and keeps the loopback tests fast. The "ACK every second segment" rule usually fires first, so the
+/// timer only matters for a lone segment with no follow-up.
+const DELAYED_ACK_TICKS: u64 = 5;
 /// How long the active closer lingers in TIME_WAIT before closing (~300 ms). A real stack waits 2*MSL
 /// (minutes) to be sure a lost final ACK could be retransmitted and old duplicates have died out.
 const TIME_WAIT_TICKS: u64 = 30;
@@ -321,6 +327,15 @@ pub fn fast_retransmits() -> u64 {
     FAST_RETRANSMITS.load(Ordering::Relaxed)
 }
 
+/// Stage 23b: how many ACK segments the stack has built since boot ([`build_ack`]). The delayed-ACK test
+/// reads it to confirm the receiver sent *fewer* ACKs than it received data segments (i.e. it coalesced).
+static ACKS_SENT: AtomicU64 = AtomicU64::new(0);
+
+/// Total ACK segments built since boot (Stage 23b; see [`ACKS_SENT`]).
+pub fn acks_sent() -> u64 {
+    ACKS_SENT.load(Ordering::Relaxed)
+}
+
 /// The connection lifecycle states (RFC 793). The opening subset — `Closed`/`Listen`/`SynSent`/
 /// `SynReceived`/`Established` — is the three-way handshake (Stage 21b); the rest are the **teardown**
 /// states of the FIN handshake (Stage 21d). TCP is full-duplex, so each direction closes independently:
@@ -393,6 +408,11 @@ struct Tcb {
     rttvar: u32,
     rto: u32,
     rtt_valid: bool,
+    /// Stage 23b: in-order data segments received but not yet acknowledged — the "ACK every second segment"
+    /// counter (RFC 1122). Reset to zero whenever an ACK is sent (immediate or delayed).
+    unacked_segs: u32,
+    /// Stage 23b: the tick by which a pending **delayed ACK** must be sent, or 0 if none is pending.
+    delayed_ack_deadline: u64,
     /// Receive space: `nxt` = next seq we expect from the peer, `irs` = the peer's initial seq.
     rcv_nxt: u32,
     irs: u32,
@@ -450,6 +470,8 @@ pub fn open_passive(local_port: u16) {
         rttvar: 0,
         rto: RTO_INITIAL_TICKS,
         rtt_valid: false,
+        unacked_segs: 0,
+        delayed_ack_deadline: 0,
         rcv_nxt: 0,
         irs: 0,
         rx: Vec::new(),
@@ -488,6 +510,8 @@ pub fn open_active(
         rttvar: 0,
         rto: RTO_INITIAL_TICKS,
         rtt_valid: false,
+        unacked_segs: 0,
+        delayed_ack_deadline: 0,
         rcv_nxt: 0, // unknown until the SYN-ACK tells us the peer's ISN
         irs: 0,
         rx: Vec::new(),
@@ -694,6 +718,7 @@ fn step(tcb: &mut Tcb, local_ip: [u8; 4], remote_ip: [u8; 4], seg: &Segment) -> 
 /// Build a bare ACK for this connection's current sequence state (`seq = snd_nxt`, `ack = rcv_nxt`). The
 /// workhorse reply of every acknowledging state — data receipt, a FIN, or a re-ACK of a retransmission.
 fn build_ack(tcb: &Tcb, local_ip: [u8; 4], remote_ip: [u8; 4]) -> Vec<u8> {
+    ACKS_SENT.fetch_add(1, Ordering::Relaxed); // Stage 23b: count ACKs so a test can see delayed ACK coalesce them
     build(
         local_ip,
         remote_ip,
@@ -792,7 +817,10 @@ fn process_ack(tcb: &mut Tcb, seg: &Segment) -> bool {
 fn grow_cwnd(tcb: &mut Tcb, acked: u32) {
     let mss = MSS as u32;
     if tcb.cwnd < tcb.ssthresh {
-        tcb.cwnd = tcb.cwnd.saturating_add(acked.min(mss));
+        // Slow start, byte-counted (RFC 3465 "ABC", limit L = 2*MSS). Growing by the bytes acknowledged
+        // rather than per-ACK keeps the ramp the same when Stage 23b delayed ACK halves the ACK count —
+        // one ACK for two segments still opens cwnd by two MSS. Capped at 2*MSS to avoid bursts.
+        tcb.cwnd = tcb.cwnd.saturating_add(acked.min(2 * mss));
     } else {
         tcb.cwnd = tcb.cwnd.saturating_add((mss * mss / tcb.cwnd).max(1));
     }
@@ -897,9 +925,11 @@ fn on_established(
     // precedes it) is *held* in the reassembly queue instead of dropped. Either way the ACK below carries
     // the resulting `rcv_nxt` — unchanged for an out-of-order segment, i.e. a duplicate ACK that prompts
     // the peer to retransmit the missing segment (the classic fast-retransmit trigger).
-    if !seg.payload.is_empty() {
-        accept_segment_data(tcb, seg.seq, seg.payload);
-    }
+    let disp = if seg.payload.is_empty() {
+        None
+    } else {
+        Some(accept_segment_data(tcb, seg.seq, seg.payload))
+    };
 
     // A FIN occupies the sequence number just past the segment's data; honor it only in order. It moves
     // us to CLOSE_WAIT — the peer will send no more data, though our side may still send until the
@@ -910,13 +940,35 @@ fn on_established(
         tcb.state = State::CloseWait;
     }
 
-    // Acknowledge anything that consumed sequence space (data or a FIN); also re-ACK a duplicate segment
-    // to prompt the peer. A pure ACK of our own data (no payload, no FIN) needs no reply.
-    if fin || !seg.payload.is_empty() {
+    // Stage 23b: decide the ACK's *timing* (delayed ACK, RFC 1122). A FIN, or a segment that must be
+    // acknowledged at once (out-of-order — the dup ACK is the fast-retransmit trigger — or gap-filling / old
+    // / window-refused), draws an immediate ACK. Plain in-order data may be delayed: acknowledge every
+    // second such segment, otherwise arm the delayed-ACK timer and stay silent (`flush_delayed_acks`,
+    // serviced once per poll, sends it before the sender's RTO). A pure ACK of our own data needs no reply.
+    if fin || matches!(disp, Some(Accept::AckNow)) {
+        clear_delayed_ack(tcb);
         Some(build_ack(tcb, local_ip, remote_ip))
+    } else if matches!(disp, Some(Accept::InOrderDelayable)) {
+        tcb.unacked_segs += 1;
+        if tcb.unacked_segs >= 2 {
+            clear_delayed_ack(tcb);
+            Some(build_ack(tcb, local_ip, remote_ip))
+        } else {
+            if tcb.delayed_ack_deadline == 0 {
+                tcb.delayed_ack_deadline = now_ticks() + DELAYED_ACK_TICKS;
+            }
+            None
+        }
     } else {
         None
     }
+}
+
+/// Stage 23b: clear a connection's pending delayed-ACK state — called whenever an ACK is actually sent (an
+/// ACK carries the cumulative `rcv_nxt`, so it covers every in-order segment received so far).
+fn clear_delayed_ack(tcb: &mut Tcb) {
+    tcb.unacked_segs = 0;
+    tcb.delayed_ack_deadline = 0;
 }
 
 /// Stage 22a: accept one data segment's payload into the receive stream, handling **reordering**. The
@@ -928,31 +980,48 @@ fn on_established(
 ///   `rcv_nxt`, then splice in any buffered out-of-order segment that is now contiguous ([`drain_ooo`]).
 /// - **Ahead of R** (`R < seq`): a gap precedes it — buffer it for later reassembly ([`buffer_ooo`])
 ///   rather than dropping it, so the peer need not retransmit it once the gap fills.
-fn accept_segment_data(tcb: &mut Tcb, seq: u32, payload: &[u8]) {
+/// Stage 23b: what accepting a data segment did, which decides its ACK *timing* (delayed ACK, RFC 1122).
+enum Accept {
+    /// Plain in-order data — its ACK may be delayed (bundled with the next segment or a short timer).
+    InOrderDelayable,
+    /// Must be acknowledged immediately: an out-of-order segment (an immediate duplicate ACK is the
+    /// fast-retransmit trigger), a segment that filled a reassembly gap (RFC 5681 SHOULD ack at once), an
+    /// old duplicate, or one refused for a closed window.
+    AckNow,
+}
+
+fn accept_segment_data(tcb: &mut Tcb, seq: u32, payload: &[u8]) -> Accept {
     let end = seq.wrapping_add(payload.len() as u32);
 
     if seq_leq(end, tcb.rcv_nxt) {
-        return; // entirely old — already accepted
+        return Accept::AckNow; // entirely old — re-ACK immediately so the peer stops resending
     }
     if seq_leq(seq, tcb.rcv_nxt) {
         // In order (dropping any prefix we already hold): the new bytes are the part beyond `rcv_nxt`.
         let skip = tcb.rcv_nxt.wrapping_sub(seq) as usize;
         let new = &payload[skip..];
         // Stage 22b: **flow control** — accept the segment only if it fits the free receive window. If it
-        // does not, drop it (leaving `rcv_nxt` where it is): the ACK below then advertises the smaller
-        // window, and the peer waits / retransmits until the application reads and reopens it. This keeps
-        // `rx` bounded by `RCV_WINDOW_MAX`, so the window we advertise is honest.
+        // does not, drop it (leaving `rcv_nxt` where it is): the ACK then advertises the smaller window, and
+        // the peer waits / retransmits until the application reads and reopens it. This keeps `rx` bounded by
+        // `RCV_WINDOW_MAX`, so the window we advertise is honest.
         let free = RCV_WINDOW_MAX.saturating_sub(tcb.rx.len());
         if new.len() > free {
-            return;
+            return Accept::AckNow; // window-refused — ACK now to advertise the closed window
         }
         tcb.rx.extend_from_slice(new);
         tcb.rcv_nxt = end;
-        drain_ooo(tcb);
-        return;
+        // Stage 23b: plain in-order data may have its ACK delayed; but if this segment just filled a
+        // reassembly gap (spliced buffered out-of-order data back into the stream), acknowledge at once.
+        if drain_ooo(tcb) {
+            Accept::AckNow
+        } else {
+            Accept::InOrderDelayable
+        }
+    } else {
+        // Ahead of `rcv_nxt`: a gap precedes this segment. Hold it in the reassembly queue and dup-ACK now.
+        buffer_ooo(tcb, seq, payload);
+        Accept::AckNow
     }
-    // Ahead of `rcv_nxt`: a gap precedes this segment. Hold it in the reassembly queue.
-    buffer_ooo(tcb, seq, payload);
 }
 
 /// Stage 22a: hold an out-of-order segment in the reassembly queue — unless it is already fully covered by
@@ -974,7 +1043,10 @@ fn buffer_ooo(tcb: &mut Tcb, seq: u32, payload: &[u8]) {
 /// Stage 22a: after `rcv_nxt` advances, splice in every buffered out-of-order segment now contiguous with
 /// it (and discard any that has become entirely old), repeating until the queue no longer touches
 /// `rcv_nxt`. Overlaps are handled by appending only each segment's bytes *beyond* the current `rcv_nxt`.
-fn drain_ooo(tcb: &mut Tcb) {
+/// Returns whether it spliced any buffered data back into the stream (Stage 23b uses this to acknowledge a
+/// gap-filling segment immediately).
+fn drain_ooo(tcb: &mut Tcb) -> bool {
+    let mut spliced = false;
     loop {
         let r = tcb.rcv_nxt;
         // A queued segment that reaches `rcv_nxt` (`seq <= R < end`) fills the gap (or part of it).
@@ -986,6 +1058,7 @@ fn drain_ooo(tcb: &mut Tcb) {
             let skip = r.wrapping_sub(o.seq) as usize;
             tcb.rx.extend_from_slice(&o.data[skip..]);
             tcb.rcv_nxt = o.seq.wrapping_add(o.data.len() as u32);
+            spliced = true;
             continue; // the advance may make a further queued segment contiguous
         }
         // Nothing contiguous: prune any segment now entirely behind `rcv_nxt`, then stop.
@@ -998,6 +1071,7 @@ fn drain_ooo(tcb: &mut Tcb) {
             break;
         }
     }
+    spliced
 }
 
 /// Stage 22c: queue application data to send on the ESTABLISHED connection `(local_port -> remote_port)`.
@@ -1305,6 +1379,24 @@ pub fn on_tick() -> Vec<(Vec<u8>, [u8; 4])> {
         }
     }
     resends
+}
+
+/// Stage 23b: send any **delayed ACK** whose deadline has elapsed — call once per [`super::poll`] (like the
+/// retransmit timer). Scans connections and, for each with an overdue pending delayed ACK, emits a bare ACK
+/// carrying the current `rcv_nxt` and clears the pending state; returns the ACK segments (with each peer IP)
+/// for the caller to transmit. Kept **separate from [`on_tick`]** so these ACKs are transmitted through the
+/// ordinary path and are *not* counted as retransmissions.
+pub fn flush_delayed_acks(local_ip: [u8; 4]) -> Vec<(Vec<u8>, [u8; 4])> {
+    let now = now_ticks();
+    let mut acks = Vec::new();
+    let mut table = CONNECTIONS.lock();
+    for tcb in table.iter_mut() {
+        if tcb.delayed_ack_deadline != 0 && now >= tcb.delayed_ack_deadline {
+            clear_delayed_ack(tcb);
+            acks.push((build_ack(tcb, local_ip, tcb.remote_ip), tcb.remote_ip));
+        }
+    }
+    acks
 }
 
 /// Drop all connections (and listeners). Used to isolate the loopback self-test/tests from each other.

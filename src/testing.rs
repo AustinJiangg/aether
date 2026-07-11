@@ -1388,6 +1388,21 @@ fn tcp_estimates_rtt_over_loopback() {
     );
 }
 
+/// Stage 23b: delayed ACKs via loopback — a batch of in-order segments draws fewer ACKs than there were
+/// segments (the receiver acknowledges every second segment, or after a short timer), with the data still
+/// delivered in order. Exercises the "ACK every second segment" rule, the delayed-ACK timer, and the
+/// immediate-ACK path for out-of-order/gap-filling segments (that fast retransmit relies on).
+#[test_case]
+fn tcp_coalesces_acks() {
+    use crate::net;
+
+    assert!(crate::e1000::present(), "e1000 not initialized");
+    assert!(
+        net::tcp_delayed_ack_loopback_selftest(),
+        "TCP delayed ACK over loopback failed"
+    );
+}
+
 /// Stage 19b-2: the live DNS resolver — resolve a hostname through SLIRP's DNS server over the wire.
 /// Unlike the SLIRP-internal gateway ping, this depends on the *host* having working upstream DNS
 /// (SLIRP forwards to it), so the test is lenient: it always exercises the full path (build the query,

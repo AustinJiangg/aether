@@ -334,7 +334,11 @@ ACKs). Proved via loopback by bursting four segments with the first dropped ("fa
 now begun (four follow-on tracks, Stage 23-26, planned in `ROADMAP.md`). Stage 23a is done**: adaptive RTO
 (RFC 6298) — the fixed retransmission timeout is replaced by a per-connection estimate measured from
 round-trip times (Karn's algorithm; `srtt`/`rttvar`/`rto` on the `Tcb`, `rto = clamp(SRTT + 4*RTTVAR, MIN,
-MAX)`). `ROADMAP.md` records the full staged history (stages 0-22d-3 complete, Stage 23a done).
+MAX)`). **Stage 23b is also done**: delayed ACKs (RFC 1122) — the receiver acknowledges only every second
+in-order segment (or after a 50 ms timer, `flush_delayed_acks`), halving ACK traffic, while out-of-order /
+gap-filling segments are still ACKed immediately (so fast retransmit is unaffected); slow start switched to
+byte-counting (RFC 3465 ABC) so the halved ACK count does not slow the ramp. `ROADMAP.md` records the full
+staged history (stages 0-22d-3 complete, Stage 23a-23b done).
 
 ## Language and writing conventions
 
@@ -875,7 +879,14 @@ Exit QEMU: `Ctrl-A` then `X`.
   `rttvar` ×4, the integer RFC 6298 form via the pure `rtt_step`), and `rto = clamp(SRTT + 4*RTTVAR, MIN,
   MAX)` replaces the fixed `RTO_TICKS` in the retransmit timer/backoff. The formula is checked by a
   known-answer unit test (`rtt_estimator_selftest`) since loopback RTT floors the live RTO; `current_rto`/
-  `rtt_sampled` back the live `net::tcp_rtt_estimation_loopback_selftest`.
+  `rtt_sampled` back the live `net::tcp_rtt_estimation_loopback_selftest`. **Stage 23b** adds **delayed ACKs
+  (RFC 1122)**: `accept_segment_data` now returns an `Accept` verdict (in-order data is *delayable*, but
+  out-of-order / gap-filling / old / window-refused is *ack-now*), and `on_established` ACKs delayable data
+  only every second segment, else arms a per-connection delayed-ACK timer (`DELAYED_ACK_TICKS` = 5) that
+  `flush_delayed_acks` (called per `net::poll`, through the uncounted transmit path) services. `grow_cwnd`
+  switched to byte-counting slow start (RFC 3465 ABC, `min(bytes_acked, 2*MSS)`) so the halved ACK count does
+  not halve the ramp (the 22d cwnd numbers are unchanged). The `acks_sent` counter backs
+  `net::tcp_delayed_ack_loopback_selftest`, which confirms eight in-order segments draw only four ACKs.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run
