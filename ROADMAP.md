@@ -795,6 +795,65 @@ unify later.
 | **17** | Networking | NIC driver (virtio-net or e1000): send/receive raw Ethernet frames | DMA, ring buffers |
 | **18** | Networking | Minimal network stack: ARP + IPv4 + ICMP (ping the gateway) | protocol layering |
 
+## Post-roadmap tracks (Stage 23+)
+
+> **Status: designed, not started.** With the original roadmap complete (stages 0-22d-3), four independent
+> follow-on tracks extend it. They are **not** strictly ordered by dependency, but the recommended sequence
+> is **23 → 24 → 25 → 26**, chosen by risk and blast radius: do the isolated TCP polish first (it rides the
+> momentum of the just-finished TCP work), then the socket capstone that makes the stack usable, then the
+> disruptive bootloader migration *before* the layout-sensitive multi-core work (so the SMP code is not
+> migrated twice), and leave the most triple-fault-prone multi-core scheduling for last, on a modern base
+> with the most test coverage. Each sub-step stays one `cargo run`/`cargo test`-verifiable commit, the same
+> discipline as stages 0-22. Cross-track prerequisites: **Stage 26 hard-needs per-CPU TSS (26a)**; Stages 25
+> and 26 both reuse the `wait` syscall's block-list / cross-address-space wake pattern; Stage 24's delayed
+> ACK must keep *out-of-order* segments immediately ACKed or it breaks Stage 22d-3 fast retransmit.
+
+### Stage 23 (Networking) — TCP refinements toward a production stack
+
+Isolated to `net/tcp.rs` plus a few `net/mod.rs` self-tests; no new subsystems, lowest risk.
+
+| Sub-step | What to build | OS concepts | Smallest verifiable step |
+|----------|---------------|-------------|--------------------------|
+| **23a** | RTT measurement + adaptive RTO (RFC 6298) | round-trip estimation, Karn's algorithm | Timestamp each `Unacked`; on a non-retransmitted ACK, sample RTT; maintain `SRTT`/`RTTVAR`; set `RTO = clamp(SRTT + 4*RTTVAR, MIN, MAX)`, replacing the fixed 15-tick RTO. Unit-test the RFC 6298 recurrence on synthetic samples; loopback confirms a transfer completes with a sane RTO. |
+| **23b** | Delayed ACKs (RFC 1122) | ACK coalescing, the delayed-ACK timer | ACK in-order data at most every second segment (or after a timeout), but **always** immediately dup-ACK an out-of-order segment. Loopback: two in-order segments draw one ACK; the Stage 22d-3 fast-retransmit test still fires three immediate dup ACKs. |
+| **23c** | Nagle's algorithm (RFC 896) | small-segment coalescing, `TCP_NODELAY` | Hold a sub-MSS segment while unacked small data is outstanding; flush on a full MSS or an ACK. Loopback: many small writes coalesce into fewer segments; a `TCP_NODELAY` flag disables it. |
+| **23d** | SACK — selective acknowledgment (RFC 2018) | **TCP options** (first use), selective retransmit | Emit options (data offset > 5): negotiate SACK-permitted in the SYN, carry SACK blocks describing the out-of-order queue in ACKs, and have the sender retransmit only the holes. Large — split 23d-1 (options infra + SACK-permitted) / 23d-2 (SACK blocks + sender use). Loopback with several holes. |
+
+### Stage 24 (User space + Networking) — socket system calls
+
+Connects the two finished lines — the network stack and ring 3 — so user programs can do I/O. Touches
+`syscall.rs`, `process.rs`, `net/mod.rs`, and a new user program.
+
+| Sub-step | What to build | OS concepts | Smallest verifiable step |
+|----------|---------------|-------------|--------------------------|
+| **24a** | Per-process handle table + `SYS_SOCKET`/`SYS_CONNECT` (blocking) | file descriptors, blocking syscalls | A socket is a small handle indexing a table binding a process to a TCB. `connect` builds the TCB, sends the SYN, and **blocks the process** until ESTABLISHED — reusing the `wait` block-list pattern; the `net_thread` poll drives the handshake and wakes the process. A ring-3 program connects to a loopback listener. |
+| **24b** | `SYS_SEND` / `SYS_RECV` | stream I/O, cross-context wakeup | `send` -> `tcp::queue_send`; `recv` -> `tcp::read`, blocking when empty until data arrives (woken from the receive path in the net thread — a different address space, so the bytes cross in `rax`, exactly as `wait` delivers a child's exit code). A ring-3 program sends and receives over loopback. |
+| **24c** | `SYS_LISTEN` / `SYS_ACCEPT` | server sockets, the accept queue | `accept` blocks until a SYN establishes a connection. Requires upgrading the minimal "the listener becomes the connection" model to hold multiple connections. A client and a server ring-3 program exchange data. |
+| **24d** | `SYS_CLOSE` + a user "netcat" demo | end-to-end user-space networking | A ring-3 program that opens a socket, transfers data, and closes, wired into the shell. End-to-end proof over loopback / SLIRP. |
+
+### Stage 25 (Hardware) — bootloader 0.9 -> 0.11
+
+The largest blast radius: it changes the boot flow, the boot info, and replaces VGA text with a framebuffer.
+Sequenced before Stage 26 so the layout-sensitive SMP code is written once, on the new base.
+
+| Sub-step | What to build | OS concepts | Smallest verifiable step |
+|----------|---------------|-------------|--------------------------|
+| **25a** | Build-system migration | modern boot protocol | Replace `bootimage` + bootloader 0.9 with bootloader 0.11's build API (a build dependency that assembles the disk image); new `entry_point!`/`BootInfo` and `_start` signature; update `.cargo/config.toml` runner + `Cargo.toml`. Boots and prints "hello" over serial. Highest single-step risk. |
+| **25b** | Framebuffer text console | linear framebuffer, glyph rendering | 0.11 boots into a pixel framebuffer, not VGA text mode (`0xb8000`). Write a font-glyph -> pixel renderer backing `print!`/`println!`, replacing the VGA driver. On-screen text (serial already works headless). |
+| **25c** | Memory-map migration | boot-info memory regions | 0.11's memory regions and physical-memory offset differ from 0.9. Revisit `BootInfoFrameAllocator`, `physical_memory_offset`, the lower-half assumptions, the AP-stack `.bss` note, and the `AddressSpace` kernel-map clone. Regressions across every prior stage surface here — re-run the whole test suite. |
+
+### Stage 26 (SMP) — multi-core process scheduling
+
+The deepest, most triple-fault-prone track: user processes running across cores. The process scheduler
+(`process.rs`) is BSP-only and SMP-unsafe today; APs run only their own per-CPU `sched` kernel threads.
+
+| Sub-step | What to build | OS concepts | Smallest verifiable step |
+|----------|---------------|-------------|--------------------------|
+| **26a** | Per-CPU TSS + `rsp0` (prerequisite) | per-core ring 0 stacks | Today one TSS is loaded by the BSP; APs load none. Give each core its own TSS with its own `rsp0` (and IST), loaded in `gdt::init_ap` — without it an AP cannot safely take an interrupt from ring 3. An AP takes a ring-0 interrupt on its own `rsp0`. |
+| **26b** | Run one user process on an AP | per-core CR3 + TSS | An AP enters ring 3 on its own CR3 and TSS, takes an `int 0x80` syscall (`write`/`exit`), and returns. "AP N ran a ring-3 program." |
+| **26c** | Multi-core process run queue | SMP-safe scheduling, per-CPU current | Make the process scheduler SMP-safe: a global ready queue cores pull from (or per-core queues + work stealing), with a per-CPU "current process". Two user processes run on two different cores concurrently. |
+| **26d** | Cross-core preemption + load balancing | migration, work stealing | Each core's timer preempts its own running process; idle cores pull/steal ready processes. N processes spread across N cores, all making progress, with observable migrations. |
+
 ### Notes
 
 - **Each stage stays one `cargo run`-verifiable commit**, the same discipline as
