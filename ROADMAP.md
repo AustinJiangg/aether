@@ -637,9 +637,26 @@ unify later.
 > loopback connection, then actively closes one end and passively closes the other, walking both TCBs
 > through the full handshake until the active closer is in **TIME_WAIT** and the passive closer is
 > **CLOSED** — boot logs "TCP teardown over loopback = true (client TimeWait, server Closed)". Verified by
-> 72 tests (`tcp_tears_down_over_loopback`). Still to come: **21e** retransmission timers — a resend queue
-> and a timeout that resends unacknowledged segments (and expires TIME_WAIT after 2*MSL), plus real
-> sliding-window flow control.
+> 72 tests (`tcp_tears_down_over_loopback`).
+>
+> **Stage 21e** adds **retransmission timers** — the last piece that makes the transport truly *reliable*,
+> completing the TCP track. Every outbound segment carrying sequence space is kept on a per-connection
+> **retransmit queue** (`Unacked { end_seq, deadline, tries, segment }`); `send_data` and `close` enqueue
+> theirs, and `process_ack` drops each once `snd_una` reaches its `end_seq`. Time is the global 100 Hz tick
+> counter (`interrupts::timer_ticks`, read directly by `tcp.rs`), so no clock is threaded through the send
+> paths. `tcp::on_tick` — serviced once per `net::poll` — resends the oldest unacknowledged segment whose
+> deadline has passed (exponential backoff, aborting the connection after `MAX_RETRIES`) and expires a
+> TIME_WAIT connection to CLOSED once its 2*MSL linger elapses. Proved deterministically via PHY loopback
+> with **fault injection**: `tcp_retransmit_loopback_selftest` arms a "drop the next TCP frame" hook
+> (`DROP_NEXT_TCP_TX`), sends a payload whose data segment is silently dropped, and confirms the timer
+> resends it (so the transfer still completes in order and acknowledged), then tears the connection down
+> and confirms the active closer's TIME_WAIT expires to CLOSED — boot logs "TCP retransmission over
+> loopback = true (1 resend)". Verified by 73 tests (`tcp_recovers_from_loss_over_loopback`). **This
+> completes Stage 21 (TCP) and the networking track: a from-scratch, reliable, connection-oriented
+> transport — segment layer, three-way handshake, in-order data transfer with acknowledgements, the FIN
+> teardown handshake, and retransmission timers — over the hand-written Ethernet/ARP/IPv4/UDP stack and the
+> interrupt-driven e1000.** (A real sliding-window for flow/congestion control and out-of-order reassembly
+> remain as possible future refinements.)
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

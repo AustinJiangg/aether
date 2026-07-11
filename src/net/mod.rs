@@ -153,6 +153,12 @@ static TCP_SEGMENTS_RECEIVED: AtomicU64 = AtomicU64::new(0);
 /// The next ephemeral local port an outgoing TCP connection will use (Stage 21b). Bumped per connect,
 /// wrapping within the ephemeral range so successive connections do not collide.
 static TCP_EPHEMERAL: AtomicU32 = AtomicU32::new(49152);
+/// TCP segments the retransmission timer has resent (Stage 21e).
+static TCP_RETRANSMITS: AtomicU64 = AtomicU64::new(0);
+/// Stage 21e fault-injection hook: when > 0, the next TCP frame handed to [`tx_tcp`] is silently dropped
+/// instead of transmitted, simulating packet loss so the retransmission timer must recover it. Test-only
+/// (armed by `tcp_retransmit_loopback_selftest`); zero in normal operation.
+static DROP_NEXT_TCP_TX: AtomicU32 = AtomicU32::new(0);
 
 /// Bring the stack up: record our MAC and log our identity. Call once, after the e1000 is up. Our IP
 /// is still unconfigured here (`0.0.0.0`) — DHCP (Stage 20b) leases one immediately after.
@@ -180,6 +186,21 @@ pub fn our_ip() -> [u8; 4] {
 /// Called in a bounded loop from boot (18a-c) and, later (18d), from a background task woken by the
 /// receive interrupt. A single stack buffer is reused for each frame — no per-frame allocation.
 pub fn poll() -> usize {
+    // Stage 21e: first service the TCP timers — retransmit any segment whose ACK is overdue and expire
+    // any elapsed TIME_WAIT. The resends are framed and transmitted here, outside tcp's connection lock.
+    for (segment, remote_ip) in tcp::on_tick() {
+        if let Some(mac) = tcp_resend_next_hop(remote_ip) {
+            let frame = ether::build(
+                mac,
+                our_mac(),
+                ether::ETHERTYPE_IPV4,
+                &ipv4::build(our_ip(), remote_ip, tcp::PROTO_TCP, &segment),
+            );
+            tx_tcp(&frame);
+            TCP_RETRANSMITS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     let mut buf = [0u8; 2048];
     let mut n = 0;
     while let Some(len) = e1000::poll_frame(&mut buf) {
@@ -689,6 +710,27 @@ fn tcp_next_hop(dst_ip: [u8; 4]) -> Option<MacAddr> {
     arp_resolve(dst_ip)
 }
 
+/// Like [`tcp_next_hop`] but **cache-only** — it never pumps [`poll`] (which would reenter it). Used on
+/// the Stage 21e retransmit path *inside* `poll`, where an already-established connection's peer MAC is
+/// already in the ARP cache (or is our own MAC, for a loopback connection).
+fn tcp_resend_next_hop(dst_ip: [u8; 4]) -> Option<MacAddr> {
+    if dst_ip == our_ip() {
+        return Some(our_mac());
+    }
+    arp::cache_lookup(dst_ip)
+}
+
+/// Transmit a fully-framed TCP frame, honoring the Stage 21e loss-injection hook: when [`DROP_NEXT_TCP_TX`]
+/// is armed the frame is silently dropped (simulating packet loss) instead of sent, so the retransmission
+/// timer must recover it. The outbound data path and the resend path both go through here.
+fn tx_tcp(frame: &[u8]) {
+    if DROP_NEXT_TCP_TX.load(Ordering::Acquire) > 0 {
+        DROP_NEXT_TCP_TX.fetch_sub(1, Ordering::AcqRel);
+        return; // "lost" on the wire
+    }
+    e1000::transmit(frame);
+}
+
 /// Pick the next ephemeral local port for an outgoing connection (49152..=65535, wrapping).
 fn next_ephemeral_port() -> u16 {
     let n = TCP_EPHEMERAL.fetch_add(1, Ordering::Relaxed);
@@ -744,7 +786,7 @@ pub fn tcp_send(local_port: u16, remote_port: u16, data: &[u8]) -> bool {
         ether::ETHERTYPE_IPV4,
         &ipv4::build(our_ip(), remote_ip, tcp::PROTO_TCP, &seg),
     );
-    e1000::transmit(&frame);
+    tx_tcp(&frame); // Stage 21e: droppable, so the retransmission timer can be exercised
     true
 }
 
@@ -902,6 +944,97 @@ pub fn tcp_teardown_loopback_selftest() -> bool {
     serial_println!(
         "[net] TCP teardown loopback selftest: client {:?}, server {:?}, ok = {}",
         client_state, server_state, ok,
+    );
+    ok
+}
+
+/// Stage 21e: how many TCP segments the retransmission timer has resent (over the whole run).
+pub fn tcp_retransmits() -> u64 {
+    TCP_RETRANSMITS.load(Ordering::Relaxed)
+}
+
+/// Stage 21e self-test of **retransmission** with no external peer, via PHY loopback — the follow-on to
+/// [`tcp_teardown_loopback_selftest`] and the last piece that makes the transport truly *reliable*.
+/// Establish a loopback connection, then send a payload with the loss-injection hook armed so that data
+/// segment is silently dropped: no ACK comes back, so after the retransmission timeout the timer resends
+/// it, this time delivered — the server buffers it in order and ACKs, and the sender's queue clears. Then
+/// tear the connection down and confirm the active closer's TIME_WAIT expires to CLOSED under the timer.
+/// Success proves both timers: loss recovery and the timed close. Returns whether all three held.
+pub fn tcp_retransmit_loopback_selftest() -> bool {
+    tcp::reset_connections();
+    let port: u16 = 7780;
+    tcp::open_passive(port);
+
+    e1000::set_loopback(true);
+    let mut sink = [0u8; 2048];
+    while e1000::poll_frame(&mut sink).is_some() {}
+
+    let client_port = match tcp_connect(our_ip(), port) {
+        Some(p) => p,
+        None => {
+            e1000::set_loopback(false);
+            serial_println!("[net] TCP retransmit loopback selftest: handshake failed");
+            return false;
+        }
+    };
+    for _ in 0..200 {
+        if tcp::established_count() >= 2 {
+            break;
+        }
+        poll();
+        crate::apic::pit_sleep_us(500);
+    }
+
+    // Inject loss: the next TCP frame (our data segment) is dropped, so the server never sees it and never
+    // ACKs — only the retransmission timer can recover it.
+    let retransmits_before = tcp_retransmits();
+    DROP_NEXT_TCP_TX.store(1, Ordering::Release);
+    let payload = b"aether tcp retransmit 21e";
+    tcp_send(client_port, port, payload); // this frame is dropped on the wire
+
+    // Pump long enough for the ~150 ms RTO: the timer (serviced inside `poll`) resends the segment; this
+    // time it is delivered, the server buffers it and ACKs, and the client's retransmit queue clears.
+    let mut recovered = false;
+    for _ in 0..4000 {
+        poll();
+        if tcp::received_data(port, client_port).as_deref() == Some(&payload[..])
+            && tcp::all_data_acked(client_port, port) == Some(true)
+        {
+            recovered = true;
+            break;
+        }
+        crate::apic::pit_sleep_us(1000);
+    }
+    let resent = tcp_retransmits() > retransmits_before;
+
+    // Tear the connection down, then confirm the client's TIME_WAIT expires to CLOSED under the timer.
+    tcp_close(client_port, port);
+    for _ in 0..400 {
+        poll();
+        if tcp::connection_state(port, client_port) == Some(tcp::State::CloseWait) {
+            break;
+        }
+        crate::apic::pit_sleep_us(500);
+    }
+    tcp_close(port, client_port);
+    let mut closed = false;
+    for _ in 0..4000 {
+        poll();
+        if tcp::connection_state(client_port, port) == Some(tcp::State::Closed) {
+            closed = true;
+            break;
+        }
+        crate::apic::pit_sleep_us(1000);
+    }
+    e1000::set_loopback(false);
+
+    let ok = recovered && resent && closed;
+    serial_println!(
+        "[net] TCP retransmit loopback selftest: resends {}, recovered {}, time_wait->closed {}, ok = {}",
+        tcp_retransmits() - retransmits_before,
+        recovered,
+        closed,
+        ok,
     );
     ok
 }

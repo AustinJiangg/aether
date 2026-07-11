@@ -183,6 +183,44 @@ pub fn checksum(src_ip: [u8; 4], dst_ip: [u8; 4], segment: &[u8]) -> u16 {
 /// The receive window we advertise, in bytes. Fixed for now; real flow control comes in a later step.
 const DEFAULT_WINDOW: u16 = 64240;
 
+// Stage 21e: retransmission-timer constants. Time is measured in timer ticks (`interrupts::timer_ticks`,
+// 100 Hz, so 1 tick = 10 ms). A real stack estimates the retransmission timeout from measured round-trip
+// times (RFC 6298); fixed, short values are enough to *demonstrate* recovery deterministically.
+
+/// Initial retransmission timeout: resend an unacknowledged segment after this many ticks (~150 ms).
+const RTO_TICKS: u64 = 15;
+/// Give up (abort the connection) after resending the same segment this many times.
+const MAX_RETRIES: u32 = 5;
+/// How long the active closer lingers in TIME_WAIT before closing (~300 ms). A real stack waits 2*MSL
+/// (minutes) to be sure a lost final ACK could be retransmitted and old duplicates have died out.
+const TIME_WAIT_TICKS: u64 = 30;
+
+/// The current time, in timer ticks since boot. TCP reads the global monotonic tick counter directly so
+/// the send/close/tick paths need not thread a clock value through their signatures.
+fn now_ticks() -> u64 {
+    crate::interrupts::timer_ticks()
+}
+
+/// TCP sequence comparison (RFC 1982): `a <= b` within the 32-bit *wrapping* sequence space — true when
+/// `b` is at or ahead of `a` in the near half. Used to decide when `snd_una` has reached a segment's end.
+fn seq_leq(a: u32, b: u32) -> bool {
+    b.wrapping_sub(a) < 0x8000_0000
+}
+
+/// Stage 21e: one unacknowledged outbound segment, retained so the retransmission timer can resend it if
+/// its ACK does not arrive in time. Dropped from the connection's queue once `snd_una` reaches `end_seq`.
+struct Unacked {
+    /// The send sequence number just past this segment (its data/flags end); acknowledged once `snd_una`
+    /// reaches or passes it (a FIN, like a SYN, contributes one to this beyond any data).
+    end_seq: u32,
+    /// Absolute tick at which to resend if still unacknowledged.
+    deadline: u64,
+    /// How many times it has already been resent — bounds retries and drives exponential backoff.
+    tries: u32,
+    /// The exact segment bytes (already checksummed) to retransmit verbatim.
+    segment: Vec<u8>,
+}
+
 /// The connection lifecycle states (RFC 793). The opening subset — `Closed`/`Listen`/`SynSent`/
 /// `SynReceived`/`Established` — is the three-way handshake (Stage 21b); the rest are the **teardown**
 /// states of the FIN handshake (Stage 21d). TCP is full-duplex, so each direction closes independently:
@@ -228,8 +266,13 @@ struct Tcb {
     irs: u32,
     /// Stage 21c: the **receive buffer** — in-order stream bytes we have accepted and acknowledged but
     /// the application has not yet consumed. Data arriving with `seq == rcv_nxt` is appended here; a real
-    /// socket `read` would drain it. (No send-side retransmission buffer yet — that comes in Stage 21e.)
+    /// socket `read` would drain it.
     rx: Vec<u8>,
+    /// Stage 21e: the **retransmission queue** — outbound segments sent but not yet acknowledged, oldest
+    /// first, kept so the timer can resend them if an ACK is late. Emptied as `snd_una` advances.
+    retransmit: Vec<Unacked>,
+    /// Stage 21e: the tick at which a TIME_WAIT connection may finally close (set on entering TIME_WAIT).
+    time_wait_deadline: u64,
 }
 
 /// The connection table. Small and linear — one entry per connection (and one per listener). A real
@@ -265,6 +308,8 @@ pub fn open_passive(local_port: u16) {
         rcv_nxt: 0,
         irs: 0,
         rx: Vec::new(),
+        retransmit: Vec::new(),
+        time_wait_deadline: 0,
     });
 }
 
@@ -290,6 +335,8 @@ pub fn open_active(
         rcv_nxt: 0, // unknown until the SYN-ACK tells us the peer's ISN
         irs: 0,
         rx: Vec::new(),
+        retransmit: Vec::new(),
+        time_wait_deadline: 0,
     });
     build(local_ip, remote_ip, local_port, remote_port, iss, 0, SYN, DEFAULT_WINDOW, &[])
 }
@@ -413,7 +460,7 @@ fn step(tcb: &mut Tcb, local_ip: [u8; 4], remote_ip: [u8; 4], seg: &Segment) -> 
             match (our_fin_acked, peer_fin) {
                 // Our FIN is acked and the peer has finished too: ACK its FIN and linger in TIME_WAIT.
                 (true, true) => {
-                    tcb.state = State::TimeWait;
+                    enter_time_wait(tcb);
                     Some(build_ack(tcb, local_ip, remote_ip))
                 }
                 // Our FIN is acked; wait for the peer's FIN in FIN_WAIT_2.
@@ -436,7 +483,7 @@ fn step(tcb: &mut Tcb, local_ip: [u8; 4], remote_ip: [u8; 4], seg: &Segment) -> 
             process_ack(tcb, seg);
             if seg.flags & FIN != 0 && seg.seq == tcb.rcv_nxt {
                 tcb.rcv_nxt = tcb.rcv_nxt.wrapping_add(1);
-                tcb.state = State::TimeWait;
+                enter_time_wait(tcb);
                 return Some(build_ack(tcb, local_ip, remote_ip));
             }
             None
@@ -457,7 +504,7 @@ fn step(tcb: &mut Tcb, local_ip: [u8; 4], remote_ip: [u8; 4], seg: &Segment) -> 
         State::Closing => {
             process_ack(tcb, seg);
             if tcb.snd_una == tcb.snd_nxt {
-                tcb.state = State::TimeWait;
+                enter_time_wait(tcb);
             }
             None
         }
@@ -505,13 +552,25 @@ fn build_ack(tcb: &Tcb, local_ip: [u8; 4], remote_ip: [u8; 4]) -> Vec<u8> {
 /// sequence-number wrap); a duplicate ack (`ack == snd_una`) is a harmless no-op, and an ack beyond
 /// `snd_nxt` is ignored. After a FIN we sent, `snd_una == snd_nxt` therefore means our FIN was acked.
 fn process_ack(tcb: &mut Tcb, seg: &Segment) {
-    if seg.flags & ACK != 0 {
-        let acked = seg.ack.wrapping_sub(tcb.snd_una);
-        let outstanding = tcb.snd_nxt.wrapping_sub(tcb.snd_una);
-        if acked <= outstanding {
-            tcb.snd_una = seg.ack;
-        }
+    if seg.flags & ACK == 0 {
+        return;
     }
+    let acked = seg.ack.wrapping_sub(tcb.snd_una);
+    let outstanding = tcb.snd_nxt.wrapping_sub(tcb.snd_una);
+    if acked <= outstanding {
+        tcb.snd_una = seg.ack;
+        // Stage 21e: drop every queued segment the peer has now cumulatively acknowledged, so the
+        // retransmission timer stops resending it.
+        let una = tcb.snd_una;
+        tcb.retransmit.retain(|u| !seq_leq(u.end_seq, una));
+    }
+}
+
+/// Move a connection into TIME_WAIT and stamp its 2*MSL linger deadline (Stage 21e), after which
+/// [`on_tick`] closes it. The active closer lingers here so a lost final ACK can still be retransmitted.
+fn enter_time_wait(tcb: &mut Tcb) {
+    tcb.state = State::TimeWait;
+    tcb.time_wait_deadline = now_ticks() + TIME_WAIT_TICKS;
 }
 
 /// Handle a segment on an ESTABLISHED connection — the steady state (Stage 21c) plus the *start* of a
@@ -583,6 +642,15 @@ pub fn send_data(
         data,
     );
     tcb.snd_nxt = tcb.snd_nxt.wrapping_add(data.len() as u32);
+    // Stage 21e: queue this segment for retransmission until the peer acknowledges it.
+    if !data.is_empty() {
+        tcb.retransmit.push(Unacked {
+            end_seq: tcb.snd_nxt,
+            deadline: now_ticks() + RTO_TICKS,
+            tries: 0,
+            segment: seg.clone(),
+        });
+    }
     Some((seg, tcb.remote_ip))
 }
 
@@ -615,6 +683,13 @@ pub fn close(local_ip: [u8; 4], local_port: u16, remote_port: u16) -> Option<(Ve
         &[],
     );
     tcb.snd_nxt = tcb.snd_nxt.wrapping_add(1); // the FIN consumes one sequence number
+    // Stage 21e: queue the FIN for retransmission too — a lost FIN would otherwise stall teardown.
+    tcb.retransmit.push(Unacked {
+        end_seq: tcb.snd_nxt,
+        deadline: now_ticks() + RTO_TICKS,
+        tries: 0,
+        segment: seg.clone(),
+    });
     tcb.state = next_state;
     Some((seg, tcb.remote_ip))
 }
@@ -657,6 +732,41 @@ pub fn established_count() -> usize {
         .iter()
         .filter(|c| c.state == State::Established)
         .count()
+}
+
+/// Stage 21e: service the connection timers — call once per [`super::poll`]. For every connection whose
+/// oldest unacknowledged segment's deadline has passed, resend it (with exponential backoff, aborting the
+/// connection after [`MAX_RETRIES`]); and expire any TIME_WAIT connection whose linger has elapsed,
+/// moving it to CLOSED. Returns the segments to retransmit, each paired with the peer IP for framing —
+/// built under the lock, transmitted by the caller after it is released (as [`on_segment`] does).
+pub fn on_tick() -> Vec<(Vec<u8>, [u8; 4])> {
+    let now = now_ticks();
+    let mut resends = Vec::new();
+    let mut table = CONNECTIONS.lock();
+    for tcb in table.iter_mut() {
+        // Expire a TIME_WAIT connection once its 2*MSL linger has elapsed.
+        if tcb.state == State::TimeWait && now >= tcb.time_wait_deadline {
+            tcb.state = State::Closed;
+            tcb.retransmit.clear();
+            continue;
+        }
+        // Retransmit the oldest unacknowledged segment if its deadline has passed.
+        if let Some(u) = tcb.retransmit.first_mut() {
+            if now >= u.deadline {
+                if u.tries >= MAX_RETRIES {
+                    // Too many attempts: give up and abort the connection (a real stack sends RST).
+                    tcb.state = State::Closed;
+                    tcb.retransmit.clear();
+                    continue;
+                }
+                u.tries += 1;
+                // Exponential backoff, capped: each successive resend waits twice as long.
+                u.deadline = now + (RTO_TICKS << core::cmp::min(u.tries, 6));
+                resends.push((u.segment.clone(), tcb.remote_ip));
+            }
+        }
+    }
+    resends
 }
 
 /// Drop all connections (and listeners). Used to isolate the loopback self-test/tests from each other.

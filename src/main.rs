@@ -912,6 +912,17 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 tcp_teardown_ok,
             );
 
+            // Stage 21e (networking): TCP retransmission — what finally makes the transport *reliable*.
+            // Every sent segment is kept until acknowledged; a timer resends it if the ACK is late, and
+            // the active closer's TIME_WAIT expires under the same timer. Prove it via loopback by
+            // dropping a data segment on purpose and confirming the timer recovers it (then closes).
+            let tcp_rexmit_ok = net::tcp_retransmit_loopback_selftest();
+            serial_println!(
+                "[ OK ] net 21e: TCP retransmission over loopback = {} ({} resend(s) total)",
+                tcp_rexmit_ok,
+                net::tcp_retransmits(),
+            );
+
             match net::ping(gw) {
                 Some(seq) => {
                     serial_println!(

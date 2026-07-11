@@ -1262,6 +1262,19 @@ fn tcp_tears_down_over_loopback() {
     assert!(net::tcp_teardown_loopback_selftest(), "TCP teardown over loopback failed");
 }
 
+/// Stage 21e: TCP retransmission via loopback (no external peer). Establish a connection, drop a data
+/// segment on purpose (loss injection), and confirm the retransmission timer resends it so the transfer
+/// still completes in order and acknowledged — then that the active closer's TIME_WAIT expires to CLOSED
+/// under the timer. Exercises the retransmit queue, the timeout/resend, and the timed close.
+#[test_case]
+fn tcp_recovers_from_loss_over_loopback() {
+    use crate::net;
+
+    assert!(crate::e1000::present(), "e1000 not initialized");
+    assert!(net::tcp_retransmit_loopback_selftest(), "TCP retransmission over loopback failed");
+    assert!(net::tcp_retransmits() > 0, "the retransmission timer never resent anything");
+}
+
 /// Stage 19b-2: the live DNS resolver — resolve a hostname through SLIRP's DNS server over the wire.
 /// Unlike the SLIRP-internal gateway ping, this depends on the *host* having working upstream DNS
 /// (SLIRP forwards to it), so the test is lenient: it always exercises the full path (build the query,
