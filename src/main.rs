@@ -991,6 +991,13 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             let tcp_dack_ok = net::tcp_delayed_ack_loopback_selftest();
             serial_println!("[ OK ] net 23b: TCP delayed ACK over loopback = {}", tcp_dack_ok);
 
+            // Stage 23c (networking): Nagle's algorithm — the sender coalesces a burst of small writes,
+            // holding a sub-MSS segment while earlier data is unacknowledged, so many tiny writes leave as a
+            // few packets instead of one each (TCP_NODELAY disables it). Prove it via loopback: 16 one-byte
+            // writes go out as far fewer segments, still in order.
+            let tcp_nagle_ok = net::tcp_nagle_loopback_selftest();
+            serial_println!("[ OK ] net 23c: TCP Nagle over loopback = {}", tcp_nagle_ok);
+
             match net::ping(gw) {
                 Some(seq) => {
                     serial_println!(

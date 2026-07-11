@@ -1029,6 +1029,10 @@ pub fn tcp_reassembly_loopback_selftest() -> bool {
         crate::apic::pit_sleep_us(500);
     }
 
+    // Disable Nagle so the two small segments go out at once (Stage 23c would otherwise hold the second
+    // sub-MSS segment while the first is unacknowledged); this test controls segment timing directly.
+    tcp::set_nodelay(client_port, port, true);
+
     // Split a payload into two segments and send them with the reorder hook armed: segment #1 is held back
     // and segment #2 goes on the wire first, so the receiver sees them out of order.
     let payload = b"aether tcp reassembly 22a: out-of-order splice";
@@ -1118,6 +1122,10 @@ pub fn tcp_flow_control_loopback_selftest() -> bool {
         poll();
         crate::apic::pit_sleep_us(500);
     }
+
+    // Disable Nagle so each sub-MSS chunk goes out immediately (Stage 23c would otherwise coalesce them
+    // while data is unacknowledged); this test drives the window with precisely-sized chunks.
+    tcp::set_nodelay(client_port, port, true);
 
     // 1. Fill the receiver's window exactly, in chunks small enough to fit a loopback frame. The advertised
     //    window (free receive-buffer space) shrinks to zero as the unread bytes accumulate.
@@ -1665,6 +1673,71 @@ pub fn tcp_delayed_ack_loopback_selftest() -> bool {
     serial_println!(
         "[net] TCP delayed-ACK loopback selftest: {} data segments drew {} ACK(s), coalesced {}, delivered {}/{} in order {}, ok = {}",
         segs, acks, coalesced, got.len(), total, in_order, ok,
+    );
+    ok
+}
+
+/// Stage 23c self-test of **Nagle's algorithm** (RFC 896) via PHY loopback. Nagle coalesces a burst of
+/// small writes: while earlier data is unacknowledged, a sub-MSS write is held (buffered) rather than sent,
+/// until the outstanding data is acknowledged or a full segment accumulates — so many tiny writes leave as
+/// a few packets instead of one packet each. This sends a run of one-byte writes with Nagle *on* (the
+/// default) and confirms they were coalesced into **far fewer segments than writes**, with every byte still
+/// delivered in order. (The complementary `TCP_NODELAY` path — send each write at once — is exercised by the
+/// reassembly and flow-control self-tests, which enable it.)
+pub fn tcp_nagle_loopback_selftest() -> bool {
+    tcp::reset_connections();
+    let port: u16 = 7789;
+    tcp::open_passive(port);
+
+    e1000::set_loopback(true);
+    let mut sink = [0u8; 2048];
+    while e1000::poll_frame(&mut sink).is_some() {}
+
+    let client_port = match tcp_connect(our_ip(), port) {
+        Some(p) => p,
+        None => {
+            e1000::set_loopback(false);
+            serial_println!("[net] TCP Nagle loopback selftest: handshake failed");
+            return false;
+        }
+    };
+    for _ in 0..200 {
+        if tcp::established_count() >= 2 {
+            break;
+        }
+        poll();
+        crate::apic::pit_sleep_us(500);
+    }
+
+    // Write a run of single bytes with Nagle on. The first goes out immediately (nothing outstanding); the
+    // rest are held and coalesced behind it, so they leave as one further segment once the first is acked.
+    let writes = 16usize;
+    let expected: Vec<u8> = (0..writes).map(|i| (i + 1) as u8).collect();
+    let segs_before = tcp::data_segments_sent();
+    for b in &expected {
+        tcp_send(client_port, port, &[*b]);
+    }
+
+    let mut got: Vec<u8> = Vec::new();
+    for _ in 0..8000 {
+        poll();
+        if let Some(chunk) = tcp_read(port, client_port, 8192) {
+            got.extend_from_slice(&chunk);
+        }
+        if got.len() >= writes && tcp::all_data_acked(client_port, port) == Some(true) {
+            break;
+        }
+        crate::apic::pit_sleep_us(300);
+    }
+    e1000::set_loopback(false);
+
+    let segs = tcp::data_segments_sent() - segs_before;
+    let coalesced = segs < writes as u64; // far fewer segments than the 16 writes -> Nagle coalesced them
+    let in_order = got == expected;
+    let ok = coalesced && in_order && got.len() == writes;
+    serial_println!(
+        "[net] TCP Nagle loopback selftest: {} write(s) sent as {} segment(s), coalesced {}, delivered {}/{} in order {}, ok = {}",
+        writes, segs, coalesced, got.len(), writes, in_order, ok,
     );
     ok
 }

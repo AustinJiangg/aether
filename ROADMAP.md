@@ -797,7 +797,7 @@ unify later.
 
 ## Post-roadmap tracks (Stage 23+)
 
-> **Status: in progress — Stage 23a-23b done.** With the original roadmap complete (stages 0-22d-3), four independent
+> **Status: in progress — Stage 23a-23c done.** With the original roadmap complete (stages 0-22d-3), four independent
 > follow-on tracks extend it. They are **not** strictly ordered by dependency, but the recommended sequence
 > is **23 → 24 → 25 → 26**, chosen by risk and blast radius: do the isolated TCP polish first (it rides the
 > momentum of the just-finished TCP work), then the socket capstone that makes the stack usable, then the
@@ -839,6 +839,19 @@ Isolated to `net/tcp.rs` plus a few `net/mod.rs` self-tests; no new subsystems, 
 > several segments (which arrive paired), then sends eight in-order segments and confirms they drew only four
 > ACKs (coalesced) with the bytes still in order; the Stage 22a/22d-3 tests keep passing, confirming
 > out-of-order segments are still ACKed immediately. Verified by 82 tests (the new `tcp_coalesces_acks`).
+>
+> **Stage 23c is done — Nagle's algorithm (RFC 896).** The sender coalesces a burst of small writes. In
+> `flush`, while earlier data is unacknowledged (`inflight != 0`), a sub-MSS chunk is now **held** (left in
+> `snd_buf`) instead of sent — it leaves only once a full MSS accumulates or the outstanding data is
+> acknowledged; a write is still sent immediately when nothing is outstanding, or when the application set
+> **`TCP_NODELAY`** (`set_nodelay`). Proved via loopback: `tcp_nagle_loopback_selftest` issues sixteen
+> one-byte writes with Nagle on and confirms they left as just **two** segments (the first byte immediately,
+> the rest coalesced behind it) with every byte still in order. Nagle changes small-segment timing, so the
+> two prior tests that drive precisely-sized sub-MSS segments — reassembly (22a) and flow control (22b) —
+> now set `TCP_NODELAY` (they exercise segment-level mechanics, which real latency-sensitive apps also
+> disable Nagle for); every other test is unaffected (their sends are full MSS segments, or single writes
+> with nothing outstanding). Verified by 83 tests (the new `tcp_coalesces_small_writes`). This leaves only
+> Stage 23d (SACK) in the TCP-refinements track.
 
 | Sub-step | What to build | OS concepts | Smallest verifiable step |
 |----------|---------------|-------------|--------------------------|

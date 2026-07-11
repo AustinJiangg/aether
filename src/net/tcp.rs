@@ -413,6 +413,10 @@ struct Tcb {
     unacked_segs: u32,
     /// Stage 23b: the tick by which a pending **delayed ACK** must be sent, or 0 if none is pending.
     delayed_ack_deadline: u64,
+    /// Stage 23c: whether **Nagle's algorithm is disabled** (`TCP_NODELAY`). With Nagle on (the default,
+    /// `false`), a sub-MSS segment is held while earlier data is unacknowledged, coalescing small writes;
+    /// with it disabled, every write is sent at once (for latency-sensitive traffic).
+    nodelay: bool,
     /// Receive space: `nxt` = next seq we expect from the peer, `irs` = the peer's initial seq.
     rcv_nxt: u32,
     irs: u32,
@@ -472,6 +476,7 @@ pub fn open_passive(local_port: u16) {
         rtt_valid: false,
         unacked_segs: 0,
         delayed_ack_deadline: 0,
+        nodelay: false,
         rcv_nxt: 0,
         irs: 0,
         rx: Vec::new(),
@@ -512,6 +517,7 @@ pub fn open_active(
         rtt_valid: false,
         unacked_segs: 0,
         delayed_ack_deadline: 0,
+        nodelay: false,
         rcv_nxt: 0, // unknown until the SYN-ACK tells us the peer's ISN
         irs: 0,
         rx: Vec::new(),
@@ -1092,6 +1098,21 @@ pub fn queue_send(local_port: u16, remote_port: u16, data: &[u8]) -> bool {
     }
 }
 
+/// Stage 23c: set (or clear) `TCP_NODELAY` on the connection `(local_port, remote_port)` — `true` disables
+/// Nagle's algorithm, so every write is sent at once instead of small ones being coalesced. Returns `false`
+/// if there is no such connection. Latency-sensitive traffic disables Nagle; so do the self-tests that need
+/// to control exactly when each (small) segment goes on the wire.
+pub fn set_nodelay(local_port: u16, remote_port: u16, enabled: bool) -> bool {
+    let mut table = CONNECTIONS.lock();
+    match table.iter_mut().find(|c| c.local_port == local_port && c.remote_port == remote_port) {
+        Some(tcb) => {
+            tcb.nodelay = enabled;
+            true
+        }
+        None => false,
+    }
+}
+
 /// Stage 22c: build and record one data segment carrying the next `n` bytes of the send buffer, and return
 /// it for transmission. Drains `n` bytes from `snd_buf`, stamps `seq = snd_nxt` (advancing it), sets
 /// `PSH | ACK`, and queues the segment on the retransmit list so a lost data segment is recovered (Stage
@@ -1157,7 +1178,16 @@ pub fn flush(local_ip: [u8; 4]) -> Vec<(Vec<u8>, [u8; 4])> {
                 }
                 break;
             }
-            let n = core::cmp::min(usable as usize, tcb.snd_buf.len()).min(MSS);
+            let available = core::cmp::min(usable as usize, tcb.snd_buf.len());
+            // Stage 23c: Nagle's algorithm — while earlier data is still unacknowledged, only send a
+            // *full-sized* segment; a partial one is held (left in `snd_buf`) until an MSS accumulates or the
+            // outstanding data is acknowledged. This coalesces a burst of small writes into fewer packets. It
+            // does not apply when nothing is outstanding (send the small write immediately) or when the
+            // application set `TCP_NODELAY`.
+            if available < MSS && inflight != 0 && !tcb.nodelay {
+                break;
+            }
+            let n = available.min(MSS);
             let seg = emit_segment(tcb, local_ip, n);
             out.push((seg, tcb.remote_ip));
         }

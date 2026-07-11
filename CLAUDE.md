@@ -337,8 +337,11 @@ round-trip times (Karn's algorithm; `srtt`/`rttvar`/`rto` on the `Tcb`, `rto = c
 MAX)`). **Stage 23b is also done**: delayed ACKs (RFC 1122) — the receiver acknowledges only every second
 in-order segment (or after a 50 ms timer, `flush_delayed_acks`), halving ACK traffic, while out-of-order /
 gap-filling segments are still ACKed immediately (so fast retransmit is unaffected); slow start switched to
-byte-counting (RFC 3465 ABC) so the halved ACK count does not slow the ramp. `ROADMAP.md` records the full
-staged history (stages 0-22d-3 complete, Stage 23a-23b done).
+byte-counting (RFC 3465 ABC) so the halved ACK count does not slow the ramp. **Stage 23c is also done**:
+Nagle's algorithm (RFC 896) — the sender coalesces small writes, holding a sub-MSS segment in `flush` while
+earlier data is unacknowledged (unless nothing is outstanding, or `TCP_NODELAY` is set via `set_nodelay`), so
+sixteen one-byte writes leave as two segments. `ROADMAP.md` records the full staged history (stages 0-22d-3
+complete, Stage 23a-23c done).
 
 ## Language and writing conventions
 
@@ -887,6 +890,11 @@ Exit QEMU: `Ctrl-A` then `X`.
   switched to byte-counting slow start (RFC 3465 ABC, `min(bytes_acked, 2*MSS)`) so the halved ACK count does
   not halve the ramp (the 22d cwnd numbers are unchanged). The `acks_sent` counter backs
   `net::tcp_delayed_ack_loopback_selftest`, which confirms eight in-order segments draw only four ACKs.
+  **Stage 23c** adds **Nagle's algorithm (RFC 896)**: `flush` holds a sub-MSS chunk (leaving it in `snd_buf`)
+  while earlier data is unacknowledged, coalescing small writes — unless nothing is outstanding or the
+  connection set `TCP_NODELAY` (`set_nodelay`, which the reassembly/flow-control self-tests enable so their
+  precisely-sized small segments still go out at once). `net::tcp_nagle_loopback_selftest` confirms sixteen
+  one-byte writes leave as two segments.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run
