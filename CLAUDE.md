@@ -284,11 +284,17 @@ IPv4 address instead of hardcoding it. `net/dhcp.rs` builds/parses the BOOTP-bas
 and `net::dhcp_configure` runs the four-step DORA exchange (DISCOVER/OFFER/REQUEST/ACK) against SLIRP's
 built-in server, making our address **dynamic** (`OUR_IP` is now a runtime `CURRENT_IP` read via
 `our_ip()`, `0.0.0.0` until leased) — boot leases `10.0.2.15` (gateway `10.0.2.2`, DNS `10.0.2.3`) over
-the wire, and `ifconfig` shows the lease (Stage 20b). **Stage 21 (TCP) has begun** — the stack's first
-*reliable* transport: `net/tcp.rs` holds the pure segment layer (Stage 21a) and the connection state
-machine + three-way handshake (Stage 21b), proved by a PHY-loopback self-connect where a client and a
-server TCB both reach ESTABLISHED (SYN/SYN-ACK/ACK); data transfer, teardown, and retransmission are the
-remaining sub-steps. `ROADMAP.md` records the full staged history (stages 0-21b).
+the wire, and `ifconfig` shows the lease (Stage 20b). **Stage 21 (TCP) is also done — completing the
+networking track and the whole roadmap** — the stack's first *reliable*, connection-oriented transport,
+in `net/tcp.rs`: the pure segment layer (21a), the connection state machine + three-way handshake (21b),
+in-order data transfer with acknowledgements (21c), the FIN teardown handshake with TIME_WAIT (21d), and
+retransmission timers (21e). Every sent segment is kept on a per-connection retransmit queue; a timer
+(`on_tick`, serviced each `net::poll`, off the global 100 Hz tick counter) resends the oldest
+unacknowledged segment past its RTO with exponential backoff and expires TIME_WAIT to CLOSED after 2*MSL.
+All five sub-steps are proved deterministically with no peer via PHY loopback (a self-connect where a
+client and a server TCB drive both halves of every exchange), 21e using a "drop the next TCP frame" fault
+hook so the retransmission timer can be exercised. `ROADMAP.md` records the full staged history
+(stages 0-21e).
 
 ## Language and writing conventions
 
@@ -762,8 +768,21 @@ Exit QEMU: `Ctrl-A` then `X`.
   all behind a `Mutex<Vec<Tcb>>` connection table. `net::receive` dispatches IPv4 protocol 6 to `handle_tcp`
   (which transmits any response), and `net::tcp_connect` sends the SYN and pumps `poll` until ESTABLISHED
   (our own MAC for a loopback destination, no ARP). `tcp_handshake_loopback_selftest` connects to ourselves
-  over PHY loopback so a client and a server TCB both reach ESTABLISHED (SYN/SYN-ACK/ACK). Still to come:
-  data transfer (21c), teardown (21d), retransmission (21e).
+  over PHY loopback so a client and a server TCB both reach ESTABLISHED (SYN/SYN-ACK/ACK). Stage 21c adds
+  **in-order data transfer**: the `Tcb` grows a receive buffer, `on_established` accepts payload with
+  `seq == rcv_nxt` (advancing `rcv_nxt` and ACKing) and processes incoming ACKs (advancing `snd_una`), and
+  `tcp::send_data`/`net::tcp_send` build and transmit a `PSH|ACK` data segment; `tcp_data_loopback_selftest`
+  sends a payload to itself and confirms the bytes arrive in order and acknowledged. Stage 21d adds the
+  **FIN teardown handshake** — the `State` enum grows `FinWait1`/`FinWait2`/`TimeWait` (active closer),
+  `CloseWait`/`LastAck` (passive), and `Closing` (simultaneous close); a FIN, like a SYN, consumes one
+  sequence number, so no new TCB fields are needed; `tcp::close`/`net::tcp_close` send our FIN, and
+  `tcp_teardown_loopback_selftest` closes both ends until the active closer is TIME_WAIT and the passive
+  closer CLOSED. Stage 21e adds **retransmission timers**: each sent segment (data or FIN) is queued in
+  `Tcb::retransmit`, `process_ack` drops it once `snd_una` reaches its `end_seq`, and `tcp::on_tick` (run
+  each `net::poll`, timed off `interrupts::timer_ticks`) resends the oldest unacked segment past its RTO
+  with exponential backoff (aborting after `MAX_RETRIES`) and expires TIME_WAIT to CLOSED after 2*MSL;
+  `tcp_retransmit_loopback_selftest` arms a `DROP_NEXT_TCP_TX` loss hook to drop a data segment and confirms
+  the timer recovers it (then that TIME_WAIT expires). This completes Stage 21 (TCP) and the roadmap.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run
