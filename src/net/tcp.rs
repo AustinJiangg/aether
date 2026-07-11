@@ -66,6 +66,46 @@ pub const URG: u8 = 0x20;
 /// Mask of the six flags we recognize, used when parsing a peer's segment.
 const FLAG_MASK: u8 = 0x3F;
 
+// Stage 23d-1: TCP **options** — the variable-length trailer after the fixed 20-byte header, present only
+// when the data offset is > 5 words. Each option is either a single byte (END/NOP, for termination and
+// alignment) or a `[kind, length, value...]` TLV whose `length` counts the kind and length bytes too. This
+// is the stack's first use of options: 23d-1 negotiates SACK-permitted (a bare capability flag), and 23d-2
+// will carry SACK blocks in ACKs.
+const OPT_END: u8 = 0; // end of the option list; the rest of the header (to the data offset) is padding
+const OPT_NOP: u8 = 1; // no-operation, one byte, used to align a following option
+/// RFC 2018 **SACK-permitted**: a two-byte option (`kind 4, length 2`, no value) sent *only in a SYN* to
+/// tell the peer "I understand selective acknowledgment". SACK is enabled on a connection only if *both*
+/// SYNs carry it (the negotiation below).
+const OPT_SACK_PERMITTED: u8 = 4;
+/// The SACK-permitted option's on-the-wire bytes (`[kind, length]`, no value).
+const SACK_PERMITTED_OPTION: [u8; 2] = [OPT_SACK_PERMITTED, 2];
+
+/// Find the value bytes of the first option of kind `want` in a TCP option field, or `None` if it is
+/// absent. Walks the TLV sequence, honoring the one-byte END (stop) and NOP (skip-one) options, and is
+/// bounds-checked so a malformed or truncated option field can never read past `options`. The returned
+/// slice is the option's *value* — its bytes after the two-byte `[kind, length]` prefix (empty for a
+/// length-2 option like SACK-permitted).
+fn find_option(options: &[u8], want: u8) -> Option<&[u8]> {
+    let mut i = 0;
+    while i < options.len() {
+        match options[i] {
+            OPT_END => return None, // end of the list; nothing more to scan
+            OPT_NOP => i += 1,      // one-byte padding
+            kind => {
+                let len = *options.get(i + 1)? as usize; // TLV: [kind, len, value...]
+                if len < 2 || i + len > options.len() {
+                    return None; // malformed length — stop rather than misread
+                }
+                if kind == want {
+                    return Some(&options[i + 2..i + len]);
+                }
+                i += len;
+            }
+        }
+    }
+    None
+}
+
 /// A parsed, borrowed TCP segment. `payload` borrows the caller's buffer, starting after the header (and
 /// any options), so it is the actual stream bytes this segment carries (empty for a pure control segment
 /// like SYN or ACK).
@@ -81,6 +121,9 @@ pub struct Segment<'a> {
     pub flags: u8,
     /// The sender's current receive window (flow control), in bytes.
     pub window: u16,
+    /// Stage 23d-1: the raw **option** bytes between the fixed header and the payload (empty when the data
+    /// offset is 5). Interpreted via [`find_option`]; the handshake reads [`Segment::sack_permitted`].
+    pub options: &'a [u8],
     pub payload: &'a [u8],
 }
 
@@ -103,16 +146,24 @@ impl<'a> Segment<'a> {
             ack: u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]),
             flags: buf[13] & FLAG_MASK,
             window: u16::from_be_bytes([buf[14], buf[15]]),
-            // Skip any options (data_offset past the fixed header) to reach the stream bytes.
+            // The options occupy [HEADER_LEN, data_offset); the stream bytes begin at data_offset.
+            options: &buf[HEADER_LEN..data_offset],
             payload: &buf[data_offset..],
         })
+    }
+
+    /// Stage 23d-1: whether this segment carries the RFC 2018 **SACK-permitted** option — only meaningful in
+    /// a SYN / SYN-ACK. The handshake reads it to decide whether selective acknowledgment is enabled on the
+    /// connection.
+    pub fn sack_permitted(&self) -> bool {
+        find_option(self.options, OPT_SACK_PERMITTED).is_some()
     }
 }
 
 /// Build a TCP segment — a 20-byte header (no options) with a correct checksum, followed by `payload`.
 /// The source/destination IPs are not stored in the segment; they are needed only for the checksum's
 /// pseudo-header (see [`checksum`]), the same layering shortcut UDP makes. `flags` is an OR of the flag
-/// constants (e.g. `SYN`, or `SYN | ACK`).
+/// constants (e.g. `SYN`, or `SYN | ACK`). The common no-options case; [`build_with_options`] adds options.
 #[allow(clippy::too_many_arguments)]
 pub fn build(
     src_ip: [u8; 4],
@@ -125,16 +176,41 @@ pub fn build(
     window: u16,
     payload: &[u8],
 ) -> Vec<u8> {
-    let mut seg = Vec::with_capacity(HEADER_LEN + payload.len());
+    build_with_options(src_ip, dst_ip, src_port, dst_port, seq, ack, flags, window, &[], payload)
+}
+
+/// Stage 23d-1: build a TCP segment carrying `options` (raw option TLV bytes) between the fixed header and
+/// `payload`. The options are zero-padded up to a 4-byte boundary — a trailing zero reads as the END-of-list
+/// option, so the padding is inert — and the **data offset** field is set to match, so the peer's parser
+/// skips exactly the option bytes. The checksum covers the header, the (padded) options, and the payload.
+#[allow(clippy::too_many_arguments)]
+pub fn build_with_options(
+    src_ip: [u8; 4],
+    dst_ip: [u8; 4],
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    options: &[u8],
+    payload: &[u8],
+) -> Vec<u8> {
+    // The header must be a whole number of 32-bit words, so round the options up to a 4-byte multiple.
+    let padded = (options.len() + 3) & !3;
+    let data_offset_words = (HEADER_LEN + padded) / 4;
+    let mut seg = Vec::with_capacity(HEADER_LEN + padded + payload.len());
     seg.extend_from_slice(&src_port.to_be_bytes());
     seg.extend_from_slice(&dst_port.to_be_bytes());
     seg.extend_from_slice(&seq.to_be_bytes());
     seg.extend_from_slice(&ack.to_be_bytes());
-    seg.push(5 << 4); // data offset = 5 words (20 bytes, no options); reserved bits zero
+    seg.push((data_offset_words as u8) << 4); // data offset in 32-bit words; reserved bits zero
     seg.push(flags);
     seg.extend_from_slice(&window.to_be_bytes());
     seg.extend_from_slice(&[0, 0]); // checksum placeholder, zero for the computation below
     seg.extend_from_slice(&[0, 0]); // urgent pointer (unused)
+    seg.extend_from_slice(options);
+    seg.resize(HEADER_LEN + padded, 0); // zero-pad the options out to the 4-byte boundary
     seg.extend_from_slice(payload);
 
     let ck = checksum(src_ip, dst_ip, &seg);
@@ -417,6 +493,10 @@ struct Tcb {
     /// `false`), a sub-MSS segment is held while earlier data is unacknowledged, coalescing small writes;
     /// with it disabled, every write is sent at once (for latency-sensitive traffic).
     nodelay: bool,
+    /// Stage 23d-1: whether **selective acknowledgment (SACK, RFC 2018)** was negotiated on this connection
+    /// — set true only when *both* SYNs carried the SACK-permitted option (our SYN always offers it; the peer
+    /// confirms by echoing it). 23d-1 only records the capability; 23d-2 uses it to carry SACK blocks.
+    sack_permitted: bool,
     /// Receive space: `nxt` = next seq we expect from the peer, `irs` = the peer's initial seq.
     rcv_nxt: u32,
     irs: u32,
@@ -477,6 +557,7 @@ pub fn open_passive(local_port: u16) {
         unacked_segs: 0,
         delayed_ack_deadline: 0,
         nodelay: false,
+        sack_permitted: false,
         rcv_nxt: 0,
         irs: 0,
         rx: Vec::new(),
@@ -518,6 +599,7 @@ pub fn open_active(
         unacked_segs: 0,
         delayed_ack_deadline: 0,
         nodelay: false,
+        sack_permitted: false, // set once the SYN-ACK confirms the peer also permits SACK (Stage 23d-1)
         rcv_nxt: 0, // unknown until the SYN-ACK tells us the peer's ISN
         irs: 0,
         rx: Vec::new(),
@@ -525,7 +607,19 @@ pub fn open_active(
         retransmit: Vec::new(),
         time_wait_deadline: 0,
     });
-    build(local_ip, remote_ip, local_port, remote_port, iss, 0, SYN, window_for(0), &[])
+    // Offer SACK on the SYN (Stage 23d-1); the peer enables it only by echoing the option in its SYN-ACK.
+    build_with_options(
+        local_ip,
+        remote_ip,
+        local_port,
+        remote_port,
+        iss,
+        0,
+        SYN,
+        window_for(0),
+        &SACK_PERMITTED_OPTION,
+        &[],
+    )
 }
 
 /// Process one received TCP segment against the connection table, advancing the relevant TCB's state
@@ -563,8 +657,12 @@ pub fn on_segment(local_ip: [u8; 4], remote_ip: [u8; 4], seg: &Segment) -> Optio
             tcb.snd_una = iss;
             tcb.snd_nxt = iss.wrapping_add(1); // our SYN consumes one seq
             tcb.snd_wnd = seg.window as u32; // learn the peer's receive window from its SYN (Stage 22c)
+            // Stage 23d-1: enable SACK only if the peer offered it, and echo the option back only then, so
+            // both ends agree (RFC 2018). A SYN without it leaves the connection non-SACK.
+            tcb.sack_permitted = seg.sack_permitted();
             tcb.state = State::SynReceived;
-            return Some(build(
+            let options: &[u8] = if tcb.sack_permitted { &SACK_PERMITTED_OPTION } else { &[] };
+            return Some(build_with_options(
                 local_ip,
                 remote_ip,
                 tcb.local_port,
@@ -573,6 +671,7 @@ pub fn on_segment(local_ip: [u8; 4], remote_ip: [u8; 4], seg: &Segment) -> Optio
                 tcb.rcv_nxt,
                 SYN | ACK,
                 recv_window(tcb),
+                options,
                 &[],
             ));
         }
@@ -594,6 +693,8 @@ fn step(tcb: &mut Tcb, local_ip: [u8; 4], remote_ip: [u8; 4], seg: &Segment) -> 
                 tcb.rcv_nxt = seg.seq.wrapping_add(1);
                 tcb.snd_una = seg.ack;
                 tcb.snd_wnd = seg.window as u32; // learn the peer's window from its SYN-ACK (Stage 22c)
+                // Stage 23d-1: the SYN-ACK echoing SACK-permitted means both ends offered it — SACK is on.
+                tcb.sack_permitted = seg.sack_permitted();
                 tcb.state = State::Established;
                 // Complete the handshake with the final ACK.
                 return Some(build(
@@ -1345,6 +1446,17 @@ pub fn rtt_sampled(local_port: u16, remote_port: u16) -> Option<bool> {
         .iter()
         .find(|c| c.local_port == local_port && c.remote_port == remote_port)
         .map(|c| c.rtt_valid)
+}
+
+/// Stage 23d-1: whether **selective acknowledgment (SACK)** was negotiated on `(local_port, remote_port)` —
+/// true only when both ends carried the RFC 2018 SACK-permitted option in the handshake. `None` if no such
+/// connection. 23d-1 only negotiates the capability; 23d-2 will use it to carry SACK blocks.
+pub fn sack_permitted(local_port: u16, remote_port: u16) -> Option<bool> {
+    CONNECTIONS
+        .lock()
+        .iter()
+        .find(|c| c.local_port == local_port && c.remote_port == remote_port)
+        .map(|c| c.sack_permitted)
 }
 
 /// The state of the connection identified by `(local_port, remote_port)`, or `None` if there is no such

@@ -1417,6 +1417,53 @@ fn tcp_coalesces_small_writes() {
     );
 }
 
+/// Stage 23d-1: TCP options build/parse — the SACK-permitted option round-trips. Pure logic (no
+/// connection): build a SYN carrying the RFC 2018 SACK-permitted option and confirm the data offset grew
+/// past 5 words, the option is detected on parse, the segment still self-checksums, and a plain no-option
+/// SYN reports no SACK.
+#[test_case]
+fn tcp_sack_permitted_option_round_trips() {
+    use crate::net::tcp;
+
+    let src_ip = [10, 0, 2, 15];
+    let dst_ip = [10, 0, 2, 2];
+    // A SYN that offers SACK: the two-byte option (kind 4, len 2), padded out to a 4-byte boundary.
+    let syn = tcp::build_with_options(
+        src_ip, dst_ip, 40000, 80, 0x2222_3333, 0, tcp::SYN, 64240, &[4, 2], &[],
+    );
+    assert_eq!(syn.len(), tcp::HEADER_LEN + 4, "header grew by one padded option word");
+    assert_eq!(syn[12] >> 4, 6, "data offset = 6 words (24-byte header, one option word)");
+    assert_eq!(
+        tcp::checksum(src_ip, dst_ip, &syn),
+        0,
+        "a segment with options must still carry a valid checksum"
+    );
+
+    let s = tcp::Segment::parse(&syn).expect("SYN with options should parse");
+    assert_eq!(s.flags, tcp::SYN);
+    assert!(s.sack_permitted(), "the SACK-permitted option must be detected");
+    assert!(s.payload.is_empty(), "a SYN carries no stream data past its options");
+
+    // A plain SYN (no options) reports no SACK.
+    let plain = tcp::build(src_ip, dst_ip, 40000, 80, 0, 0, tcp::SYN, 64240, &[]);
+    let p = tcp::Segment::parse(&plain).expect("plain SYN should parse");
+    assert!(!p.sack_permitted(), "a SYN without the option reports no SACK");
+}
+
+/// Stage 23d-1: SACK-permitted negotiation via loopback — a client and a server TCB complete the handshake
+/// and both flag SACK enabled, proving the option round-trips on the wire and both sides record the
+/// negotiation. Exercises the option build/parse path inside a real handshake, not just in isolation.
+#[test_case]
+fn tcp_negotiates_sack_over_loopback() {
+    use crate::net;
+
+    assert!(crate::e1000::present(), "e1000 not initialized");
+    assert!(
+        net::tcp_sack_negotiation_loopback_selftest(),
+        "TCP SACK-permitted negotiation over loopback failed"
+    );
+}
+
 /// Stage 19b-2: the live DNS resolver — resolve a hostname through SLIRP's DNS server over the wire.
 /// Unlike the SLIRP-internal gateway ping, this depends on the *host* having working upstream DNS
 /// (SLIRP forwards to it), so the test is lenient: it always exercises the full path (build the query,

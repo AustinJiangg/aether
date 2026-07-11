@@ -1863,6 +1863,50 @@ pub fn tcp_handshake_loopback_selftest() -> bool {
     connected && established >= 2
 }
 
+/// Stage 23d-1 self-test: complete a loopback handshake and confirm **both** ends negotiated SACK-permitted
+/// (RFC 2018), the stack's first use of TCP options. Our SYN offers the option and the SYN-ACK echoes it
+/// back, so after the handshake each TCB has the flag set — proving the option round-trips on the wire
+/// (parsed past the enlarged data offset) and the negotiation records it on both sides. Returns whether
+/// both connections are established and both flagged SACK-permitted.
+pub fn tcp_sack_negotiation_loopback_selftest() -> bool {
+    tcp::reset_connections();
+    let port: u16 = 7779;
+    tcp::open_passive(port); // a listener to accept our own SYN
+
+    e1000::set_loopback(true);
+    // Drain stale frames so the handshake sees a clean ring.
+    let mut sink = [0u8; 2048];
+    while e1000::poll_frame(&mut sink).is_some() {}
+
+    let client_port = match tcp_connect(our_ip(), port) {
+        Some(p) => p,
+        None => {
+            e1000::set_loopback(false);
+            serial_println!("[net] TCP SACK negotiation selftest: connect failed");
+            return false;
+        }
+    };
+    // Pump until the listener also reaches ESTABLISHED (it records SACK from the looped-back SYN).
+    for _ in 0..200 {
+        if tcp::established_count() >= 2 {
+            break;
+        }
+        poll();
+        crate::apic::pit_sleep_us(500);
+    }
+    e1000::set_loopback(false);
+
+    let established = tcp::established_count();
+    // The listener's TCB is keyed by (our port, the client's ephemeral port) — the mirror of the client's.
+    let client_sack = tcp::sack_permitted(client_port, port).unwrap_or(false);
+    let server_sack = tcp::sack_permitted(port, client_port).unwrap_or(false);
+    serial_println!(
+        "[net] TCP SACK negotiation selftest: established = {}, client SACK = {}, server SACK = {}",
+        established, client_sack, server_sack,
+    );
+    established >= 2 && client_sack && server_sack
+}
+
 /// Stage 18d: parse a dotted-decimal IPv4 address (`"10.0.2.2"`) into four octets, or `None` if it is
 /// malformed (wrong number of parts, non-numeric, or an octet out of 0..=255). Used by the shell's
 /// `ping` command. `u8::from_str` (via `parse`) rejects out-of-range and non-digit octets for us.

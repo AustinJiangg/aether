@@ -998,6 +998,13 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             let tcp_nagle_ok = net::tcp_nagle_loopback_selftest();
             serial_println!("[ OK ] net 23c: TCP Nagle over loopback = {}", tcp_nagle_ok);
 
+            // Stage 23d-1 (networking): TCP options infrastructure + SACK-permitted negotiation — the SYN and
+            // SYN-ACK now carry the RFC 2018 SACK-permitted option, the stack's first use of TCP options.
+            // Prove it via loopback: after the handshake both ends have SACK enabled (the option round-tripped
+            // past the enlarged data offset and the negotiation recorded it on both sides).
+            let tcp_sack_ok = net::tcp_sack_negotiation_loopback_selftest();
+            serial_println!("[ OK ] net 23d-1: TCP SACK-permitted negotiated = {}", tcp_sack_ok);
+
             match net::ping(gw) {
                 Some(seq) => {
                     serial_println!(

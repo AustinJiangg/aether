@@ -797,7 +797,7 @@ unify later.
 
 ## Post-roadmap tracks (Stage 23+)
 
-> **Status: in progress — Stage 23a-23c done.** With the original roadmap complete (stages 0-22d-3), four independent
+> **Status: in progress — Stage 23a-23c and 23d-1 done.** With the original roadmap complete (stages 0-22d-3), four independent
 > follow-on tracks extend it. They are **not** strictly ordered by dependency, but the recommended sequence
 > is **23 → 24 → 25 → 26**, chosen by risk and blast radius: do the isolated TCP polish first (it rides the
 > momentum of the just-finished TCP work), then the socket capstone that makes the stack usable, then the
@@ -852,6 +852,25 @@ Isolated to `net/tcp.rs` plus a few `net/mod.rs` self-tests; no new subsystems, 
 > disable Nagle for); every other test is unaffected (their sends are full MSS segments, or single writes
 > with nothing outstanding). Verified by 83 tests (the new `tcp_coalesces_small_writes`). This leaves only
 > Stage 23d (SACK) in the TCP-refinements track.
+>
+> **Stage 23d-1 is done — TCP options infrastructure + SACK-permitted negotiation.** SACK (selective
+> acknowledgment) is carried in **TCP options**, the variable-length trailer after the fixed 20-byte header,
+> which the stack had never used before now (the data offset was always 5). 23d-1 lays that groundwork and
+> uses it for the simplest option, the RFC 2018 **SACK-permitted** capability flag; 23d-2 will carry the
+> actual SACK blocks. In `net/tcp.rs`: `build_with_options` appends raw option bytes between the header and
+> payload, zero-padded to a 4-byte boundary with the **data offset** set to match (`build` is now its
+> no-options wrapper, so every existing call site is unchanged); `Segment` grows an `options` slice and a
+> `sack_permitted()` accessor over a bounds-checked TLV walker (`find_option`, honoring the one-byte
+> END/NOP options). The handshake negotiates per RFC 2018: our SYN (`open_active`) always offers
+> SACK-permitted (`kind 4, length 2`), a listener echoes it in its SYN-ACK **only if the incoming SYN
+> carried it** (`on_segment`), and each end records the outcome on a new `Tcb::sack_permitted` (the active
+> opener from the SYN-ACK, the passive opener from the SYN) — so SACK is enabled only when *both* SYNs
+> offered it. Proved deterministically with no peer via PHY loopback: `tcp_sack_negotiation_loopback_selftest`
+> completes a loopback handshake and confirms both the client and server TCBs flagged SACK — boot logs
+> "TCP SACK negotiation selftest: established = 2, client SACK = true, server SACK = true". Verified by 85
+> tests (the pure `tcp_sack_permitted_option_round_trips` — a SYN's option round-trips through build/parse
+> with the enlarged data offset and a valid checksum — and the live `tcp_negotiates_sack_over_loopback`).
+> (Remaining: Stage 23d-2, SACK blocks in ACKs + the sender retransmitting only the holes.)
 
 | Sub-step | What to build | OS concepts | Smallest verifiable step |
 |----------|---------------|-------------|--------------------------|

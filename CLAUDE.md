@@ -340,8 +340,14 @@ gap-filling segments are still ACKed immediately (so fast retransmit is unaffect
 byte-counting (RFC 3465 ABC) so the halved ACK count does not slow the ramp. **Stage 23c is also done**:
 Nagle's algorithm (RFC 896) — the sender coalesces small writes, holding a sub-MSS segment in `flush` while
 earlier data is unacknowledged (unless nothing is outstanding, or `TCP_NODELAY` is set via `set_nodelay`), so
-sixteen one-byte writes leave as two segments. `ROADMAP.md` records the full staged history (stages 0-22d-3
-complete, Stage 23a-23c done).
+sixteen one-byte writes leave as two segments. **Stage 23d-1 is also done**: TCP options infrastructure +
+SACK-permitted negotiation (RFC 2018) — the stack's first use of TCP **options** (the variable-length trailer
+after the 20-byte header, previously never emitted). `build_with_options` appends option bytes zero-padded to
+a 4-byte boundary with the data offset set to match (`build` is now its no-options wrapper); `Segment` gains an
+`options` slice + a `sack_permitted()` accessor over a bounds-checked TLV walker (`find_option`). The handshake
+negotiates: our SYN always offers SACK-permitted, a listener echoes it in its SYN-ACK only if the SYN carried
+it, and each end records the result on `Tcb::sack_permitted` (so SACK is on only if both SYNs offered it).
+`ROADMAP.md` records the full staged history (stages 0-22d-3 complete, Stage 23a-23c and 23d-1 done).
 
 ## Language and writing conventions
 
@@ -894,7 +900,12 @@ Exit QEMU: `Ctrl-A` then `X`.
   while earlier data is unacknowledged, coalescing small writes — unless nothing is outstanding or the
   connection set `TCP_NODELAY` (`set_nodelay`, which the reassembly/flow-control self-tests enable so their
   precisely-sized small segments still go out at once). `net::tcp_nagle_loopback_selftest` confirms sixteen
-  one-byte writes leave as two segments.
+  one-byte writes leave as two segments. Stage 23d-1 adds TCP **options** (the first use in the stack):
+  `build_with_options` emits option bytes padded to a 4-byte boundary with the data offset set to match
+  (`build` delegates to it with no options), `Segment` exposes an `options` slice + `sack_permitted()` over a
+  bounds-checked TLV walker (`find_option`), and the SYN/SYN-ACK carry the RFC 2018 **SACK-permitted** option,
+  negotiated onto `Tcb::sack_permitted` (both SYNs must offer it). `net::tcp_sack_negotiation_loopback_selftest`
+  confirms both ends of a loopback handshake enable SACK.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run
