@@ -893,6 +893,15 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 net::tcp_segments_received(),
             );
 
+            // Stage 21c (networking): TCP data transfer. Once established, the connection is a reliable,
+            // ordered byte stream. Prove it via loopback: send a payload to ourselves and confirm the
+            // receiving end buffered exactly those bytes in order and the sending end saw them ACKed.
+            let tcp_data_ok = net::tcp_data_loopback_selftest();
+            serial_println!(
+                "[ OK ] net 21c: TCP data transfer over loopback = {}",
+                tcp_data_ok,
+            );
+
             match net::ping(gw) {
                 Some(seq) => {
                     serial_println!(

@@ -1238,6 +1238,18 @@ fn tcp_completes_handshake_over_loopback() {
     );
 }
 
+/// Stage 21c: TCP data transfer bidirectionally, via loopback (no external peer). Establish a loopback
+/// connection, send a payload from the client, and confirm the server buffered exactly those bytes in
+/// order and the client saw them acknowledged — exercising the send path (sequence tracking), the
+/// in-order receive path, and the ACK that closes the reliable-transfer loop.
+#[test_case]
+fn tcp_transfers_data_over_loopback() {
+    use crate::net;
+
+    assert!(crate::e1000::present(), "e1000 not initialized");
+    assert!(net::tcp_data_loopback_selftest(), "TCP data transfer over loopback failed");
+}
+
 /// Stage 19b-2: the live DNS resolver — resolve a hostname through SLIRP's DNS server over the wire.
 /// Unlike the SLIRP-internal gateway ping, this depends on the *host* having working upstream DNS
 /// (SLIRP forwards to it), so the test is lenient: it always exercises the full path (build the query,

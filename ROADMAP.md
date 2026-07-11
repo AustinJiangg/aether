@@ -609,9 +609,22 @@ unify later.
 > connects to *ourselves*, so a client TCB and a server TCB complete SYN / SYN-ACK / ACK and **both** reach
 > ESTABLISHED — boot logs "TCP handshake over loopback = true (3 segment(s) parsed)". Verified by 70 tests
 > (`tcp_segment_builds_and_parses` — pure build/parse incl. an options-skip and bad-offset rejection — and
-> the live `tcp_completes_handshake_over_loopback`). Still to come: **21c** data transfer (send/receive
-> stream bytes with ACKs and a sliding window), **21d** teardown (the FIN handshake, TIME_WAIT), and
-> **21e** retransmission timers.
+> the live `tcp_completes_handshake_over_loopback`).
+>
+> **Stage 21c** adds **data transfer** — the ESTABLISHED connection becomes a live, reliable, ordered byte
+> stream. The TCB grows a **receive buffer**, and `step`'s formerly-stubbed `Established` arm becomes
+> `on_established`: it advances `snd_una` over any of our sent bytes the peer now ACKs, accepts **in-order**
+> payload (`seq == rcv_nxt`) into the receive buffer while advancing `rcv_nxt`, and replies with an ACK for
+> every data segment (a duplicate/out-of-order segment is re-ACKed, not buffered — a gap waits for the
+> peer's retransmit in 21e; out-of-order reassembly is deliberately skipped). `tcp::send_data` builds a
+> `PSH|ACK` data segment from the connection's send state and advances `snd_nxt`; `net::tcp_send` frames and
+> transmits it, and the peer's ACK is processed by the normal `poll`/`handle_tcp` receive path. Proved
+> deterministically with no peer via PHY loopback: `tcp_data_loopback_selftest` establishes a loopback
+> connection, sends a payload from the client, and confirms the server buffered exactly those bytes **in
+> order** and the client saw them **acknowledged** — boot logs "TCP data transfer over loopback = true" (25
+> bytes received, acknowledged = true). Verified by 71 tests (`tcp_transfers_data_over_loopback`). Still to
+> come: **21d** teardown (the FIN handshake, TIME_WAIT) and **21e** retransmission timers (plus real
+> sliding-window flow control).
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

@@ -724,6 +724,91 @@ pub fn tcp_connect(remote_ip: [u8; 4], remote_port: u16) -> Option<u16> {
     None
 }
 
+/// Stage 21c: send application `data` on the established TCP connection `(local_port -> remote_port)`.
+/// Builds a data segment ([`tcp::send_data`], which advances the connection's send sequence), frames it
+/// as TCP-in-IPv4-in-Ethernet to the peer, and transmits. Returns `false` if there is no such established
+/// connection, or the peer's MAC cannot be resolved. The peer's ACK is processed by [`poll`]/[`handle_tcp`]
+/// when it arrives; there is no retransmission if this segment is lost (Stage 21e adds the timer).
+pub fn tcp_send(local_port: u16, remote_port: u16, data: &[u8]) -> bool {
+    let (seg, remote_ip) = match tcp::send_data(our_ip(), local_port, remote_port, data) {
+        Some(x) => x,
+        None => return false, // no established connection with this port pair
+    };
+    let mac = match tcp_next_hop(remote_ip) {
+        Some(m) => m,
+        None => return false, // cannot resolve the peer's MAC (no route)
+    };
+    let frame = ether::build(
+        mac,
+        our_mac(),
+        ether::ETHERTYPE_IPV4,
+        &ipv4::build(our_ip(), remote_ip, tcp::PROTO_TCP, &seg),
+    );
+    e1000::transmit(&frame);
+    true
+}
+
+/// Stage 21c self-test of TCP **data transfer** with no external peer, via PHY loopback — the follow-on to
+/// [`tcp_handshake_loopback_selftest`]. Establish a loopback connection (listen, then connect to
+/// ourselves), then send a payload from the client to the server: the data segment loops back, the server
+/// accepts it in order and ACKs, and that ACK loops back so the client marks the bytes acknowledged.
+/// Success proves the reliable byte stream in both directions — the send path (sequence tracking) on one
+/// end, the in-order receive path plus acknowledgement on the other. Returns whether the exact bytes were
+/// received in order *and* the sender saw them all acknowledged.
+pub fn tcp_data_loopback_selftest() -> bool {
+    tcp::reset_connections();
+    let port: u16 = 7778;
+    tcp::open_passive(port); // a listener to accept our own SYN
+
+    e1000::set_loopback(true);
+    // Drain stale frames so the exchange sees a clean ring.
+    let mut sink = [0u8; 2048];
+    while e1000::poll_frame(&mut sink).is_some() {}
+
+    // Handshake first (as in the 21b self-test), then let the server also reach ESTABLISHED.
+    let client_port = match tcp_connect(our_ip(), port) {
+        Some(p) => p,
+        None => {
+            e1000::set_loopback(false);
+            serial_println!("[net] TCP data loopback selftest: handshake failed");
+            return false;
+        }
+    };
+    for _ in 0..200 {
+        if tcp::established_count() >= 2 {
+            break;
+        }
+        poll();
+        crate::apic::pit_sleep_us(500);
+    }
+
+    // Send a payload from the client and pump: the data segment loops back (server buffers it and ACKs),
+    // then the ACK loops back (client marks the bytes acknowledged).
+    let payload = b"hello from aether tcp 21c";
+    tcp_send(client_port, port, payload);
+    let mut ok = false;
+    for _ in 0..400 {
+        poll();
+        let received = tcp::received_data(port, client_port);
+        let acked = tcp::all_data_acked(client_port, port) == Some(true);
+        if received.as_deref() == Some(&payload[..]) && acked {
+            ok = true;
+            break;
+        }
+        crate::apic::pit_sleep_us(500);
+    }
+    e1000::set_loopback(false);
+
+    let got = tcp::received_data(port, client_port).map(|d| d.len()).unwrap_or(0);
+    serial_println!(
+        "[net] TCP data loopback selftest: {} byte(s) received in order, acknowledged = {}, ok = {}",
+        got,
+        tcp::all_data_acked(client_port, port) == Some(true),
+        ok,
+    );
+    ok
+}
+
 /// Stage 21b self-test of the three-way handshake with no external peer, via PHY loopback. Listen on a
 /// port, then actively connect to *ourselves* on it: our SYN loops back, the listener answers SYN-ACK,
 /// that loops back and we answer ACK, which loops back to the listener — so both a client TCB and a

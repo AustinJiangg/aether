@@ -210,6 +210,10 @@ struct Tcb {
     /// Receive space: `nxt` = next seq we expect from the peer, `irs` = the peer's initial seq.
     rcv_nxt: u32,
     irs: u32,
+    /// Stage 21c: the **receive buffer** — in-order stream bytes we have accepted and acknowledged but
+    /// the application has not yet consumed. Data arriving with `seq == rcv_nxt` is appended here; a real
+    /// socket `read` would drain it. (No send-side retransmission buffer yet — that comes in Stage 21e.)
+    rx: Vec<u8>,
 }
 
 /// The connection table. Small and linear — one entry per connection (and one per listener). A real
@@ -244,6 +248,7 @@ pub fn open_passive(local_port: u16) {
         iss: 0,
         rcv_nxt: 0,
         irs: 0,
+        rx: Vec::new(),
     });
 }
 
@@ -268,6 +273,7 @@ pub fn open_active(
         iss,
         rcv_nxt: 0, // unknown until the SYN-ACK tells us the peer's ISN
         irs: 0,
+        rx: Vec::new(),
     });
     build(local_ip, remote_ip, local_port, remote_port, iss, 0, SYN, DEFAULT_WINDOW, &[])
 }
@@ -374,8 +380,114 @@ fn step(tcb: &mut Tcb, local_ip: [u8; 4], remote_ip: [u8; 4], seg: &Segment) -> 
             }
             None
         }
-        _ => None, // Established (data) and teardown states are handled in later sub-steps
+        State::Established => on_established(tcb, local_ip, remote_ip, seg),
+        _ => None, // teardown states (the FIN handshake) are handled in Stage 21d
     }
+}
+
+/// Handle a segment on an ESTABLISHED connection (Stage 21c) — the steady state, where the reliable byte
+/// stream is actually in motion. Two things happen, either or both per segment:
+///
+/// 1. **Process an acknowledgement.** If the peer ACKs bytes we sent, advance `snd_una` over them (so we
+///    know they arrived; a retransmission timer, Stage 21e, would use this to stop resending).
+/// 2. **Accept stream data.** If the segment carries payload *in order* (`seq == rcv_nxt`), append it to
+///    the receive buffer and advance `rcv_nxt`. Either way, reply with an ACK naming `rcv_nxt` — every
+///    data segment is acknowledged, which is what makes the transfer reliable.
+///
+/// Returns the ACK segment to send when we received data, else `None` (a bare ACK for our own data needs
+/// no reply — acknowledging an acknowledgement would loop forever).
+fn on_established(
+    tcb: &mut Tcb,
+    local_ip: [u8; 4],
+    remote_ip: [u8; 4],
+    seg: &Segment,
+) -> Option<Vec<u8>> {
+    // (1) An incoming acknowledgement advances snd_una over the bytes the peer now confirms. Accept an
+    // ack in (snd_una, snd_nxt] using wrapping arithmetic, so it stays correct across a sequence-number
+    // wrap; a duplicate ack (ack == snd_una) is a harmless no-op, and an ack beyond snd_nxt is ignored.
+    if seg.flags & ACK != 0 {
+        let acked = seg.ack.wrapping_sub(tcb.snd_una);
+        let outstanding = tcb.snd_nxt.wrapping_sub(tcb.snd_una);
+        if acked <= outstanding {
+            tcb.snd_una = seg.ack;
+        }
+    }
+
+    // (2) Accept stream data. We take only in-order segments: a real stack would queue out-of-order data
+    // for reassembly, but requiring `seq == rcv_nxt` keeps the byte stream simple and still correct — a
+    // gap is simply left unacknowledged until the peer retransmits it (Stage 21e).
+    if seg.payload.is_empty() {
+        return None; // a pure ACK (no data) needs no reply
+    }
+    if seg.seq == tcb.rcv_nxt {
+        tcb.rx.extend_from_slice(seg.payload);
+        tcb.rcv_nxt = tcb.rcv_nxt.wrapping_add(seg.payload.len() as u32);
+    }
+    // Reply with an ACK for rcv_nxt whether the data was in order (now acknowledged) or a duplicate /
+    // out-of-order segment (re-ACK the last byte we did receive, prompting the peer to resend the gap).
+    Some(build(
+        local_ip,
+        remote_ip,
+        tcb.local_port,
+        tcb.remote_port,
+        tcb.snd_nxt,
+        tcb.rcv_nxt,
+        ACK,
+        DEFAULT_WINDOW,
+        &[],
+    ))
+}
+
+/// Stage 21c: queue application data to send on the ESTABLISHED connection `(local_port -> remote_port)`,
+/// and return the **data segment** to transmit together with the peer's IP (which the caller needs to
+/// frame it). The segment carries `seq = snd_nxt` (the next unsent stream position), acknowledges the
+/// peer up to `rcv_nxt`, and sets `PSH | ACK` ("deliver this data now"); `snd_nxt` then advances over the
+/// bytes. `local_ip` is needed for the pseudo-header checksum. Returns `None` if there is no such
+/// established connection. (No retransmission buffer yet — Stage 21e keeps the unacked bytes for resend.)
+pub fn send_data(
+    local_ip: [u8; 4],
+    local_port: u16,
+    remote_port: u16,
+    data: &[u8],
+) -> Option<(Vec<u8>, [u8; 4])> {
+    let mut table = CONNECTIONS.lock();
+    let tcb = table.iter_mut().find(|c| {
+        c.state == State::Established && c.local_port == local_port && c.remote_port == remote_port
+    })?;
+    let seg = build(
+        local_ip,
+        tcb.remote_ip,
+        tcb.local_port,
+        tcb.remote_port,
+        tcb.snd_nxt,
+        tcb.rcv_nxt,
+        PSH | ACK,
+        DEFAULT_WINDOW,
+        data,
+    );
+    tcb.snd_nxt = tcb.snd_nxt.wrapping_add(data.len() as u32);
+    Some((seg, tcb.remote_ip))
+}
+
+/// Stage 21c: a clone of the receive buffer for `(local_port, remote_port)` — the in-order stream bytes
+/// accepted and acknowledged but not yet consumed. `None` if no such connection. A real socket `read`
+/// would drain these bytes; a clone is enough for the self-test and tests to inspect what arrived.
+pub fn received_data(local_port: u16, remote_port: u16) -> Option<Vec<u8>> {
+    CONNECTIONS
+        .lock()
+        .iter()
+        .find(|c| c.local_port == local_port && c.remote_port == remote_port)
+        .map(|c| c.rx.clone())
+}
+
+/// Stage 21c: whether every byte we have sent on `(local_port, remote_port)` has been acknowledged by the
+/// peer (`snd_una == snd_nxt`, i.e. nothing outstanding). `None` if no such connection.
+pub fn all_data_acked(local_port: u16, remote_port: u16) -> Option<bool> {
+    CONNECTIONS
+        .lock()
+        .iter()
+        .find(|c| c.local_port == local_port && c.remote_port == remote_port)
+        .map(|c| c.snd_una == c.snd_nxt)
 }
 
 /// The state of the connection identified by `(local_port, remote_port)`, or `None` if there is no such
