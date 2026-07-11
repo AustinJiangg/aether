@@ -1218,14 +1218,17 @@ pub fn tcp_sender_window_loopback_selftest() -> bool {
     let segs_before = tcp::data_segments_sent();
     tcp_send(client_port, port, &data);
 
-    // 1 & 2: immediately (before any ACK is processed) the sender has put at most one window in flight and
-    // buffered the rest, and it segmented the send into at least two MSS pieces.
+    // 1: immediately (before any ACK is processed) the sender has capped in-flight data at the current send
+    // window and buffered the rest. Since Stage 22d the effective window is min(advertised, cwnd), and slow
+    // start opens cwnd at one MSS — so the first burst is only one MSS, well under the receiver's two-MSS
+    // window — but either way in-flight never exceeds the advertised window and in-flight + buffered is the
+    // whole send. (That the send is *segmented* into >= 2 MSS pieces is checked after the transfer, below:
+    // under slow start those pieces leave over several round trips as cwnd opens, not all at once.)
     let in_flight = tcp::bytes_in_flight(client_port, port).unwrap_or(0) as usize;
     let buffered = tcp::send_buffered(client_port, port).unwrap_or(0);
-    let segmented = tcp::data_segments_sent() - segs_before >= 2;
     let respected = in_flight <= window && buffered > 0 && in_flight + buffered == total;
 
-    // 3: drain the receiver as data arrives, reopening the window so the buffered remainder flows out (the
+    // 2 & 3: drain the receiver as data arrives, reopening the window so the buffered remainder flows out (the
     // zero-window probe redelivers it once the window had closed), until every byte has arrived in order.
     let mut got: Vec<u8> = Vec::new();
     for _ in 0..8000 {
@@ -1240,11 +1243,87 @@ pub fn tcp_sender_window_loopback_selftest() -> bool {
     }
     e1000::set_loopback(false);
 
+    // The large send was split into at least two MSS-sized segments — counted over the whole transfer,
+    // since under Stage 22d's slow start they leave over several round trips (as cwnd opens), not at once.
+    let segmented = tcp::data_segments_sent() - segs_before >= 2;
     let in_order = got == data;
     let ok = respected && segmented && in_order && got.len() == total;
     serial_println!(
-        "[net] TCP sender-window loopback selftest: window {}, sent-then-in-flight {}, buffered {}, segmented {}, delivered {}/{} in order {}, ok = {}",
+        "[net] TCP sender-window loopback selftest: window {}, first-burst-in-flight {}, buffered {}, segmented {}, delivered {}/{} in order {}, ok = {}",
         window, in_flight, buffered, segmented, got.len(), total, in_order, ok,
+    );
+    ok
+}
+
+/// Stage 22d self-test of **congestion control** (slow start) with no external peer, via PHY loopback — the
+/// follow-on to [`tcp_sender_window_loopback_selftest`]. Where Stage 22c paced the sender to the *peer's*
+/// advertised window (flow control), Stage 22d adds a second limit — the **congestion window** (`cwnd`) —
+/// pacing it to the *network*. The sender may put only `min(snd_wnd, cwnd)` bytes in flight.
+///
+/// This establishes a loopback connection and notes its initial `cwnd` — one MSS, because slow start starts
+/// small — then streams several segments' worth of data while draining the receiver so ACKs keep flowing
+/// back. Each ACK that confirms new data grows `cwnd` by one MSS (slow start), so by the end `cwnd` has
+/// climbed well above its initial value, and every byte still arrives in order. It returns whether `cwnd`
+/// grew and the stream was intact. (Because the loopback receive window is only two MSS, `cwnd` is genuinely
+/// the binding limit at the start — the very first flush sends one MSS, not two — so this really exercises
+/// congestion pacing, not just flow-control pacing.)
+pub fn tcp_congestion_control_loopback_selftest() -> bool {
+    tcp::reset_connections();
+    let port: u16 = 7784;
+    tcp::open_passive(port);
+
+    e1000::set_loopback(true);
+    let mut sink = [0u8; 2048];
+    while e1000::poll_frame(&mut sink).is_some() {}
+
+    let client_port = match tcp_connect(our_ip(), port) {
+        Some(p) => p,
+        None => {
+            e1000::set_loopback(false);
+            serial_println!("[net] TCP congestion-control loopback selftest: handshake failed");
+            return false;
+        }
+    };
+    for _ in 0..200 {
+        if tcp::established_count() >= 2 {
+            break;
+        }
+        poll();
+        crate::apic::pit_sleep_us(500);
+    }
+
+    // The sender's congestion window right after the handshake — slow start begins at one MSS.
+    let cwnd_initial = tcp::congestion_window(client_port, port).unwrap_or(0);
+
+    // Stream several segments' worth of data, draining the receiver as it arrives so ACKs keep flowing back
+    // (each new-data ACK grows cwnd). A distinct byte pattern lets us confirm the bytes arrive in order.
+    let total = 8192usize;
+    let data: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+    tcp_send(client_port, port, &data);
+
+    let mut got: Vec<u8> = Vec::new();
+    let mut cwnd_max = cwnd_initial;
+    for _ in 0..8000 {
+        poll();
+        if let Some(c) = tcp::congestion_window(client_port, port) {
+            cwnd_max = cwnd_max.max(c);
+        }
+        if let Some(chunk) = tcp_read(port, client_port, 4096) {
+            got.extend_from_slice(&chunk);
+        }
+        if got.len() >= total && tcp::all_data_acked(client_port, port) == Some(true) {
+            break;
+        }
+        crate::apic::pit_sleep_us(300);
+    }
+    e1000::set_loopback(false);
+
+    let grew = cwnd_max > cwnd_initial;
+    let in_order = got == data;
+    let ok = grew && in_order && got.len() == total;
+    serial_println!(
+        "[net] TCP congestion-control loopback selftest: cwnd {} -> {}, delivered {}/{} in order {}, ok = {}",
+        cwnd_initial, cwnd_max, got.len(), total, in_order, ok,
     );
     ok
 }

@@ -715,6 +715,34 @@ unify later.
 > bidirectional sliding window (receiver advertises, sender obeys, zero-window probe). (**Congestion
 > control** — slow start / congestion avoidance / fast retransmit, pacing the sender to the *network*
 > rather than the peer — is the remaining refinement, Stage 22d.)
+>
+> **Stage 22d has begun — congestion control.** Flow control (Stage 22c) paces the sender to the *receiver*;
+> congestion control paces it to the *network*, so a fast receiver behind a congested link cannot be used to
+> flood that link (the 1986 "congestion collapse" this mechanism was invented to prevent). It is split into
+> sub-steps, each `cargo test`-verifiable: **22d-1** slow start + the growth machinery; **22d-2** the loss
+> response (RTO → multiplicative decrease, then congestion avoidance); **22d-3** fast retransmit / fast
+> recovery on three duplicate ACKs.
+>
+> **Stage 22d-1 is done — slow start (the congestion-window machinery).** The `Tcb` grows two fields: `cwnd`
+> (the **congestion window** — the sender's estimate of how much data the *network* can absorb) and
+> `ssthresh` (the **slow-start threshold** dividing the two growth modes). The sender now paces to
+> `min(snd_wnd, cwnd)` — `flush` takes the smaller of the peer's advertised window and `cwnd` — so whichever
+> of the receiver or the network is the tighter bottleneck governs. `cwnd` is not advertised; the sender
+> infers it: it starts at one **MSS** (`INIT_CWND`, deliberately small so the ramp is visible and so `cwnd`,
+> not the two-MSS loopback receive window, is the binding limit early) and `grow_cwnd` — called on every ACK
+> that confirms new data (`process_ack`) — adds one MSS per ACK while `cwnd < ssthresh` (**slow start**:
+> `cwnd` doubles every RTT, exponential, since a full window yields `cwnd/MSS` ACKs per round trip), or
+> `MSS*MSS/cwnd` per ACK once `cwnd >= ssthresh` (**congestion avoidance**: ~one MSS per RTT, linear). A pure
+> duplicate/window-update ACK (`acked == 0`) does not grow it. `ssthresh` starts arbitrarily high
+> (`INIT_SSTHRESH = u32::MAX`, RFC 5681), so a fresh connection stays in slow start — the congestion-avoidance
+> branch stays unreachable until a loss lowers `ssthresh` (Stage 22d-2). Proved deterministically with no peer
+> via PHY loopback: `tcp_congestion_control_loopback_selftest` establishes a connection (initial `cwnd` = one
+> MSS), streams 8 KiB while draining the receiver so ACKs flow, and confirms `cwnd` climbs well above its
+> initial value (boot logs "cwnd 1024 -> 9216") with every byte still in order. Because `INIT_CWND` (one MSS)
+> is now smaller than the two-MSS loopback receive window, the sender's *first* burst is one segment, not two,
+> so `cwnd` genuinely binds — the Stage 22c `tcp_sender_window_loopback_selftest` was updated to count its
+> segmentation over the whole transfer (slow start spreads the pieces over several round trips) rather than
+> the first instant. Verified by 77 tests (the new `tcp_grows_congestion_window`).
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

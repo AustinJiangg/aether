@@ -949,6 +949,14 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             let tcp_snd_ok = net::tcp_sender_window_loopback_selftest();
             serial_println!("[ OK ] net 22c: TCP sender window over loopback = {}", tcp_snd_ok);
 
+            // Stage 22d (networking): TCP congestion control — slow start. Beyond the peer's advertised
+            // window (flow control), the sender now also obeys a *congestion window* (cwnd) that paces it to
+            // the network. cwnd starts at one MSS and grows one MSS per ACK in slow start (doubling each
+            // round trip). Prove it via loopback: stream several segments, draining the receiver so ACKs
+            // flow, and watch cwnd climb well above its initial one-MSS value while the bytes arrive in order.
+            let tcp_cc_ok = net::tcp_congestion_control_loopback_selftest();
+            serial_println!("[ OK ] net 22d: TCP congestion control over loopback = {}", tcp_cc_ok);
+
             match net::ping(gw) {
                 Some(seq) => {
                     serial_println!(

@@ -310,8 +310,15 @@ application bytes and `flush` (run after each `queue_send` and once per `poll`) 
 the window admits, in `MSS`-sized segments, sending a one-byte **zero-window probe** (recovered by the 21e
 timer, so it doubles as the persist timer) to break a zero-window deadlock. Proved via loopback by sending
 more than the peer's window and confirming the sender caps in-flight data, buffers the excess, and
-ultimately delivers everything in order once the receiver reads. `ROADMAP.md` records the full staged
-history (stages 0-22c).
+ultimately delivers everything in order once the receiver reads. **Stage 22d has begun — congestion control
+(pacing the sender to the *network*, not just the receiver). Stage 22d-1 is done**: slow start — the `Tcb`
+grows `cwnd` (the congestion window) and `ssthresh` (the slow-start threshold), `flush` now paces to
+`min(snd_wnd, cwnd)` (whichever of receiver or network is tighter governs), and `grow_cwnd` (called from
+`process_ack` on every new-data ACK) opens `cwnd` from one `MSS` by one MSS per ACK while `cwnd < ssthresh`
+(slow start, so `cwnd` doubles per RTT) or `MSS*MSS/cwnd` per ACK once at/above it (congestion avoidance,
+~one MSS per RTT — unreachable until a loss lowers `ssthresh`, Stage 22d-2). Proved via loopback by streaming
+8 KiB while draining the receiver and confirming `cwnd` climbs from one MSS ("cwnd 1024 -> 9216") with the
+bytes still in order. `ROADMAP.md` records the full staged history (stages 0-22d-1).
 
 ## Language and writing conventions
 
@@ -822,7 +829,16 @@ Exit QEMU: `Ctrl-A` then `X`.
   retransmit queue (the persist timer). `net::tcp_send` now queues-then-flushes; accessors `bytes_in_flight`/
   `send_buffered`/`data_segments_sent` back `net::tcp_sender_window_loopback_selftest`, which sends more than
   the window and confirms the sender caps in-flight data, buffers the excess (segmented), and delivers it all
-  in order once the receiver reads.
+  in order once the receiver reads. **Stage 22d-1** adds **congestion control (slow start)**: the `Tcb` grows
+  `cwnd` (the congestion window — the sender's estimate of the *network's* capacity, distinct from `snd_wnd`'s
+  *receiver* capacity) and `ssthresh` (the slow-start threshold); `flush` now paces to `min(snd_wnd, cwnd)`,
+  so the tighter of receiver/network governs, and `grow_cwnd` (called from `process_ack` on every ACK that
+  confirms new data, `acked != 0`) opens `cwnd` from `INIT_CWND` (one `MSS`) by one MSS per ACK in slow start
+  (`cwnd < ssthresh`, so `cwnd` doubles per RTT) or `MSS*MSS/cwnd` per ACK in congestion avoidance (at/above
+  `ssthresh`). `INIT_SSTHRESH` = `u32::MAX` keeps a fresh connection in slow start (the congestion-avoidance
+  branch is unreachable until a loss lowers `ssthresh`, Stage 22d-2). The `congestion_window` accessor backs
+  `net::tcp_congestion_control_loopback_selftest`, which streams 8 KiB over loopback and watches `cwnd` climb
+  from one MSS while the bytes arrive in order.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

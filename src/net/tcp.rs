@@ -203,6 +203,23 @@ fn recv_window(tcb: &Tcb) -> u16 {
 /// the sender's windowing. A real stack learns the peer's MSS from a SYN option; we fix it.
 const MSS: usize = 1024;
 
+// Stage 22d: congestion-control constants. Where flow control (Stage 22c) paces the sender to the
+// *receiver's* buffer via `snd_wnd`, congestion control paces it to the *network's* capacity via a second
+// window, `cwnd`. The sender never puts more than `min(snd_wnd, cwnd)` bytes in flight, so whichever is
+// smaller — a slow receiver or a congested network — governs. `cwnd` is not told to us; the sender infers
+// it, growing it on every successful ACK and (Stage 22d-2) shrinking it on loss.
+
+/// The **initial congestion window** — where slow start begins. RFC 5681/3390 permit a larger initial
+/// window (~4 MSS), but we start at one MSS so the exponential ramp is clearly visible over a small
+/// transfer and so `cwnd` (not the tiny loopback receive window) is the binding limit early on.
+const INIT_CWND: u32 = MSS as u32;
+
+/// The **initial slow-start threshold**: the `cwnd` boundary between slow start (below it, exponential
+/// growth) and congestion avoidance (at/above it, linear growth). RFC 5681 says it SHOULD start
+/// arbitrarily high, so a fresh connection begins in slow start and stays there until the first loss
+/// lowers it (Stage 22d-2). Until then the congestion-avoidance branch of [`grow_cwnd`] is unreachable.
+const INIT_SSTHRESH: u32 = u32::MAX;
+
 // Stage 21e: retransmission-timer constants. Time is measured in timer ticks (`interrupts::timer_ticks`,
 // 100 Hz, so 1 tick = 10 ms). A real stack estimates the retransmission timeout from measured round-trip
 // times (RFC 6298); fixed, short values are enough to *demonstrate* recovery deterministically.
@@ -324,6 +341,15 @@ struct Tcb {
     /// Stage 22c: the **send buffer** — application bytes queued to send but not yet transmitted (because
     /// the window had no room). [`flush`] drains it into segments as the window allows.
     snd_buf: Vec<u8>,
+    /// Stage 22d: the **congestion window** — the sender's estimate of how much data the *network* (not the
+    /// peer) can absorb without loss. [`flush`] limits in-flight data to `min(snd_wnd, cwnd)`, so `cwnd`
+    /// paces to congestion while `snd_wnd` paces to the receiver. Grows via slow start / congestion
+    /// avoidance ([`grow_cwnd`]) as ACKs arrive, and collapses on loss (Stage 22d-2).
+    cwnd: u32,
+    /// Stage 22d: the **slow-start threshold** — the `cwnd` value at which the sender switches from slow
+    /// start's exponential growth to congestion avoidance's linear growth. Starts high (see
+    /// [`INIT_SSTHRESH`]) and is lowered to about half the flight on a loss.
+    ssthresh: u32,
     /// Receive space: `nxt` = next seq we expect from the peer, `irs` = the peer's initial seq.
     rcv_nxt: u32,
     irs: u32,
@@ -373,6 +399,8 @@ pub fn open_passive(local_port: u16) {
         iss: 0,
         snd_wnd: 0,
         snd_buf: Vec::new(),
+        cwnd: INIT_CWND,
+        ssthresh: INIT_SSTHRESH,
         rcv_nxt: 0,
         irs: 0,
         rx: Vec::new(),
@@ -403,6 +431,8 @@ pub fn open_active(
         iss,
         snd_wnd: 0, // unknown until the SYN-ACK advertises the peer's window
         snd_buf: Vec::new(),
+        cwnd: INIT_CWND,
+        ssthresh: INIT_SSTHRESH,
         rcv_nxt: 0, // unknown until the SYN-ACK tells us the peer's ISN
         irs: 0,
         rx: Vec::new(),
@@ -637,10 +667,35 @@ fn process_ack(tcb: &mut Tcb, seg: &Segment) {
     let outstanding = tcb.snd_nxt.wrapping_sub(tcb.snd_una);
     if acked <= outstanding {
         tcb.snd_una = seg.ack;
+        // Stage 22d: an ACK that confirmed new data (`acked != 0`) reached the peer without loss is the
+        // signal that the network is coping — grow the congestion window. A pure duplicate or
+        // window-update ACK has `acked == 0` and must not grow it (a duplicate ACK is, in fact, a *hint of*
+        // loss — Stage 22d-3 will count them for fast retransmit).
+        if acked != 0 {
+            grow_cwnd(tcb, acked);
+        }
         // Stage 21e: drop every queued segment the peer has now cumulatively acknowledged, so the
         // retransmission timer stops resending it.
         let una = tcb.snd_una;
         tcb.retransmit.retain(|u| !seq_leq(u.end_seq, una));
+    }
+}
+
+/// Stage 22d: grow the congestion window after an ACK confirmed `acked` new bytes, per RFC 5681. Two modes,
+/// split at [`Tcb::ssthresh`]:
+///
+/// - **Slow start** (`cwnd < ssthresh`): add one MSS per ACK (byte-counted: `min(acked, MSS)`). Since a
+///   full window of data yields `cwnd / MSS` ACKs in a round trip, `cwnd` **doubles every RTT** —
+///   exponential growth, to find the network's capacity quickly from a cold start.
+/// - **Congestion avoidance** (`cwnd >= ssthresh`): add `MSS * MSS / cwnd` per ACK, which sums to about one
+///   MSS per RTT — **linear growth**, easing up gently once near the estimated limit. (Unreachable until a
+///   loss lowers `ssthresh` below `cwnd`, which arrives in Stage 22d-2.)
+fn grow_cwnd(tcb: &mut Tcb, acked: u32) {
+    let mss = MSS as u32;
+    if tcb.cwnd < tcb.ssthresh {
+        tcb.cwnd = tcb.cwnd.saturating_add(acked.min(mss));
+    } else {
+        tcb.cwnd = tcb.cwnd.saturating_add((mss * mss / tcb.cwnd).max(1));
     }
 }
 
@@ -841,7 +896,11 @@ pub fn flush(local_ip: [u8; 4]) -> Vec<(Vec<u8>, [u8; 4])> {
         }
         while !tcb.snd_buf.is_empty() {
             let inflight = tcb.snd_nxt.wrapping_sub(tcb.snd_una);
-            let usable = tcb.snd_wnd.saturating_sub(inflight);
+            // Stage 22d: obey *both* limits at once — the peer's advertised window (flow control: don't
+            // overrun the receiver) and the congestion window (congestion control: don't overrun the
+            // network). The effective send window is the smaller of the two.
+            let window = core::cmp::min(tcb.snd_wnd, tcb.cwnd);
+            let usable = window.saturating_sub(inflight);
             if usable == 0 {
                 // Window-blocked. On a true zero window with nothing in flight, send a one-byte probe to
                 // keep the connection moving; otherwise wait for the in-flight data's ACKs to open it.
@@ -963,6 +1022,18 @@ pub fn send_buffered(local_port: u16, remote_port: u16) -> Option<usize> {
         .iter()
         .find(|c| c.local_port == local_port && c.remote_port == remote_port)
         .map(|c| c.snd_buf.len())
+}
+
+/// Stage 22d: the current **congestion window** of `(local_port, remote_port)`, in bytes — the sender's
+/// estimate of how much data the network can absorb, which (together with the peer's advertised window)
+/// bounds how much it puts in flight. Grows via slow start / congestion avoidance as ACKs arrive. `None` if
+/// no such connection. The congestion-control self-test watches this climb from [`INIT_CWND`].
+pub fn congestion_window(local_port: u16, remote_port: u16) -> Option<u32> {
+    CONNECTIONS
+        .lock()
+        .iter()
+        .find(|c| c.local_port == local_port && c.remote_port == remote_port)
+        .map(|c| c.cwnd)
 }
 
 /// The state of the connection identified by `(local_port, remote_port)`, or `None` if there is no such

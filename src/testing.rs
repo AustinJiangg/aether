@@ -1317,6 +1317,22 @@ fn tcp_sender_obeys_peer_window() {
     assert!(net::tcp_sender_window_loopback_selftest(), "TCP sender window over loopback failed");
 }
 
+/// Stage 22d: TCP congestion control (slow start) via loopback (no external peer). Establish a connection,
+/// note its initial one-MSS congestion window, then stream several MSS while draining the receiver so ACKs
+/// flow back; each new-data ACK grows cwnd, so it climbs well above its initial value and every byte still
+/// arrives in order. Exercises the congestion window, its slow-start growth per ACK, and the sender pacing
+/// to min(cwnd, the advertised window).
+#[test_case]
+fn tcp_grows_congestion_window() {
+    use crate::net;
+
+    assert!(crate::e1000::present(), "e1000 not initialized");
+    assert!(
+        net::tcp_congestion_control_loopback_selftest(),
+        "TCP congestion control over loopback failed"
+    );
+}
+
 /// Stage 19b-2: the live DNS resolver — resolve a hostname through SLIRP's DNS server over the wire.
 /// Unlike the SLIRP-internal gateway ping, this depends on the *host* having working upstream DNS
 /// (SLIRP forwards to it), so the test is lenient: it always exercises the full path (build the query,
