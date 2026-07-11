@@ -293,8 +293,13 @@ retransmission timers (21e). Every sent segment is kept on a per-connection retr
 unacknowledged segment past its RTO with exponential backoff and expires TIME_WAIT to CLOSED after 2*MSL.
 All five sub-steps are proved deterministically with no peer via PHY loopback (a self-connect where a
 client and a server TCB drive both halves of every exchange), 21e using a "drop the next TCP frame" fault
-hook so the retransmission timer can be exercised. `ROADMAP.md` records the full staged history
-(stages 0-21e).
+hook so the retransmission timer can be exercised. **Stage 22 (TCP refinements) has now begun. Stage 22a
+is done**: out-of-order reassembly — a data segment arriving ahead of `rcv_nxt` is buffered in a
+per-connection reassembly queue (`Tcb::ooo`) and spliced into the stream once the gap fills, instead of
+being dropped; `on_established` routes data through `accept_segment_data` (old / in-order+`drain_ooo` /
+ahead-of-sequence+`buffer_ooo`), and it is proved via PHY loopback with a `REORDER_NEXT_TCP_TX` fault hook
+(mirroring 21e's drop hook) that delivers two segments in reversed order. `ROADMAP.md` records the full
+staged history (stages 0-22a).
 
 ## Language and writing conventions
 
@@ -782,7 +787,14 @@ Exit QEMU: `Ctrl-A` then `X`.
   each `net::poll`, timed off `interrupts::timer_ticks`) resends the oldest unacked segment past its RTO
   with exponential backoff (aborting after `MAX_RETRIES`) and expires TIME_WAIT to CLOSED after 2*MSL;
   `tcp_retransmit_loopback_selftest` arms a `DROP_NEXT_TCP_TX` loss hook to drop a data segment and confirms
-  the timer recovers it (then that TIME_WAIT expires). This completes Stage 21 (TCP) and the roadmap.
+  the timer recovers it (then that TIME_WAIT expires). This completed Stage 21 (TCP). **Stage 22a** adds
+  **out-of-order reassembly**: the `Tcb` grows an out-of-order queue (`ooo`), and `on_established` routes
+  data through `accept_segment_data` — old data (`end <= rcv_nxt`) is a duplicate; in-order data
+  (`seq <= rcv_nxt < end`) is appended and then `drain_ooo` splices in any now-contiguous buffered segment;
+  an ahead-of-sequence segment (`rcv_nxt < seq`) is held by `buffer_ooo` (bounded by `MAX_OOO_SEGMENTS`) and
+  dup-ACKed. `net::tcp_reassembly_loopback_selftest` proves it via PHY loopback with a `REORDER_NEXT_TCP_TX`
+  hook (holds one TCP frame back so two sends arrive reversed), confirming the bytes reassemble in order and
+  both are acknowledged.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

@@ -44,7 +44,7 @@
 #![allow(dead_code)] // a few completeness items (states/flags) are unused until later sub-steps
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use spin::Mutex;
 
@@ -195,6 +195,11 @@ const MAX_RETRIES: u32 = 5;
 /// (minutes) to be sure a lost final ACK could be retransmitted and old duplicates have died out.
 const TIME_WAIT_TICKS: u64 = 30;
 
+/// Stage 22a: cap on how many out-of-order segments a connection buffers while waiting for a gap to fill.
+/// A real stack bounds its reassembly queue by the advertised receive window; a small fixed cap is enough
+/// here, and a full queue simply drops further out-of-order segments (the peer retransmits them later).
+const MAX_OOO_SEGMENTS: usize = 16;
+
 /// The current time, in timer ticks since boot. TCP reads the global monotonic tick counter directly so
 /// the send/close/tick paths need not thread a clock value through their signatures.
 fn now_ticks() -> u64 {
@@ -205,6 +210,11 @@ fn now_ticks() -> u64 {
 /// `b` is at or ahead of `a` in the near half. Used to decide when `snd_una` has reached a segment's end.
 fn seq_leq(a: u32, b: u32) -> bool {
     b.wrapping_sub(a) < 0x8000_0000
+}
+
+/// Strict version of [`seq_leq`]: `a < b` in the wrapping sequence space (Stage 22a reassembly).
+fn seq_lt(a: u32, b: u32) -> bool {
+    a != b && seq_leq(a, b)
 }
 
 /// Stage 21e: one unacknowledged outbound segment, retained so the retransmission timer can resend it if
@@ -219,6 +229,23 @@ struct Unacked {
     tries: u32,
     /// The exact segment bytes (already checksummed) to retransmit verbatim.
     segment: Vec<u8>,
+}
+
+/// Stage 22a: one out-of-order segment's payload, held in the receive **reassembly queue** because a gap
+/// precedes it (`seq > rcv_nxt`). It is spliced into the stream once the missing bytes arrive and
+/// `rcv_nxt` reaches it. `seq` is the stream position of `data[0]`.
+struct OutOfOrder {
+    seq: u32,
+    data: Vec<u8>,
+}
+
+/// Stage 22a: how many out-of-order segments have been buffered for later reassembly, over the whole run.
+/// A test reads this to confirm the reorder path was actually exercised (not merely in-order delivery).
+static OOO_BUFFERED: AtomicU64 = AtomicU64::new(0);
+
+/// Total out-of-order segments buffered since boot (Stage 22a; see [`OOO_BUFFERED`]).
+pub fn out_of_order_buffered() -> u64 {
+    OOO_BUFFERED.load(Ordering::Relaxed)
 }
 
 /// The connection lifecycle states (RFC 793). The opening subset — `Closed`/`Listen`/`SynSent`/
@@ -268,6 +295,9 @@ struct Tcb {
     /// the application has not yet consumed. Data arriving with `seq == rcv_nxt` is appended here; a real
     /// socket `read` would drain it.
     rx: Vec<u8>,
+    /// Stage 22a: the **out-of-order reassembly queue** — segments accepted with `seq > rcv_nxt` (a gap
+    /// precedes them), held until the missing bytes arrive so they can be spliced into `rx` in order.
+    ooo: Vec<OutOfOrder>,
     /// Stage 21e: the **retransmission queue** — outbound segments sent but not yet acknowledged, oldest
     /// first, kept so the timer can resend them if an ACK is late. Emptied as `snd_una` advances.
     retransmit: Vec<Unacked>,
@@ -308,6 +338,7 @@ pub fn open_passive(local_port: u16) {
         rcv_nxt: 0,
         irs: 0,
         rx: Vec::new(),
+        ooo: Vec::new(),
         retransmit: Vec::new(),
         time_wait_deadline: 0,
     });
@@ -335,6 +366,7 @@ pub fn open_active(
         rcv_nxt: 0, // unknown until the SYN-ACK tells us the peer's ISN
         irs: 0,
         rx: Vec::new(),
+        ooo: Vec::new(),
         retransmit: Vec::new(),
         time_wait_deadline: 0,
     });
@@ -587,13 +619,13 @@ fn on_established(
 ) -> Option<Vec<u8>> {
     process_ack(tcb, seg);
 
-    // Accept stream data, in order only: a real stack would queue out-of-order data for reassembly, but
-    // requiring `seq == rcv_nxt` keeps the byte stream simple and still correct — a gap is left
-    // unacknowledged until the peer retransmits it (Stage 21e).
-    let in_order = seg.seq == tcb.rcv_nxt;
-    if in_order && !seg.payload.is_empty() {
-        tcb.rx.extend_from_slice(seg.payload);
-        tcb.rcv_nxt = tcb.rcv_nxt.wrapping_add(seg.payload.len() as u32);
+    // Accept stream data with **reassembly** (Stage 22a): in-order bytes extend the stream and let any
+    // buffered out-of-order bytes be spliced in behind them, while a segment ahead of `rcv_nxt` (a gap
+    // precedes it) is *held* in the reassembly queue instead of dropped. Either way the ACK below carries
+    // the resulting `rcv_nxt` — unchanged for an out-of-order segment, i.e. a duplicate ACK that prompts
+    // the peer to retransmit the missing segment (the classic fast-retransmit trigger).
+    if !seg.payload.is_empty() {
+        accept_segment_data(tcb, seg.seq, seg.payload);
     }
 
     // A FIN occupies the sequence number just past the segment's data; honor it only in order. It moves
@@ -611,6 +643,78 @@ fn on_established(
         Some(build_ack(tcb, local_ip, remote_ip))
     } else {
         None
+    }
+}
+
+/// Stage 22a: accept one data segment's payload into the receive stream, handling **reordering**. The
+/// segment covers the sequence range `[seq, seq + len)`; three cases relative to `rcv_nxt` (call it R):
+///
+/// - **Entirely old** (`end <= R`): a duplicate of bytes already accepted — store nothing (the caller
+///   still re-ACKs, so the peer stops resending it).
+/// - **In order, possibly with an old prefix** (`seq <= R < end`): append the new tail `[R, end)`, advance
+///   `rcv_nxt`, then splice in any buffered out-of-order segment that is now contiguous ([`drain_ooo`]).
+/// - **Ahead of R** (`R < seq`): a gap precedes it — buffer it for later reassembly ([`buffer_ooo`])
+///   rather than dropping it, so the peer need not retransmit it once the gap fills.
+fn accept_segment_data(tcb: &mut Tcb, seq: u32, payload: &[u8]) {
+    let end = seq.wrapping_add(payload.len() as u32);
+
+    if seq_leq(end, tcb.rcv_nxt) {
+        return; // entirely old — already accepted
+    }
+    if seq_leq(seq, tcb.rcv_nxt) {
+        // In order (dropping any prefix we already hold): append the part beyond `rcv_nxt` and advance.
+        let skip = tcb.rcv_nxt.wrapping_sub(seq) as usize;
+        tcb.rx.extend_from_slice(&payload[skip..]);
+        tcb.rcv_nxt = end;
+        drain_ooo(tcb);
+        return;
+    }
+    // Ahead of `rcv_nxt`: a gap precedes this segment. Hold it in the reassembly queue.
+    buffer_ooo(tcb, seq, payload);
+}
+
+/// Stage 22a: hold an out-of-order segment in the reassembly queue — unless it is already fully covered by
+/// a queued segment (a retransmit of one we hold) or the queue is full (then drop it; the peer will
+/// resend). A genuinely new buffered segment is counted in [`OOO_BUFFERED`].
+fn buffer_ooo(tcb: &mut Tcb, seq: u32, payload: &[u8]) {
+    let end = seq.wrapping_add(payload.len() as u32);
+    let covered = tcb.ooo.iter().any(|o| {
+        let o_end = o.seq.wrapping_add(o.data.len() as u32);
+        seq_leq(o.seq, seq) && seq_leq(end, o_end)
+    });
+    if covered || tcb.ooo.len() >= MAX_OOO_SEGMENTS {
+        return;
+    }
+    tcb.ooo.push(OutOfOrder { seq, data: payload.to_vec() });
+    OOO_BUFFERED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Stage 22a: after `rcv_nxt` advances, splice in every buffered out-of-order segment now contiguous with
+/// it (and discard any that has become entirely old), repeating until the queue no longer touches
+/// `rcv_nxt`. Overlaps are handled by appending only each segment's bytes *beyond* the current `rcv_nxt`.
+fn drain_ooo(tcb: &mut Tcb) {
+    loop {
+        let r = tcb.rcv_nxt;
+        // A queued segment that reaches `rcv_nxt` (`seq <= R < end`) fills the gap (or part of it).
+        if let Some(i) = tcb.ooo.iter().position(|o| {
+            let end = o.seq.wrapping_add(o.data.len() as u32);
+            seq_leq(o.seq, r) && seq_lt(r, end)
+        }) {
+            let o = tcb.ooo.swap_remove(i);
+            let skip = r.wrapping_sub(o.seq) as usize;
+            tcb.rx.extend_from_slice(&o.data[skip..]);
+            tcb.rcv_nxt = o.seq.wrapping_add(o.data.len() as u32);
+            continue; // the advance may make a further queued segment contiguous
+        }
+        // Nothing contiguous: prune any segment now entirely behind `rcv_nxt`, then stop.
+        let before = tcb.ooo.len();
+        tcb.ooo.retain(|o| {
+            let end = o.seq.wrapping_add(o.data.len() as u32);
+            !seq_leq(end, r)
+        });
+        if tcb.ooo.len() == before {
+            break;
+        }
     }
 }
 

@@ -923,6 +923,17 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 net::tcp_retransmits(),
             );
 
+            // Stage 22a (networking): TCP out-of-order reassembly. A segment arriving ahead of the next
+            // expected byte is buffered, not dropped, and spliced into the stream once the gap fills.
+            // Prove it via loopback by sending a payload as two segments delivered in *reversed* order and
+            // confirming the receiver reassembles the bytes in order and acknowledges both.
+            let tcp_reasm_ok = net::tcp_reassembly_loopback_selftest();
+            serial_println!(
+                "[ OK ] net 22a: TCP reassembly over loopback = {} ({} out-of-order buffered total)",
+                tcp_reasm_ok,
+                net::tcp_out_of_order_buffered(),
+            );
+
             match net::ping(gw) {
                 Some(seq) => {
                     serial_println!(

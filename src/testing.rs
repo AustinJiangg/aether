@@ -1275,6 +1275,23 @@ fn tcp_recovers_from_loss_over_loopback() {
     assert!(net::tcp_retransmits() > 0, "the retransmission timer never resent anything");
 }
 
+/// Stage 22a: TCP out-of-order reassembly via loopback (no external peer). Establish a connection, then
+/// send a payload as two segments delivered in reversed order (reorder injection), and confirm the
+/// receiver buffers the ahead-of-sequence segment and splices it into the stream once the earlier segment
+/// fills the gap — so the bytes arrive in order and both are acknowledged. Exercises the reassembly queue.
+#[test_case]
+fn tcp_reassembles_out_of_order() {
+    use crate::net;
+
+    assert!(crate::e1000::present(), "e1000 not initialized");
+    let before = net::tcp_out_of_order_buffered();
+    assert!(net::tcp_reassembly_loopback_selftest(), "TCP out-of-order reassembly over loopback failed");
+    assert!(
+        net::tcp_out_of_order_buffered() > before,
+        "the reassembly path was never exercised (no out-of-order segment buffered)",
+    );
+}
+
 /// Stage 19b-2: the live DNS resolver — resolve a hostname through SLIRP's DNS server over the wire.
 /// Unlike the SLIRP-internal gateway ping, this depends on the *host* having working upstream DNS
 /// (SLIRP forwards to it), so the test is lenient: it always exercises the full path (build the query,

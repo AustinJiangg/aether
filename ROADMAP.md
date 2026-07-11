@@ -655,8 +655,27 @@ unify later.
 > completes Stage 21 (TCP) and the networking track: a from-scratch, reliable, connection-oriented
 > transport — segment layer, three-way handshake, in-order data transfer with acknowledgements, the FIN
 > teardown handshake, and retransmission timers — over the hand-written Ethernet/ARP/IPv4/UDP stack and the
-> interrupt-driven e1000.** (A real sliding-window for flow/congestion control and out-of-order reassembly
-> remain as possible future refinements.)
+> interrupt-driven e1000.**
+>
+> **Stage 22 (TCP refinements) has begun** — the follow-on that turns the deliberately-simplified Stage 21
+> transport into something closer to a production TCP. It refines two mechanisms Stage 21 stubbed out:
+> **out-of-order reassembly** (22a) and the **sliding window** for flow/congestion control (22b onward).
+>
+> **Stage 22a is done — out-of-order reassembly.** Stage 21c accepted stream data *in order only*
+> (`seq == rcv_nxt`), dropping any segment that arrived ahead of the next expected byte and waiting for the
+> peer to retransmit it. Stage 22a instead **buffers** an ahead-of-sequence segment in a per-connection
+> **reassembly queue** (`Tcb::ooo`) and splices it into the stream once the gap fills. `on_established` now
+> routes every data segment through `accept_segment_data`, which handles the three cases against `rcv_nxt`:
+> entirely-old (a duplicate — re-ACK only), in-order (append the new tail, advance `rcv_nxt`, then
+> `drain_ooo` splices in any now-contiguous buffered segment), and ahead-of-`rcv_nxt` (a gap — `buffer_ooo`
+> holds it, bounded by `MAX_OOO_SEGMENTS`, and the segment is dup-ACKed, the classic fast-retransmit
+> trigger). Overlaps are handled by appending only the bytes beyond the current `rcv_nxt`. Proved
+> deterministically with no peer via PHY loopback and a **reorder** fault-injection hook
+> (`REORDER_NEXT_TCP_TX`, mirroring 21e's `DROP_NEXT_TCP_TX`): `tcp_reassembly_loopback_selftest` sends a
+> payload as two segments whose wire order is reversed, and confirms the receiver reassembles all bytes in
+> order and acknowledges both — boot logs "TCP reassembly over loopback = true (1 out-of-order buffered)".
+> Verified by 74 tests (the new `tcp_reassembles_out_of_order`). (A real sliding-window for flow/congestion
+> control — 22b onward — remains.)
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

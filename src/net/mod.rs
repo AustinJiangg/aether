@@ -159,6 +159,13 @@ static TCP_RETRANSMITS: AtomicU64 = AtomicU64::new(0);
 /// instead of transmitted, simulating packet loss so the retransmission timer must recover it. Test-only
 /// (armed by `tcp_retransmit_loopback_selftest`); zero in normal operation.
 static DROP_NEXT_TCP_TX: AtomicU32 = AtomicU32::new(0);
+/// Stage 22a fault-injection hook: when armed, [`tx_tcp`] holds the next TCP frame back and sends it only
+/// *after* the following one, so two consecutive sends leave in reversed order — exercising the receiver's
+/// out-of-order reassembly with no real network reordering. Test-only (armed by
+/// `tcp_reassembly_loopback_selftest`); the held frame lives in [`HELD_TCP_TX`].
+static REORDER_NEXT_TCP_TX: AtomicBool = AtomicBool::new(false);
+/// The frame [`REORDER_NEXT_TCP_TX`] is holding back, released after the next `tx_tcp` (Stage 22a).
+static HELD_TCP_TX: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 
 /// Bring the stack up: record our MAC and log our identity. Call once, after the e1000 is up. Our IP
 /// is still unconfigured here (`0.0.0.0`) — DHCP (Stage 20b) leases one immediately after.
@@ -728,7 +735,16 @@ fn tx_tcp(frame: &[u8]) {
         DROP_NEXT_TCP_TX.fetch_sub(1, Ordering::AcqRel);
         return; // "lost" on the wire
     }
+    // Stage 22a: if the reorder hook is armed, hold this frame back and let the *next* one go first, then
+    // release the held one behind it — so two consecutive sends arrive reversed for the reassembly test.
+    if REORDER_NEXT_TCP_TX.swap(false, Ordering::AcqRel) {
+        *HELD_TCP_TX.lock() = Some(frame.to_vec());
+        return;
+    }
     e1000::transmit(frame);
+    if let Some(held) = HELD_TCP_TX.lock().take() {
+        e1000::transmit(&held); // the deferred frame, now out of order (after this one)
+    }
 }
 
 /// Pick the next ephemeral local port for an outgoing connection (49152..=65535, wrapping).
@@ -951,6 +967,85 @@ pub fn tcp_teardown_loopback_selftest() -> bool {
 /// Stage 21e: how many TCP segments the retransmission timer has resent (over the whole run).
 pub fn tcp_retransmits() -> u64 {
     TCP_RETRANSMITS.load(Ordering::Relaxed)
+}
+
+/// Stage 22a: how many out-of-order TCP segments the receiver has buffered for reassembly (whole run).
+pub fn tcp_out_of_order_buffered() -> u64 {
+    tcp::out_of_order_buffered()
+}
+
+/// Stage 22a self-test of **out-of-order reassembly** with no external peer, via PHY loopback — the
+/// follow-on to [`tcp_retransmit_loopback_selftest`]. Establish a loopback connection, then send a payload
+/// as *two* data segments with the reorder hook armed, so the second segment reaches the receiver *before*
+/// the first. The receiver must buffer the ahead-of-sequence segment, then splice it in once the earlier
+/// segment fills the gap — so the stream is reassembled **in order** despite arriving reversed, and both
+/// segments end up acknowledged. Returns whether the bytes arrived in order and the reorder path was hit.
+pub fn tcp_reassembly_loopback_selftest() -> bool {
+    tcp::reset_connections();
+    let port: u16 = 7781;
+    tcp::open_passive(port);
+
+    // Start from a clean hook state, then drain any stale looped frames.
+    REORDER_NEXT_TCP_TX.store(false, Ordering::Release);
+    *HELD_TCP_TX.lock() = None;
+    e1000::set_loopback(true);
+    let mut sink = [0u8; 2048];
+    while e1000::poll_frame(&mut sink).is_some() {}
+
+    let client_port = match tcp_connect(our_ip(), port) {
+        Some(p) => p,
+        None => {
+            e1000::set_loopback(false);
+            serial_println!("[net] TCP reassembly loopback selftest: handshake failed");
+            return false;
+        }
+    };
+    for _ in 0..200 {
+        if tcp::established_count() >= 2 {
+            break;
+        }
+        poll();
+        crate::apic::pit_sleep_us(500);
+    }
+
+    // Split a payload into two segments and send them with the reorder hook armed: segment #1 is held back
+    // and segment #2 goes on the wire first, so the receiver sees them out of order.
+    let payload = b"aether tcp reassembly 22a: out-of-order splice";
+    let split = 20;
+    let ooo_before = tcp::out_of_order_buffered();
+    REORDER_NEXT_TCP_TX.store(true, Ordering::Release);
+    tcp_send(client_port, port, &payload[..split]); // #1: held back by the hook
+    tcp_send(client_port, port, &payload[split..]); // #2: sent first, then #1 released behind it
+
+    // Pump until the receiver has reassembled the whole payload in order and the sender sees it acked.
+    let mut reassembled = false;
+    for _ in 0..2000 {
+        poll();
+        if tcp::received_data(port, client_port).as_deref() == Some(&payload[..])
+            && tcp::all_data_acked(client_port, port) == Some(true)
+        {
+            reassembled = true;
+            break;
+        }
+        crate::apic::pit_sleep_us(500);
+    }
+    let buffered = tcp::out_of_order_buffered() > ooo_before;
+
+    // Leave the hook clean for anything that transmits TCP afterwards.
+    REORDER_NEXT_TCP_TX.store(false, Ordering::Release);
+    *HELD_TCP_TX.lock() = None;
+    e1000::set_loopback(false);
+
+    let got = tcp::received_data(port, client_port).map(|d| d.len()).unwrap_or(0);
+    let ok = reassembled && buffered;
+    serial_println!(
+        "[net] TCP reassembly loopback selftest: {} of {} bytes in order, buffered out-of-order {}, ok = {}",
+        got,
+        payload.len(),
+        buffered,
+        ok,
+    );
+    ok
 }
 
 /// Stage 21e self-test of **retransmission** with no external peer, via PHY loopback — the follow-on to
