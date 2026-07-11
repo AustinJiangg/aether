@@ -743,6 +743,23 @@ unify later.
 > so `cwnd` genuinely binds — the Stage 22c `tcp_sender_window_loopback_selftest` was updated to count its
 > segmentation over the whole transfer (slow start spreads the pieces over several round trips) rather than
 > the first instant. Verified by 77 tests (the new `tcp_grows_congestion_window`).
+>
+> **Stage 22d-2 is done — the congestion backoff on loss (the multiplicative-decrease half of AIMD).** Slow
+> start (22d-1) only *opens* `cwnd`; 22d-2 adds the *close*. The strongest congestion signal is a
+> **retransmission timeout** — a segment lost outright — so when `on_tick` (the Stage 21e retransmit timer)
+> resends a segment, it now also calls `on_rto`, which per RFC 5681 §3.1 lowers `ssthresh` to
+> `max(flight / 2, 2*MSS)` (**multiplicative decrease** — retreat to half of what was in flight, never below
+> two segments) and collapses `cwnd` all the way back to one MSS, re-entering slow start. `cwnd` then ramps up
+> exponentially again until it reaches the now-lowered `ssthresh`, where `grow_cwnd` switches to congestion
+> avoidance — so the previously-unreachable congestion-avoidance branch is finally exercised, and a lossy path
+> converges on the capacity it can sustain instead of hammering it. Proved deterministically with no peer via
+> PHY loopback: `tcp_congestion_backoff_loopback_selftest` first streams a batch and drains it so `cwnd` grows
+> well above one MSS (with `ssthresh` still at its initial near-infinity), then arms the Stage 21e
+> `DROP_NEXT_TCP_TX` loss hook so the next data segment is dropped; when the RTO fires it recovers the segment
+> *and* backs the sender off — boot logs "cwnd 7168 -> 1059 (min after loss), ssthresh 4294967295 -> 2048",
+> and every byte still arrives in order. Verified by 78 tests (the new `tcp_backs_off_on_loss`). (Remaining:
+> Stage 22d-3, fast retransmit / fast recovery on three duplicate ACKs — recover from a single loss without
+> waiting for the full RTO.)
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

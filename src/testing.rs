@@ -1333,6 +1333,21 @@ fn tcp_grows_congestion_window() {
     );
 }
 
+/// Stage 22d-2: TCP congestion backoff on loss via loopback (no external peer). Grow the congestion window
+/// by streaming a batch, then drop a segment so the retransmission timer fires; the RTO collapses cwnd back
+/// to about one MSS and halves ssthresh, and the dropped bytes still recover in order. Exercises the
+/// multiplicative-decrease response (`on_rto`) and the re-entry into slow start after a loss.
+#[test_case]
+fn tcp_backs_off_on_loss() {
+    use crate::net;
+
+    assert!(crate::e1000::present(), "e1000 not initialized");
+    assert!(
+        net::tcp_congestion_backoff_loopback_selftest(),
+        "TCP congestion backoff over loopback failed"
+    );
+}
+
 /// Stage 19b-2: the live DNS resolver — resolve a hostname through SLIRP's DNS server over the wire.
 /// Unlike the SLIRP-internal gateway ping, this depends on the *host* having working upstream DNS
 /// (SLIRP forwards to it), so the test is lenient: it always exercises the full path (build the query,

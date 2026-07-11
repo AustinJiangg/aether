@@ -955,7 +955,15 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             // round trip). Prove it via loopback: stream several segments, draining the receiver so ACKs
             // flow, and watch cwnd climb well above its initial one-MSS value while the bytes arrive in order.
             let tcp_cc_ok = net::tcp_congestion_control_loopback_selftest();
-            serial_println!("[ OK ] net 22d: TCP congestion control over loopback = {}", tcp_cc_ok);
+            serial_println!("[ OK ] net 22d-1: TCP congestion control over loopback = {}", tcp_cc_ok);
+
+            // Stage 22d-2 (networking): congestion backoff on loss — the multiplicative-decrease half of
+            // AIMD. A retransmission timeout (a segment lost outright) collapses cwnd back to one MSS and
+            // halves ssthresh, so a lossy path retreats and re-probes instead of hammering the network.
+            // Prove it via loopback: grow cwnd by streaming a batch, then drop a segment so the RTO fires,
+            // and watch cwnd fall back to ~one MSS and ssthresh drop while the bytes still recover in order.
+            let tcp_bk_ok = net::tcp_congestion_backoff_loopback_selftest();
+            serial_println!("[ OK ] net 22d-2: TCP congestion backoff over loopback = {}", tcp_bk_ok);
 
             match net::ping(gw) {
                 Some(seq) => {

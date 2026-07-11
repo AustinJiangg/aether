@@ -1328,6 +1328,97 @@ pub fn tcp_congestion_control_loopback_selftest() -> bool {
     ok
 }
 
+/// Stage 22d-2 self-test of the **congestion backoff on loss** with no external peer, via PHY loopback — the
+/// follow-on to [`tcp_congestion_control_loopback_selftest`]. Slow start (22d-1) only opens `cwnd`; this
+/// exercises the *close* — the multiplicative-decrease half of AIMD — on a retransmission timeout.
+///
+/// Two phases. **Phase 1** streams a batch and drains it so `cwnd` grows well above one MSS (with `ssthresh`
+/// still at its initial near-infinity). **Phase 2** arms the loss-injection hook so the next data segment is
+/// silently dropped: no ACK comes, so only the RTO timer recovers it — and when it fires it also applies
+/// [`tcp::on_rto`], collapsing `cwnd` back to one MSS and halving `ssthresh` to the flight size. The test
+/// confirms `cwnd` fell back from its grown value to about one MSS, `ssthresh` dropped from near-infinity to
+/// a small value, and every byte (both phases) still arrived in order once the segment was recovered.
+pub fn tcp_congestion_backoff_loopback_selftest() -> bool {
+    tcp::reset_connections();
+    let port: u16 = 7785;
+    tcp::open_passive(port);
+
+    e1000::set_loopback(true);
+    let mut sink = [0u8; 2048];
+    while e1000::poll_frame(&mut sink).is_some() {}
+
+    let client_port = match tcp_connect(our_ip(), port) {
+        Some(p) => p,
+        None => {
+            e1000::set_loopback(false);
+            serial_println!("[net] TCP congestion-backoff loopback selftest: handshake failed");
+            return false;
+        }
+    };
+    for _ in 0..200 {
+        if tcp::established_count() >= 2 {
+            break;
+        }
+        poll();
+        crate::apic::pit_sleep_us(500);
+    }
+
+    // Phase 1: grow cwnd above one MSS by streaming a batch and draining it (all delivered and acknowledged).
+    let warmup = 6144usize;
+    let d1: Vec<u8> = (0..warmup).map(|i| (i % 251) as u8).collect();
+    tcp_send(client_port, port, &d1);
+    let mut got: Vec<u8> = Vec::new();
+    for _ in 0..8000 {
+        poll();
+        if let Some(chunk) = tcp_read(port, client_port, 4096) {
+            got.extend_from_slice(&chunk);
+        }
+        if got.len() >= warmup && tcp::all_data_acked(client_port, port) == Some(true) {
+            break;
+        }
+        crate::apic::pit_sleep_us(300);
+    }
+    let cwnd_grown = tcp::congestion_window(client_port, port).unwrap_or(0);
+    let ssthresh_before = tcp::slow_start_threshold(client_port, port).unwrap_or(0);
+
+    // Phase 2: drop the next data segment so no ACK returns — only the RTO can recover it. When the timer
+    // fires it resends *and* backs the sender off: cwnd -> one MSS, ssthresh -> half the flight.
+    DROP_NEXT_TCP_TX.store(1, Ordering::Release);
+    let d2 = b"aether tcp congestion backoff 22d-2";
+    tcp_send(client_port, port, d2);
+
+    let total = warmup + d2.len();
+    let mut cwnd_min = cwnd_grown;
+    for _ in 0..6000 {
+        poll();
+        if let Some(c) = tcp::congestion_window(client_port, port) {
+            cwnd_min = cwnd_min.min(c);
+        }
+        if let Some(chunk) = tcp_read(port, client_port, 4096) {
+            got.extend_from_slice(&chunk);
+        }
+        if got.len() >= total && tcp::all_data_acked(client_port, port) == Some(true) {
+            break;
+        }
+        crate::apic::pit_sleep_us(300);
+    }
+    let ssthresh_after = tcp::slow_start_threshold(client_port, port).unwrap_or(0);
+    e1000::set_loopback(false);
+
+    let mut expected = d1.clone();
+    expected.extend_from_slice(d2);
+    let grew = cwnd_grown > 1024; // phase 1 opened cwnd past one MSS, so there was something to collapse
+    let collapsed = cwnd_min < cwnd_grown && cwnd_min <= 2048; // the RTO backed cwnd off to about one MSS
+    let ssthresh_dropped = ssthresh_after < ssthresh_before; // multiplicative decrease lowered the threshold
+    let in_order = got == expected;
+    let ok = grew && collapsed && ssthresh_dropped && in_order && got.len() == total;
+    serial_println!(
+        "[net] TCP congestion-backoff loopback selftest: cwnd {} -> {} (min after loss), ssthresh {} -> {}, delivered {}/{} in order {}, ok = {}",
+        cwnd_grown, cwnd_min, ssthresh_before, ssthresh_after, got.len(), total, in_order, ok,
+    );
+    ok
+}
+
 /// Stage 21e self-test of **retransmission** with no external peer, via PHY loopback — the follow-on to
 /// [`tcp_teardown_loopback_selftest`] and the last piece that makes the transport truly *reliable*.
 /// Establish a loopback connection, then send a payload with the loss-injection hook armed so that data

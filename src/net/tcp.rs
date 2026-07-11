@@ -699,6 +699,20 @@ fn grow_cwnd(tcb: &mut Tcb, acked: u32) {
     }
 }
 
+/// Stage 22d-2: the congestion response to a **retransmission timeout** (RFC 5681 §3.1). An RTO means a
+/// segment was dropped outright — the strongest evidence of congestion — so the sender retreats hard: lower
+/// `ssthresh` to half the data that was in flight (never below two segments, RFC 5681 eq. 4), then collapse
+/// `cwnd` all the way back to one MSS, re-entering slow start. `cwnd` then ramps up exponentially again
+/// until it reaches the lowered `ssthresh`, where [`grow_cwnd`] switches to the gentler congestion
+/// avoidance — so a lossy path converges on the capacity it can actually sustain instead of hammering it.
+/// This is the "multiplicative decrease" half of TCP's AIMD (additive-increase / multiplicative-decrease).
+fn on_rto(tcb: &mut Tcb) {
+    let mss = MSS as u32;
+    let flight = tcb.snd_nxt.wrapping_sub(tcb.snd_una);
+    tcb.ssthresh = core::cmp::max(flight / 2, 2 * mss);
+    tcb.cwnd = mss;
+}
+
 /// Move a connection into TIME_WAIT and stamp its 2*MSL linger deadline (Stage 21e), after which
 /// [`on_tick`] closes it. The active closer lingers here so a lost final ACK can still be retransmitted.
 fn enter_time_wait(tcb: &mut Tcb) {
@@ -1036,6 +1050,18 @@ pub fn congestion_window(local_port: u16, remote_port: u16) -> Option<u32> {
         .map(|c| c.cwnd)
 }
 
+/// Stage 22d-2: the current **slow-start threshold** of `(local_port, remote_port)`, in bytes — the `cwnd`
+/// boundary between slow start (below) and congestion avoidance (at/above). Starts arbitrarily high
+/// ([`INIT_SSTHRESH`]) and is lowered to about half the flight on a retransmission timeout ([`on_rto`]), so
+/// the backoff self-test watches it fall from near-infinity to a small value. `None` if no such connection.
+pub fn slow_start_threshold(local_port: u16, remote_port: u16) -> Option<u32> {
+    CONNECTIONS
+        .lock()
+        .iter()
+        .find(|c| c.local_port == local_port && c.remote_port == remote_port)
+        .map(|c| c.ssthresh)
+}
+
 /// The state of the connection identified by `(local_port, remote_port)`, or `None` if there is no such
 /// TCB. Used by the connection driver in `net` to wait for [`State::Established`], and by tests.
 pub fn connection_state(local_port: u16, remote_port: u16) -> Option<State> {
@@ -1072,6 +1098,7 @@ pub fn on_tick() -> Vec<(Vec<u8>, [u8; 4])> {
             continue;
         }
         // Retransmit the oldest unacknowledged segment if its deadline has passed.
+        let mut timed_out = false;
         if let Some(u) = tcb.retransmit.first_mut() {
             if now >= u.deadline {
                 if u.tries >= MAX_RETRIES {
@@ -1084,7 +1111,14 @@ pub fn on_tick() -> Vec<(Vec<u8>, [u8; 4])> {
                 // Exponential backoff, capped: each successive resend waits twice as long.
                 u.deadline = now + (RTO_TICKS << core::cmp::min(u.tries, 6));
                 resends.push((u.segment.clone(), tcb.remote_ip));
+                timed_out = true;
             }
+        }
+        // Stage 22d-2: a retransmission timeout is the strongest congestion signal — a segment was lost
+        // outright — so back the sender off (multiplicative decrease + re-enter slow start). Done after the
+        // borrow of `tcb.retransmit` above is released, since it mutates other `tcb` fields (cwnd/ssthresh).
+        if timed_out {
+            on_rto(tcb);
         }
     }
     resends

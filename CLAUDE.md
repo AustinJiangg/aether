@@ -318,7 +318,13 @@ grows `cwnd` (the congestion window) and `ssthresh` (the slow-start threshold), 
 (slow start, so `cwnd` doubles per RTT) or `MSS*MSS/cwnd` per ACK once at/above it (congestion avoidance,
 ~one MSS per RTT — unreachable until a loss lowers `ssthresh`, Stage 22d-2). Proved via loopback by streaming
 8 KiB while draining the receiver and confirming `cwnd` climbs from one MSS ("cwnd 1024 -> 9216") with the
-bytes still in order. `ROADMAP.md` records the full staged history (stages 0-22d-1).
+bytes still in order. **Stage 22d-2 is also done**: the congestion backoff on loss (the multiplicative-decrease
+half of AIMD) — when the Stage 21e retransmit timer (`on_tick`) resends a segment it now also calls `on_rto`,
+which lowers `ssthresh` to `max(flight/2, 2*MSS)` and collapses `cwnd` back to one MSS (re-entering slow start,
+so `cwnd` then ramps up and eventually crosses `ssthresh` into congestion avoidance). Proved via loopback by
+growing `cwnd`, then dropping a segment so the RTO fires and backs the sender off ("cwnd 7168 -> 1059,
+ssthresh 4294967295 -> 2048") while the bytes still recover in order. `ROADMAP.md` records the full staged
+history (stages 0-22d-2).
 
 ## Language and writing conventions
 
@@ -838,7 +844,13 @@ Exit QEMU: `Ctrl-A` then `X`.
   `ssthresh`). `INIT_SSTHRESH` = `u32::MAX` keeps a fresh connection in slow start (the congestion-avoidance
   branch is unreachable until a loss lowers `ssthresh`, Stage 22d-2). The `congestion_window` accessor backs
   `net::tcp_congestion_control_loopback_selftest`, which streams 8 KiB over loopback and watches `cwnd` climb
-  from one MSS while the bytes arrive in order.
+  from one MSS while the bytes arrive in order. **Stage 22d-2** adds the **congestion backoff on loss**: when
+  the Stage 21e timer (`on_tick`) retransmits a segment it now also calls `on_rto`, which lowers `ssthresh` to
+  `max(flight/2, 2*MSS)` (multiplicative decrease) and collapses `cwnd` to one MSS, re-entering slow start (so
+  `cwnd` re-ramps and eventually crosses the lowered `ssthresh` into congestion avoidance — the branch 22d-1
+  could not reach). The `slow_start_threshold` accessor backs `net::tcp_congestion_backoff_loopback_selftest`,
+  which grows `cwnd`, drops a segment (the 21e `DROP_NEXT_TCP_TX` hook) so the RTO fires, and confirms `cwnd`
+  falls back to ~one MSS and `ssthresh` drops while the bytes recover in order.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run
