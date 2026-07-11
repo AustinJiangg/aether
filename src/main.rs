@@ -1092,6 +1092,14 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         "[sched] spawned workers {} and {}, wait-demo parent {} (spawns its own child)",
         p1, p2, parent
     );
+    // Stage 24a: also spawn a ring 3 program that uses the new socket syscalls — the network
+    // stack and ring 3, finally joined. `spawn_connect_demo` sets up a kernel-side loopback
+    // TCP listener (with PHY loopback on) and the program `socket()`s then `connect()`s to
+    // it; the blocking `connect` drives the handshake to ESTABLISHED before the process
+    // proceeds (see `process::on_user_connect`). Loopback is turned back off in
+    // `boot_continue` after the process phase.
+    let connector = process::spawn_connect_demo(&mut frame_allocator, phys_mem_offset);
+    serial_println!("[sched] spawned connect-demo process {}", connector);
     // Stage 12d: hand the frame allocator + physical-memory offset to the kernel globals
     // so the `spawn` syscall can load an ELF at runtime from inside the trap handler
     // (which cannot borrow these locals). This *moves* `frame_allocator`; nothing below
@@ -1142,6 +1150,15 @@ fn boot_continue() -> ! {
     serial_println!(
         "[sched] spawn: {} child process(es) created at runtime via the spawn syscall",
         process::processes_spawned(),
+    );
+    // Stage 24a: the connect demo has run. Turn the NIC's PHY loopback back off (it was
+    // enabled to route the demo's loopback handshake) so the shell's later `ping` and any
+    // real traffic reach the emulated wire again, and report how many ring 3 processes
+    // reached the network stack through the socket syscalls.
+    e1000::set_loopback(false);
+    serial_println!(
+        "[sched] socket: {} ring 3 process(es) connected to a loopback listener via connect()",
+        process::processes_connected(),
     );
     println!("Back from running user processes; continuing boot.");
 

@@ -55,6 +55,18 @@ pub const SYS_WAIT: u64 = 4;
 /// its pid (Stage 12d). Meaningful only from ring 3; returns the pid via the stack ABI
 /// (like `getpid`), and does not switch processes — the caller keeps running.
 pub const SYS_SPAWN: u64 = 5;
+/// `socket()` — allocate a TCP socket in the caller's per-process handle table and return
+/// its **file descriptor**, a small integer indexing that table (Stage 24a). Meaningful
+/// only from ring 3; returns the fd via the stack ABI (like `getpid`), and does not switch
+/// processes. The socket is created *unbound*; a later `connect` binds it to a connection.
+pub const SYS_SOCKET: u64 = 6;
+/// `connect(fd, dst)` — actively open a TCP connection on socket `fd` to `dst` (an IPv4
+/// address packed in the high 32 bits, port in the low 16), performing the three-way
+/// handshake (Stage 24a). Meaningful only from ring 3. Unlike the calls above this one
+/// **blocks**: the process is descheduled until the handshake reaches ESTABLISHED, and —
+/// like `wait` — it returns its result in `rax` (the connected fd, or `u64::MAX` on
+/// failure), since a blocking syscall resumes from its saved [`TrapFrame`].
+pub const SYS_CONNECT: u64 = 7;
 
 /// Count of syscalls that arrived from ring 3 — proof (for the Stage 10b test)
 /// that the user program really crossed into the kernel through `int 0x80`.
@@ -135,15 +147,21 @@ extern "C" fn syscall_dispatch(tf_ptr: *mut TrapFrame) {
     // stack top; it is valid and uniquely referenced for the duration of this call.
     let tf = unsafe { &mut *tf_ptr };
 
-    // `iframe.stack_pointer` is the caller's RSP at the `int 0x80`; by our ABI it
-    // points at [number, arg1, arg2].
+    // `iframe.stack_pointer` is the caller's RSP at the `int 0x80`; by our ABI [rsp] holds
+    // the syscall number and any arguments follow at [rsp+8] (arg1), [rsp+16] (arg2).
     let args = tf.iframe.stack_pointer.as_u64() as *mut u64;
 
-    // SAFETY: the caller pushed the number and two arguments at its stack top
-    // immediately before trapping, so these three slots exist and are writable.
-    // (A hardened kernel would verify the range lies in the caller's own mapped
-    // stack; our demo programs and the ring 0 tests always satisfy that.)
-    let (number, arg1, arg2) = unsafe { (args.read(), args.add(1).read(), args.add(2).read()) };
+    // Read only the *number* eagerly, and each argument slot lazily in the branch that
+    // uses it. A syscall with fewer arguments pushes fewer slots, so [rsp+8]/[rsp+16] then
+    // lie above the caller's pushed data — and when the call is the first thing on a fresh
+    // user stack (`socket` in the Stage 24a demo), above the mapped stack entirely, so
+    // eagerly reading all three would page-fault. (This was latent while every 0-argument
+    // syscall — `yield`/`wait` — only ran after the stack had already grown downward.)
+    //
+    // SAFETY: the caller pushed the number at its stack top immediately before trapping, so
+    // this slot exists and is readable. (A hardened kernel would also bounds-check the
+    // argument reads below against the caller's own mapped stack.)
+    let number = unsafe { args.read() };
 
     // The low two bits of the saved code selector are the caller's privilege level.
     let from_ring3 = tf.iframe.code_segment & 0b11 == 3;
@@ -156,15 +174,17 @@ extern "C" fn syscall_dispatch(tf_ptr: *mut TrapFrame) {
     // CR3) to resume a different process (or, for `exit` with none left, the kernel).
     // `yield` re-queues the caller; `exit` drops it.
     if number == SYS_YIELD && from_ring3 {
-        crate::process::on_user_yield(tf);
+        crate::process::on_user_yield(tf); // no arguments
         return;
     }
     if number == SYS_EXIT && from_ring3 {
-        crate::process::on_user_exit(tf, arg1);
+        // SAFETY: `exit` pushed its one argument (the code) at [rsp+8].
+        let code = unsafe { args.add(1).read() };
+        crate::process::on_user_exit(tf, code);
         return;
     }
     if number == SYS_WAIT && from_ring3 {
-        // `wait` blocks/returns its result in rax (set by on_user_wait), not the stack.
+        // `wait` takes no arguments and returns its result in rax (set by on_user_wait).
         crate::process::on_user_wait(tf);
         return;
     }
@@ -173,17 +193,44 @@ extern "C" fn syscall_dispatch(tf_ptr: *mut TrapFrame) {
         // value-returning calls below), but it must reach the scheduler for the caller's
         // id, so it is handled here rather than in `dispatch`. It does *not* switch
         // processes — the caller resumes right after, with the new pid.
-        let pid = crate::process::on_user_spawn(arg1);
-        // SAFETY: `args` is the caller's stack top (the number slot), shown writable
-        // above — the same slot the other value-returning syscalls write.
+        // SAFETY: `spawn` pushed its one argument (the program id) at [rsp+8].
+        let prog_id = unsafe { args.add(1).read() };
+        let pid = crate::process::on_user_spawn(prog_id);
+        // SAFETY: the number slot at [rsp] is writable — the caller pops the return value.
         unsafe { args.write(pid) };
         return;
     }
+    if number == SYS_SOCKET && from_ring3 {
+        // `socket` allocates a handle in the *caller's* per-process table, so — like
+        // `spawn` — it must reach the scheduler for the current process. It takes no
+        // arguments (so no slot above [rsp] is read — the fix for the first-syscall fault
+        // above), returns the fd via the stack ABI, and does not switch processes.
+        let fd = crate::process::on_user_socket();
+        // SAFETY: the number slot is writable, as above.
+        unsafe { args.write(fd) };
+        return;
+    }
+    if number == SYS_CONNECT && from_ring3 {
+        // `connect` is a *blocking* control transfer: it deschedules the caller until the
+        // handshake settles, then rewrites this `TrapFrame` (rax = result) to resume it —
+        // exactly like `wait`. It returns in rax, not the stack.
+        // SAFETY: `connect` pushed both arguments (fd, dst) at [rsp+8], [rsp+16].
+        let fd = unsafe { args.add(1).read() };
+        let dst = unsafe { args.add(2).read() };
+        crate::process::on_user_connect(tf, fd, dst);
+        return;
+    }
 
+    // The remaining calls (`write`/`getpid`/`exit` via `dispatch`) take up to two arguments
+    // and return via the stack. They are reached only from ring 0 (`invoke`, which always
+    // pushes both argument slots) or from ring 3 `write` (which also pushes both), so both
+    // slots are present here.
+    // SAFETY: those callers pushed both argument slots at [rsp+8], [rsp+16].
+    let arg1 = unsafe { args.add(1).read() };
+    let arg2 = unsafe { args.add(2).read() };
     let result = dispatch(number, arg1, arg2);
 
-    // SAFETY: same slot, just shown to be writable; this is where the caller will
-    // pop the return value from.
+    // SAFETY: the number slot is writable; the caller pops the return value from it.
     unsafe { args.write(result) };
 }
 

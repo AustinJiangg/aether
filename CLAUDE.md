@@ -355,8 +355,19 @@ Stage 23 (TCP refinements)**: the *sender* consumes those blocks — each `Unack
 `sacked` flag, `mark_sacked` (from `process_ack`) marks every queued segment a SACK block covers, and on a
 fast retransmit `sack_holes` resends **only the gaps** below the highest SACKed sequence (skipping segments
 the peer already holds), recovering several losses in one round trip (extra holes ride `Tcb::sack_resend`,
-drained by `take_sack_resends` each poll). `ROADMAP.md` records the full staged history (stages 0-22d-3
-complete, Stage 23 complete (23a-23d); Stages 24-26 remain).
+drained by `take_sack_resends` each poll). **Stage 24 (user space + networking — socket syscalls) has now
+begun. Stage 24a is done**: a per-process socket handle table + blocking `socket`/`connect`, joining ring 3
+and the TCP stack. Each `Process` gets a `sockets` table binding a small-integer **file descriptor** to a
+connection's `(local_port, remote_port)` pair; `SYS_SOCKET` allocates the lowest free fd and `SYS_CONNECT`
+actively opens a TCP connection — the stack's first **blocking syscall**, reusing the `wait` block-list
+pattern (a new `Scheduler::net_blocked`). Because the process scheduler still runs as a boot phase with no
+concurrent net thread, `on_user_connect` drives the handshake **inline** (`net::tcp_connect` pumps
+`net::poll` to ESTABLISHED, interrupts off so it is atomic) then wakes the process with the result in `rax`.
+A ring 3 demo `socket()`+`connect()`s to a kernel-side loopback listener. This surfaced and fixed a latent
+bug: `syscall_dispatch` eagerly read all three stack slots, faulting when `socket` (the first syscall on a
+fresh stack, only the number pushed) read past `USER_STACK_TOP` — now `number` is read eagerly and each
+argument lazily. `ROADMAP.md` records the full staged history (stages 0-22d-3 complete, Stage 23 complete
+(23a-23d), Stage 24 begun (24a done); Stages 24b-26 remain).
 
 ## Language and writing conventions
 
@@ -622,13 +633,18 @@ Exit QEMU: `Ctrl-A` then `X`.
 - `src/syscall.rs`: Stage 10 system calls over `int 0x80` (its IDT gate's DPL is 3 so
   ring 3 may invoke it) with a stack-based argument ABI:
   `write`/`getpid`/`exit`/`yield`/`wait`/`spawn` (Stage 12d's `spawn` creates a child
-  process from a kernel-known program and returns its pid).
-  Since Stage 12c-2 the entry is a hand-written *naked* stub (`syscall_entry`) that
+  process from a kernel-known program and returns its pid), plus Stage 24a's
+  `socket`/`connect` (the socket syscalls). Since Stage 12c-2 the entry is a hand-written
+  *naked* stub (`syscall_entry`) that
   builds a full `TrapFrame` and calls `syscall_dispatch`, mirroring the timer — so the
   general-purpose registers survive a context switch. Ring 3 `yield`/`exit` call
   `process::on_user_yield`/`on_user_exit` (which switch to another process or resume
   the kernel); an `invoke` helper drives the value-returning calls from ring 0 (the
-  boot demo and the tests).
+  boot demo and the tests). Stage 24a made `syscall_dispatch` read the `number` slot
+  eagerly but each argument slot **lazily** (only in the branch that uses it): a
+  0-argument syscall like `socket`, run as the first thing on a fresh user stack, pushes
+  only the number, so eagerly reading `[rsp+8]`/`[rsp+16]` page-faulted past
+  `USER_STACK_TOP`.
 - `src/elf.rs`: Stage 11b minimal ELF64 parser — validates the header (x86-64,
   ET_EXEC), bounds-checks the program-header table, and iterates the `PT_LOAD`
   segments. Pure (reads bytes, no page tables), so it is unit-testable on its own.
@@ -649,7 +665,16 @@ Exit QEMU: `Ctrl-A` then `X`.
   enqueues it as its child, returning the new pid — loading against the kernel CR3 (not
   the caller's populated space) and restoring the caller's CR3 before returning. The boot
   demo runs two `write`+busy-spin+`yield` workers interleaved under preemption, plus a
-  parent that `spawn`s its own child via `SYS_SPAWN` and `wait`s for it.
+  parent that `spawn`s its own child via `SYS_SPAWN` and `wait`s for it. Stage 24a adds a
+  per-process **socket handle table** (`Process::sockets`, a `UserSocket` binding a file
+  descriptor to a connection's `(local_port, remote_port)`) and the socket syscalls:
+  `on_user_socket` allocates the lowest free fd; `on_user_connect` is the stack's first
+  **blocking syscall** — it parks the caller in a new `Scheduler::net_blocked` list, drives
+  the TCP handshake to ESTABLISHED **inline** (`net::tcp_connect` pumps `net::poll`, since
+  no background net thread runs during the process phase), then wakes it with the result in
+  rax (like `wait`). `spawn_connect_demo` stands up a kernel-side loopback listener
+  (`net::tcp_listen_loopback` + PHY loopback) and spawns a ring 3 program that
+  `socket()`+`connect()`s to it.
 - `src/ata.rs`: Stage 13a/13b block device driver — a minimal ATA (IDE) disk driver in
   PIO mode. `read_sector` reads one raw 512-byte sector from the primary master by
   the polled READ SECTORS (LBA28) protocol: write the LBA/count registers, issue the

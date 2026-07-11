@@ -66,6 +66,9 @@ const CHILD_CODE_LEN: usize = 17 + 6;
 /// Length of the wait-demo parent's code (Stage 12d): `write` + `spawn` (6 B) +
 /// `wait` (4 B) + `write` + `exit`. The parent now creates its own child via `spawn`.
 const PARENT_CODE_LEN: usize = 17 + 6 + 4 + 17 + 6;
+/// Length of the Stage 24a connect-demo code: `socket` (5 B) + `connect` (19 B) +
+/// `write` (17 B) + `exit` (6 B).
+const CONNECT_CODE_LEN: usize = 5 + 19 + 17 + 6;
 
 /// Top of the program's user stack (the initial user `rsp`). It sits in the same
 /// private L4 slot as the loaded image, well above the code page; the stack grows
@@ -290,6 +293,30 @@ fn emit_spawn(code: &mut Vec<u8>, prog_id: u8) {
     code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
 }
 
+/// `socket()` — 5 bytes (Stage 24a). A zero-argument call whose result comes back on the
+/// stack (like `getpid`): push the number, `int 0x80`, then `pop rax` so the returned fd
+/// lands in `rax`, where [`emit_connect`] expects it.
+fn emit_socket(code: &mut Vec<u8>) {
+    code.extend_from_slice(&[0x6A, crate::syscall::SYS_SOCKET as u8]); // push SYS_SOCKET
+    code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
+    code.push(0x58); // pop rax   (rax = fd)
+}
+
+/// `connect(fd, dst)` — 19 bytes (Stage 24a). Consumes the fd left in `rax` by
+/// [`emit_socket`] and connects it to `dst` (the packed IPv4 address + port). `connect`
+/// blocks until the handshake completes and returns its result in `rax`, so nothing is
+/// popped here. It stashes the fd in `rsi` first, because materializing the 64-bit `dst`
+/// immediate clobbers `rax`; then pushes the args (dst, fd, number) and traps.
+fn emit_connect(code: &mut Vec<u8>, dst: u64) {
+    code.extend_from_slice(&[0x48, 0x89, 0xC6]); // mov rsi, rax   (stash fd)
+    code.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 ...
+    code.extend_from_slice(&dst.to_le_bytes()); // ... = dst (packed ip:port)
+    code.push(0x50); // push rax   (arg2 = dst)
+    code.push(0x56); // push rsi   (arg1 = fd)
+    code.extend_from_slice(&[0x6A, crate::syscall::SYS_CONNECT as u8]); // push SYS_CONNECT
+    code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
+}
+
 /// A busy-spin of `count` iterations — `mov rcx, count; dec rcx; jnz` (12 bytes). A
 /// ring-3 delay long enough that a ~55 ms timer tick lands mid-spin and *preempts* the
 /// process (Stage 12c-3). `rcx` is live throughout, so a correct preemption must save
@@ -342,6 +369,21 @@ fn build_parent(msg_ptr: u64, msg_len: u8) -> Vec<u8> {
     emit_write(&mut code, msg_ptr, msg_len);
     emit_exit(&mut code, 0);
     debug_assert_eq!(code.len(), PARENT_CODE_LEN);
+    code
+}
+
+/// Hand-assemble the Stage 24a connect demo: `socket(); connect(fd, dst); write(msg);
+/// exit(0)`. `dst` packs the loopback listener's address and port (see [`pack_dst`]). The
+/// `connect` blocks in ring 3 until the handshake establishes; on success the process prints
+/// `msg`, visibly proving a ring 3 program reached the network stack through the socket
+/// syscalls. Produces exactly [`CONNECT_CODE_LEN`] bytes.
+fn build_connect_demo(msg_ptr: u64, msg_len: u8, dst: u64) -> Vec<u8> {
+    let mut code = Vec::new();
+    emit_socket(&mut code);
+    emit_connect(&mut code, dst);
+    emit_write(&mut code, msg_ptr, msg_len);
+    emit_exit(&mut code, 0);
+    debug_assert_eq!(code.len(), CONNECT_CODE_LEN);
     code
 }
 
@@ -456,6 +498,49 @@ pub fn spawn_wait_demo(
     parent_id
 }
 
+/// The loopback TCP port the Stage 24a connect demo uses: the kernel listens on it and the
+/// ring 3 program connects to it. Arbitrary and otherwise unused.
+pub const CONNECT_DEMO_PORT: u16 = 7900;
+
+/// Pack an IPv4 address + port into the single 64-bit argument the `connect` syscall takes.
+/// Our stack ABI passes two u64 arguments, but the destination is three values (fd is the
+/// other argument), so the address goes in the high 32 bits — in big-endian octet order, so
+/// the packed value reads left-to-right as the dotted-decimal address — and the port in the
+/// low 16. [`on_user_connect`] unpacks it the same way.
+fn pack_dst(ip: [u8; 4], port: u16) -> u64 {
+    ((u32::from_be_bytes(ip) as u64) << 16) | port as u64
+}
+
+/// Build the Stage 24a connect-demo ELF (`socket`; `connect(dst)`; `write`; `exit`).
+fn connect_demo_elf(dst: u64) -> Vec<u8> {
+    let msg = b"user process: connected to loopback listener via socket syscalls\n";
+    let code = build_connect_demo(msg_vaddr(CONNECT_CODE_LEN), msg.len() as u8, dst);
+    build_elf(&code, msg)
+}
+
+/// Boot demo for the Stage 24a socket syscalls: stand up a kernel-side TCP listener on the
+/// loopback port with the NIC's PHY loopback enabled (so a locally-sent SYN returns to us,
+/// mirroring the `net` loopback self-tests), then load and spawn a ring 3 program that
+/// `socket()`s and `connect()`s to that listener. The blocking `connect` drives the
+/// handshake to ESTABLISHED before the process proceeds (see [`on_user_connect`]); the caller
+/// disables loopback again after the process phase. Returns the demo process's pid.
+pub fn spawn_connect_demo(
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    physical_memory_offset: VirtAddr,
+) -> u64 {
+    let ip = crate::net::our_ip();
+    crate::net::tcp_listen_loopback(CONNECT_DEMO_PORT);
+    let dst = pack_dst(ip, CONNECT_DEMO_PORT);
+    let img = load(&connect_demo_elf(dst), frame_allocator, physical_memory_offset)
+        .expect("failed to load the connect-demo program");
+    let pid = spawn(img, None);
+    serial_println!(
+        "[sched] connect-demo: spawned process {} (it will socket()+connect() to {}.{}.{}.{}:{} over loopback)",
+        pid, ip[0], ip[1], ip[2], ip[3], CONNECT_DEMO_PORT,
+    );
+    pid
+}
+
 /// Set once the boot demo has loaded the demo ELF into a fresh space and verified
 /// the entry's bytes. Read by the Stage 11b test.
 static ELF_LOAD_OK: AtomicBool = AtomicBool::new(false);
@@ -555,6 +640,25 @@ static PROCESSES_WAITED: AtomicU64 = AtomicU64::new(0);
 static LAST_WAITED_CODE: AtomicU64 = AtomicU64::new(u64::MAX);
 /// How many child processes ring 3 created via the `spawn` syscall — Stage 12d test.
 static PROCESSES_SPAWNED: AtomicU64 = AtomicU64::new(0);
+/// How many ring 3 processes established a TCP connection via the `connect` syscall — Stage
+/// 24a test.
+static PROCESSES_CONNECTED: AtomicU64 = AtomicU64::new(0);
+
+/// Stage 24a: a user **socket** — the per-process handle a ring 3 program obtains from the
+/// `socket` syscall and connects with. It is a thin binding from a small-integer **file
+/// descriptor** (an index into [`Process::sockets`]) to a TCP connection in the global
+/// connection table, which `net`/`tcp` key by the `(local_port, remote_port)` pair. A fresh
+/// socket is *unbound* (both ports 0); `connect` fills them in once the handshake
+/// establishes, so a later `send`/`recv` (Stage 24b) can find the connection's TCB. This is
+/// the kernel's first step toward Unix's "everything is a file descriptor".
+#[derive(Clone, Copy)]
+// The bound port pair is written by `connect` (Stage 24a) but not read until `send`/`recv`
+// (Stage 24b) look up the connection's TCB by it; allow it dead for this one stage.
+#[allow(dead_code)]
+struct UserSocket {
+    local_port: u16,
+    remote_port: u16,
+}
 
 /// A user process: a unique id, its loaded image (address space, entry, stack), its
 /// saved execution context (`context`), and its `parent`. As of Stage 12c-2 the context
@@ -569,6 +673,11 @@ struct Process {
     /// The process that may collect this one's exit code via `wait` (Stage 12); `None`
     /// for the root processes the kernel spawns directly at boot.
     parent: Option<u64>,
+    /// Stage 24a: the process's **socket handle table** — its open sockets, indexed by file
+    /// descriptor (a `None` slot is a closed/free fd). Empty until the process calls
+    /// `socket`. Per-process, so the same small fd means different connections in different
+    /// processes — the point of a handle table.
+    sockets: Vec<Option<UserSocket>>,
 }
 
 /// An exited child whose parent has not yet `wait`ed for it — a "zombie". We keep only
@@ -594,6 +703,12 @@ struct Scheduler {
     current: Option<Process>,
     /// Processes blocked in `wait`, waiting for a child to exit (Stage 12).
     blocked: Vec<Process>,
+    /// Stage 24a: processes blocked in a networking syscall (so far only `connect`),
+    /// waiting for a network event — the same idea as `blocked`, but woken by the network
+    /// stack rather than a child's exit. A blocked process is on no run queue; the
+    /// `connect` handler parks it here while it drives the handshake, then moves it back to
+    /// `current`/`ready` with its result (see [`on_user_connect`]).
+    net_blocked: Vec<Process>,
     /// Exited children whose parents have not yet collected them via `wait` (Stage 12).
     zombies: Vec<Zombie>,
     next_id: u64,
@@ -603,6 +718,7 @@ static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler {
     ready: Vec::new(),
     current: None,
     blocked: Vec::new(),
+    net_blocked: Vec::new(),
     zombies: Vec::new(),
     next_id: 1,
 });
@@ -622,6 +738,7 @@ pub fn spawn(image: UserImage, parent: Option<u64>) -> u64 {
         image,
         context: TrapFrame::new(iframe),
         parent,
+        sockets: Vec::new(), // no sockets until the process calls `socket` (Stage 24a)
     });
     id
 }
@@ -900,6 +1017,116 @@ pub fn on_user_spawn(prog_id: u64) -> u64 {
     child_id
 }
 
+/// Called by the `socket` syscall (ring 3, Stage 24a): allocate a fresh, unbound socket in
+/// the calling process's handle table and return its **file descriptor** (the table index).
+/// Reuses the lowest free slot, mirroring Unix's "lowest available fd". Returns `u64::MAX`
+/// if there is no current process (it should never be called from ring 0). Like `getpid`,
+/// it returns via the stack ABI and does not switch processes.
+pub fn on_user_socket() -> u64 {
+    let mut sched = SCHEDULER.lock();
+    let proc = match sched.current.as_mut() {
+        Some(p) => p,
+        None => return u64::MAX,
+    };
+    let new = UserSocket { local_port: 0, remote_port: 0 };
+    let fd = match proc.sockets.iter().position(|s| s.is_none()) {
+        Some(i) => {
+            proc.sockets[i] = Some(new);
+            i
+        }
+        None => {
+            proc.sockets.push(Some(new));
+            proc.sockets.len() - 1
+        }
+    };
+    serial_println!("[sched] process {} opened socket fd {}", proc.id, fd);
+    fd as u64
+}
+
+/// Called by the `connect` syscall (ring 3, Stage 24a): actively open a TCP connection from
+/// the process's socket `fd` to the destination packed in `dst` — the IPv4 address in the
+/// high 32 bits (big-endian octet order, so it reads left-to-right) and the port in the low
+/// 16. This is the stack's **first blocking syscall**: the process cannot proceed until the
+/// three-way handshake reaches ESTABLISHED, so it is descheduled meanwhile.
+///
+/// The block reuses the `wait` pattern: the caller is moved out of `current` into
+/// `net_blocked` (on no run queue) while the handshake runs, then moved back with its
+/// result. *How* the handshake is driven is the Stage 24a design decision (see ROADMAP.md):
+/// the process scheduler runs as a boot phase with no concurrent network thread yet, so this
+/// handler drives it **inline** — [`crate::net::tcp_connect`] sends the SYN and pumps
+/// `net::poll` until ESTABLISHED (for a loopback peer, a handful of microseconds; interrupts
+/// are off during a syscall, so it is atomic w.r.t. the other processes). A later stage that
+/// runs user processes alongside the background `net_thread` would instead switch to another
+/// ready process here and let the net thread's poll wake this one.
+///
+/// Returns its result in **rax** (like `wait`, since a blocking syscall resumes from its
+/// saved [`TrapFrame`]): the connected socket fd on success, or `u64::MAX` on failure/timeout.
+/// On success the socket is bound to the established connection so `send`/`recv` (Stage 24b)
+/// can find its TCB. Rewrites `tf` to resume the (now-unblocked) caller.
+pub fn on_user_connect(tf: &mut TrapFrame, fd: u64, dst: u64) {
+    let ip = ((dst >> 16) as u32).to_be_bytes();
+    let remote_port = (dst & 0xFFFF) as u16;
+
+    // Phase 1 (locked): validate the fd, then park the caller in `net_blocked` for the
+    // duration of the handshake. Taking it out of `current` is what makes this a real block —
+    // it is on no run queue until Phase 3 wakes it.
+    let pid = {
+        let mut sched = SCHEDULER.lock();
+        let proc = match sched.current.as_mut() {
+            Some(p) => p,
+            None => return, // no current process — should not happen from a ring 3 syscall
+        };
+        let idx = fd as usize;
+        if idx >= proc.sockets.len() || proc.sockets[idx].is_none() {
+            serial_println!("[sched] connect: process {} has no socket fd {}", proc.id, fd);
+            tf.rax = u64::MAX;
+            return;
+        }
+        let mut blocked = sched.current.take().expect("current is_some, checked above");
+        blocked.context = *tf; // resume point; rax is filled in once the handshake settles
+        let id = blocked.id;
+        serial_println!(
+            "[sched] process {} blocked in connect(fd {}) to {}.{}.{}.{}:{}",
+            id, fd, ip[0], ip[1], ip[2], ip[3], remote_port,
+        );
+        sched.net_blocked.push(blocked);
+        id
+    };
+
+    // Phase 2 (unlocked): drive the handshake to completion. `tcp_connect` sends the SYN and
+    // pumps `net::poll` until ESTABLISHED, returning the chosen ephemeral local port, or
+    // `None` on timeout. The scheduler lock is released so the poll path can run freely.
+    let result = crate::net::tcp_connect(ip, remote_port);
+
+    // Phase 3 (locked): wake the blocked process with the outcome and resume it. On success
+    // bind the socket to the established connection's port pair.
+    let mut sched = SCHEDULER.lock();
+    let pos = sched
+        .net_blocked
+        .iter()
+        .position(|p| p.id == pid)
+        .expect("the process we just blocked is still in net_blocked");
+    let mut proc = sched.net_blocked.remove(pos);
+    match result {
+        Some(local_port) => {
+            proc.sockets[fd as usize] = Some(UserSocket { local_port, remote_port });
+            proc.context.rax = fd; // connect() returns the connected fd
+            PROCESSES_CONNECTED.fetch_add(1, Ordering::SeqCst);
+            serial_println!(
+                "[sched] process {} connected: socket fd {} -> {}:{} (ESTABLISHED)",
+                proc.id, fd, local_port, remote_port,
+            );
+        }
+        None => {
+            proc.context.rax = u64::MAX; // connect() failed / timed out
+            serial_println!("[sched] process {} connect timed out", proc.id);
+        }
+    }
+    let resume = proc.context;
+    sched.current = Some(proc);
+    *tf = resume; // resume the caller (its rax now holds the connect result)
+}
+
 /// Called from the timer interrupt when it fires while a *user* process runs in ring 3
 /// — Stage 12c-3 preemption. Saves the running process's full register context,
 /// round-robins it to the back of the ready queue, switches to the next ready process
@@ -998,4 +1225,10 @@ pub fn last_waited_code() -> u64 {
 /// test.
 pub fn processes_spawned() -> u64 {
     PROCESSES_SPAWNED.load(Ordering::SeqCst)
+}
+
+/// How many ring 3 processes established a TCP connection via the `connect` syscall. For the
+/// Stage 24a test.
+pub fn processes_connected() -> u64 {
+    PROCESSES_CONNECTED.load(Ordering::SeqCst)
 }

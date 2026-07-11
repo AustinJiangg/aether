@@ -301,6 +301,17 @@ fn process_spawned_via_syscall() {
     assert_eq!(crate::process::last_waited_code(), 42);
 }
 
+/// Stage 24a: a ring 3 process reached the network stack through the `socket`/`connect`
+/// syscalls — user space and the TCP stack, joined for the first time. The boot demo stands
+/// up a kernel-side loopback listener and spawns a program that `socket()`s then
+/// `connect()`s to it; the blocking `connect` drives the three-way handshake to ESTABLISHED
+/// before waking the process, so by the time this harness runs at least one process must
+/// have connected.
+#[test_case]
+fn ring3_process_connected_a_socket() {
+    assert!(crate::process::processes_connected() >= 1);
+}
+
 /// Stage 13a: the ATA PIO driver reads a raw sector from disk. The bootimage QEMU attaches
 /// the kernel image as the primary IDE master, so sector 0 is the boot sector, whose final
 /// two bytes are the MBR boot signature 0x55 0xAA — a stable value to assert without

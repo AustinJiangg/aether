@@ -797,7 +797,7 @@ unify later.
 
 ## Post-roadmap tracks (Stage 23+)
 
-> **Status: in progress — Stage 23 complete (23a-23d); Stages 24-26 remain.** With the original roadmap complete (stages 0-22d-3), four independent
+> **Status: in progress — Stage 23 complete (23a-23d); Stage 24 begun (24a done); Stages 24b-26 remain.** With the original roadmap complete (stages 0-22d-3), four independent
 > follow-on tracks extend it. They are **not** strictly ordered by dependency, but the recommended sequence
 > is **23 → 24 → 25 → 26**, chosen by risk and blast radius: do the isolated TCP polish first (it rides the
 > momentum of the just-finished TCP work), then the socket capstone that makes the stack usable, then the
@@ -922,6 +922,30 @@ Isolated to `net/tcp.rs` plus a few `net/mod.rs` self-tests; no new subsystems, 
 
 Connects the two finished lines — the network stack and ring 3 — so user programs can do I/O. Touches
 `syscall.rs`, `process.rs`, `net/mod.rs`, and a new user program.
+
+> **Stage 24a is done — per-process handle table + `socket`/`connect` (blocking).** User space reaches the
+> TCP stack for the first time. `process.rs` gives each `Process` a **socket handle table** (`sockets:
+> Vec<Option<UserSocket>>`, a `UserSocket` binding a small-integer **file descriptor** to a connection's
+> `(local_port, remote_port)` pair — the kernel's first step toward "everything is a file descriptor").
+> `syscall.rs` adds `SYS_SOCKET` (6) and `SYS_CONNECT` (7): `socket` allocates the lowest free fd in the
+> caller's table (returned via the stack ABI, like `getpid`), and `connect(fd, dst)` — the stack's **first
+> blocking syscall** — actively opens a TCP connection to `dst` (the IPv4 address packed in the high 32 bits,
+> port in the low 16, since our two-argument ABI cannot pass three values). `connect` reuses the `wait`
+> block-list pattern: `on_user_connect` parks the caller in a new `Scheduler::net_blocked` list (on no run
+> queue), and — the Stage 24a design decision, since the process scheduler runs as a boot phase with **no
+> concurrent network thread yet** — drives the handshake **inline** (`net::tcp_connect` sends the SYN and
+> pumps `net::poll` until ESTABLISHED; interrupts are off in a syscall, so it is atomic w.r.t. the other
+> processes), then wakes the process with the result in `rax` (like `wait`). A ring 3 demo (`socket();
+> connect(loopback); write; exit`, hand-assembled with new `emit_socket`/`emit_connect`) connects to a
+> kernel-side loopback listener (`net::tcp_listen_loopback` + PHY loopback, disabled again after the process
+> phase). **The bug this surfaced:** `syscall_dispatch` eagerly read all three stack slots
+> (number/arg1/arg2), but `socket` is the first syscall on a *fresh* user stack and pushes only the number,
+> so reading `[rsp+8]` page-faulted at `USER_STACK_TOP` — latent because earlier 0-argument syscalls
+> (`yield`/`wait`) only ran after the stack had grown down; fixed by reading `number` eagerly and each
+> argument slot lazily in the branch that uses it. Boot logs "process 4 connected: socket fd 0 -> 49168:7900
+> (ESTABLISHED)" and the ring 3 process prints its message; verified by 89 tests (the new
+> `ring3_process_connected_a_socket`). (Remaining: 24b `send`/`recv`, 24c `listen`/`accept`, 24d `close` + a
+> user netcat demo.)
 
 | Sub-step | What to build | OS concepts | Smallest verifiable step |
 |----------|---------------|-------------|--------------------------|

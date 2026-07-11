@@ -808,6 +808,21 @@ pub fn tcp_connect(remote_ip: [u8; 4], remote_port: u16) -> Option<u16> {
     None
 }
 
+/// Stage 24a: set up a kernel-side passive TCP listener on `local_port` with the NIC's PHY
+/// loopback enabled, so a locally-originated SYN to our own address reaches this listener and
+/// its SYN-ACK returns to us — the same loopback arrangement the TCP self-tests use. The
+/// Stage 24a connect-demo ring 3 program (`process::spawn_connect_demo`) then `connect`s to
+/// it. The listener is left in place; the caller disables loopback again (`e1000::set_loopback(false)`)
+/// once the demo has run. Clears the connection table first so the handshake starts clean.
+pub fn tcp_listen_loopback(local_port: u16) {
+    tcp::reset_connections();
+    tcp::open_passive(local_port);
+    e1000::set_loopback(true);
+    // Drain any stale frames so the handshake sees a clean ring.
+    let mut sink = [0u8; 2048];
+    while e1000::poll_frame(&mut sink).is_some() {}
+}
+
 /// Stage 22c: transmit the segments a [`tcp::flush`] produced (queued data the window now admits, or a
 /// zero-window probe), each framed as TCP-in-IPv4-in-Ethernet to its peer. Uses the cache-only next-hop
 /// (an established connection's peer MAC is already resolved, or is our own for loopback) and goes through
