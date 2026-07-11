@@ -1292,6 +1292,18 @@ fn tcp_reassembles_out_of_order() {
     );
 }
 
+/// Stage 22b: TCP flow control (the receiver's sliding window) via loopback (no external peer). Fill the
+/// receiver's window to zero, confirm a further segment is refused (dropped, not buffered), then read to
+/// reopen the window and confirm the refused data is finally admitted. Exercises the real advertised
+/// window (free receive-buffer space), window enforcement on the receive path, and the read/reopen path.
+#[test_case]
+fn tcp_enforces_receive_window() {
+    use crate::net;
+
+    assert!(crate::e1000::present(), "e1000 not initialized");
+    assert!(net::tcp_flow_control_loopback_selftest(), "TCP flow control over loopback failed");
+}
+
 /// Stage 19b-2: the live DNS resolver — resolve a hostname through SLIRP's DNS server over the wire.
 /// Unlike the SLIRP-internal gateway ping, this depends on the *host* having working upstream DNS
 /// (SLIRP forwards to it), so the test is lenient: it always exercises the full path (build the query,

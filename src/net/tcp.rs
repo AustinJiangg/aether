@@ -180,8 +180,22 @@ pub fn checksum(src_ip: [u8; 4], dst_ip: [u8; 4], segment: &[u8]) -> u16 {
 // acknowledges x+1. The initial sequence numbers (x, y) are each side's ISS (initial send sequence).
 // ---------------------------------------------------------------------------------------------------
 
-/// The receive window we advertise, in bytes. Fixed for now; real flow control comes in a later step.
-const DEFAULT_WINDOW: u16 = 64240;
+/// Stage 22b: the maximum receive buffer, in bytes — the largest window we ever advertise. Kept modest
+/// (a real stack uses tens of KiB, auto-tuned) so a self-test can fill it and drive the window to zero
+/// cheaply. The window we actually advertise on each segment is this minus the unread bytes already
+/// buffered (`recv_window`), so it shrinks as data piles up unread and reopens when the app reads.
+const RCV_WINDOW_MAX: usize = 2048;
+
+/// Stage 22b: the receive window to advertise given `rx_used` unread bytes already buffered — the free
+/// space left in the receive buffer, clamped to the 16-bit window field. Zero means "stop sending".
+fn window_for(rx_used: usize) -> u16 {
+    RCV_WINDOW_MAX.saturating_sub(rx_used).min(u16::MAX as usize) as u16
+}
+
+/// Stage 22b: the window this connection currently advertises — free space in its receive buffer.
+fn recv_window(tcb: &Tcb) -> u16 {
+    window_for(tcb.rx.len())
+}
 
 // Stage 21e: retransmission-timer constants. Time is measured in timer ticks (`interrupts::timer_ticks`,
 // 100 Hz, so 1 tick = 10 ms). A real stack estimates the retransmission timeout from measured round-trip
@@ -370,7 +384,7 @@ pub fn open_active(
         retransmit: Vec::new(),
         time_wait_deadline: 0,
     });
-    build(local_ip, remote_ip, local_port, remote_port, iss, 0, SYN, DEFAULT_WINDOW, &[])
+    build(local_ip, remote_ip, local_port, remote_port, iss, 0, SYN, window_for(0), &[])
 }
 
 /// Process one received TCP segment against the connection table, advancing the relevant TCB's state
@@ -416,7 +430,7 @@ pub fn on_segment(local_ip: [u8; 4], remote_ip: [u8; 4], seg: &Segment) -> Optio
                 iss,
                 tcb.rcv_nxt,
                 SYN | ACK,
-                DEFAULT_WINDOW,
+                recv_window(tcb),
                 &[],
             ));
         }
@@ -447,7 +461,7 @@ fn step(tcb: &mut Tcb, local_ip: [u8; 4], remote_ip: [u8; 4], seg: &Segment) -> 
                     tcb.snd_nxt,
                     tcb.rcv_nxt,
                     ACK,
-                    DEFAULT_WINDOW,
+                    recv_window(tcb),
                     &[],
                 ));
             }
@@ -464,7 +478,7 @@ fn step(tcb: &mut Tcb, local_ip: [u8; 4], remote_ip: [u8; 4], seg: &Segment) -> 
                     tcb.iss,
                     tcb.rcv_nxt,
                     SYN | ACK,
-                    DEFAULT_WINDOW,
+                    recv_window(tcb),
                     &[],
                 ));
             }
@@ -574,7 +588,7 @@ fn build_ack(tcb: &Tcb, local_ip: [u8; 4], remote_ip: [u8; 4]) -> Vec<u8> {
         tcb.snd_nxt,
         tcb.rcv_nxt,
         ACK,
-        DEFAULT_WINDOW,
+        recv_window(tcb),
         &[],
     )
 }
@@ -662,9 +676,18 @@ fn accept_segment_data(tcb: &mut Tcb, seq: u32, payload: &[u8]) {
         return; // entirely old — already accepted
     }
     if seq_leq(seq, tcb.rcv_nxt) {
-        // In order (dropping any prefix we already hold): append the part beyond `rcv_nxt` and advance.
+        // In order (dropping any prefix we already hold): the new bytes are the part beyond `rcv_nxt`.
         let skip = tcb.rcv_nxt.wrapping_sub(seq) as usize;
-        tcb.rx.extend_from_slice(&payload[skip..]);
+        let new = &payload[skip..];
+        // Stage 22b: **flow control** — accept the segment only if it fits the free receive window. If it
+        // does not, drop it (leaving `rcv_nxt` where it is): the ACK below then advertises the smaller
+        // window, and the peer waits / retransmits until the application reads and reopens it. This keeps
+        // `rx` bounded by `RCV_WINDOW_MAX`, so the window we advertise is honest.
+        let free = RCV_WINDOW_MAX.saturating_sub(tcb.rx.len());
+        if new.len() > free {
+            return;
+        }
+        tcb.rx.extend_from_slice(new);
         tcb.rcv_nxt = end;
         drain_ooo(tcb);
         return;
@@ -742,7 +765,7 @@ pub fn send_data(
         tcb.snd_nxt,
         tcb.rcv_nxt,
         PSH | ACK,
-        DEFAULT_WINDOW,
+        recv_window(tcb),
         data,
     );
     tcb.snd_nxt = tcb.snd_nxt.wrapping_add(data.len() as u32);
@@ -783,7 +806,7 @@ pub fn close(local_ip: [u8; 4], local_port: u16, remote_port: u16) -> Option<(Ve
         tcb.snd_nxt,
         tcb.rcv_nxt,
         FIN | ACK,
-        DEFAULT_WINDOW,
+        recv_window(tcb),
         &[],
     );
     tcb.snd_nxt = tcb.snd_nxt.wrapping_add(1); // the FIN consumes one sequence number
@@ -807,6 +830,30 @@ pub fn received_data(local_port: u16, remote_port: u16) -> Option<Vec<u8>> {
         .iter()
         .find(|c| c.local_port == local_port && c.remote_port == remote_port)
         .map(|c| c.rx.clone())
+}
+
+/// Stage 22b: the application **consuming** received data — drain up to `max` bytes from the front of the
+/// connection's receive buffer and return them. This is what reopens the flow-control window: the buffer
+/// shrinks, so the next segment we send advertises a larger [`recv_window`]. `None` if no such connection.
+pub fn read(local_port: u16, remote_port: u16, max: usize) -> Option<Vec<u8>> {
+    let mut table = CONNECTIONS.lock();
+    let tcb = table
+        .iter_mut()
+        .find(|c| c.local_port == local_port && c.remote_port == remote_port)?;
+    let n = max.min(tcb.rx.len());
+    Some(tcb.rx.drain(..n).collect())
+}
+
+/// Stage 22b: the receive window this connection currently advertises — the free space in its receive
+/// buffer (`RCV_WINDOW_MAX` minus the unread bytes). Zero means the buffer is full ("stop sending"). Used
+/// by the flow-control self-test to observe the window shrink to zero and reopen after a [`read`]. `None`
+/// if no such connection.
+pub fn receive_window(local_port: u16, remote_port: u16) -> Option<u16> {
+    CONNECTIONS
+        .lock()
+        .iter()
+        .find(|c| c.local_port == local_port && c.remote_port == remote_port)
+        .map(recv_window)
 }
 
 /// Stage 21c: whether every byte we have sent on `(local_port, remote_port)` has been acknowledged by the

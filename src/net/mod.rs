@@ -1048,6 +1048,118 @@ pub fn tcp_reassembly_loopback_selftest() -> bool {
     ok
 }
 
+/// Stage 22b: the application consuming received data — drain up to `max` bytes from the connection's
+/// receive buffer, reopening the flow-control window. Thin pass-through to [`tcp::read`].
+pub fn tcp_read(local_port: u16, remote_port: u16, max: usize) -> Option<Vec<u8>> {
+    tcp::read(local_port, remote_port, max)
+}
+
+/// Stage 22b: the receive window a connection currently advertises (free receive-buffer space). Thin
+/// pass-through to [`tcp::receive_window`].
+pub fn tcp_receive_window(local_port: u16, remote_port: u16) -> Option<u16> {
+    tcp::receive_window(local_port, remote_port)
+}
+
+/// Stage 22b self-test of **flow control** (the receiver's sliding window) with no external peer, via PHY
+/// loopback. Establish a loopback connection, then:
+///
+/// 1. **Fill** the receiver's window exactly (the sender still ignores the window in this sub-step, so we
+///    simply hand it `RCV_WINDOW_MAX` bytes): the receiver accepts them and its advertised window shrinks
+///    to **zero** as the unread bytes pile up.
+/// 2. **Overrun** it: send one more segment while the window is zero — the receiver must *refuse* it (drop,
+///    not buffer), so its receive buffer and `rcv_nxt` do not move. Flow control in action.
+/// 3. **Read**: the application drains some bytes, so the window **reopens** to that many bytes.
+/// 4. **Re-admit**: with room again, the sender's retransmission timer (Stage 21e) resends the refused
+///    segment and it is now accepted — proving the reopened window actually admits data.
+///
+/// Returns whether all four held.
+pub fn tcp_flow_control_loopback_selftest() -> bool {
+    tcp::reset_connections();
+    let port: u16 = 7782;
+    tcp::open_passive(port);
+
+    e1000::set_loopback(true);
+    let mut sink = [0u8; 2048];
+    while e1000::poll_frame(&mut sink).is_some() {}
+
+    let client_port = match tcp_connect(our_ip(), port) {
+        Some(p) => p,
+        None => {
+            e1000::set_loopback(false);
+            serial_println!("[net] TCP flow-control loopback selftest: handshake failed");
+            return false;
+        }
+    };
+    for _ in 0..200 {
+        if tcp::established_count() >= 2 {
+            break;
+        }
+        poll();
+        crate::apic::pit_sleep_us(500);
+    }
+
+    // 1. Fill the receiver's window exactly, in chunks small enough to fit a loopback frame. The advertised
+    //    window (free receive-buffer space) shrinks to zero as the unread bytes accumulate.
+    let window_max = tcp_receive_window(port, client_port).unwrap_or(0) as usize;
+    let chunk = [b'A'; 512];
+    let mut sent = 0;
+    while sent < window_max {
+        let n = core::cmp::min(chunk.len(), window_max - sent);
+        tcp_send(client_port, port, &chunk[..n]);
+        sent += n;
+        for _ in 0..50 {
+            poll();
+            if tcp::all_data_acked(client_port, port) == Some(true) {
+                break;
+            }
+            crate::apic::pit_sleep_us(200);
+        }
+    }
+    let filled_window = tcp_receive_window(port, client_port).unwrap_or(0xffff);
+    let filled_rx = tcp::received_data(port, client_port).map(|d| d.len()).unwrap_or(0);
+
+    // 2. Window is closed. One more segment must be refused (dropped, not buffered): the receive buffer and
+    //    the next-expected sequence number stay put. (The receiver still sends a zero-window ACK, which the
+    //    sender treats as a duplicate — so the segment stays on the sender's retransmit queue.)
+    let extra = b"beyond-the-window!!!"; // 20 bytes
+    tcp_send(client_port, port, extra);
+    for _ in 0..100 {
+        poll();
+        crate::apic::pit_sleep_us(200);
+    }
+    let after_extra_rx = tcp::received_data(port, client_port).map(|d| d.len()).unwrap_or(0);
+    let refused = filled_window == 0 && filled_rx == window_max && after_extra_rx == filled_rx;
+
+    // 3. The application reads some bytes, reopening the window by exactly that many.
+    let read_n = 512;
+    let drained = tcp_read(port, client_port, read_n).map(|d| d.len()).unwrap_or(0);
+    let reopened_window = tcp_receive_window(port, client_port).unwrap_or(0) as usize;
+
+    // 4. With room again, the sender's retransmission timer resends the refused segment; the receiver now
+    //    accepts it. Pump long enough for the ~150 ms RTO.
+    let want_rx = filled_rx - drained + extra.len();
+    let mut admitted = false;
+    for _ in 0..4000 {
+        poll();
+        if tcp::received_data(port, client_port).map(|d| d.len()) == Some(want_rx)
+            && tcp::all_data_acked(client_port, port) == Some(true)
+        {
+            admitted = true;
+            break;
+        }
+        crate::apic::pit_sleep_us(500);
+    }
+
+    e1000::set_loopback(false);
+
+    let ok = refused && drained == read_n && reopened_window == read_n && admitted;
+    serial_println!(
+        "[net] TCP flow-control loopback selftest: filled rx {} window {}, refused-beyond {}, read {} -> window {}, re-admitted {}, ok = {}",
+        filled_rx, filled_window, refused, drained, reopened_window, admitted, ok,
+    );
+    ok
+}
+
 /// Stage 21e self-test of **retransmission** with no external peer, via PHY loopback — the follow-on to
 /// [`tcp_teardown_loopback_selftest`] and the last piece that makes the transport truly *reliable*.
 /// Establish a loopback connection, then send a payload with the loss-injection hook armed so that data

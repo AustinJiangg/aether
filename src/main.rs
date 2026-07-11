@@ -934,6 +934,13 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 net::tcp_out_of_order_buffered(),
             );
 
+            // Stage 22b (networking): TCP flow control — the receiver's sliding window. The advertised
+            // window is the free receive-buffer space, so it shrinks as unread data piles up (to zero when
+            // full) and reopens when the application reads. Prove it via loopback: fill the window to zero,
+            // confirm a further segment is refused, then read to reopen it and watch the refused data land.
+            let tcp_flow_ok = net::tcp_flow_control_loopback_selftest();
+            serial_println!("[ OK ] net 22b: TCP flow control over loopback = {}", tcp_flow_ok);
+
             match net::ping(gw) {
                 Some(seq) => {
                     serial_println!(

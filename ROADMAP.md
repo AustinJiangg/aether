@@ -674,8 +674,27 @@ unify later.
 > (`REORDER_NEXT_TCP_TX`, mirroring 21e's `DROP_NEXT_TCP_TX`): `tcp_reassembly_loopback_selftest` sends a
 > payload as two segments whose wire order is reversed, and confirms the receiver reassembles all bytes in
 > order and acknowledges both — boot logs "TCP reassembly over loopback = true (1 out-of-order buffered)".
-> Verified by 74 tests (the new `tcp_reassembles_out_of_order`). (A real sliding-window for flow/congestion
-> control — 22b onward — remains.)
+> Verified by 74 tests (the new `tcp_reassembles_out_of_order`).
+>
+> **Stage 22b is done — the receiver's sliding window (flow control).** Stage 21 advertised a *fixed*
+> window (`DEFAULT_WINDOW = 64240`) on every segment while `rx` grew without bound — the window was a lie.
+> Stage 22b makes it honest: the receive buffer is capped at `RCV_WINDOW_MAX`, and the window advertised on
+> each segment is `recv_window` = the **free space left** (max minus the unread bytes buffered), so it
+> *shrinks* as data piles up unread, hits **zero** when the buffer is full, and *reopens* when the
+> application reads. The receive path now **enforces** it: `accept_segment_data` accepts an in-order segment
+> only if it fits the free window, otherwise dropping it (and advertising the smaller window), which keeps
+> `rx` bounded so the advertised number is truthful. Two application-facing APIs appear: `tcp::read` (drain
+> consumed bytes from the buffer, reopening the window — the destructive counterpart to the inspect-only
+> `received_data`) and `tcp::receive_window` (observe the current window). Proved deterministically with no
+> peer via PHY loopback: `tcp_flow_control_loopback_selftest` fills the window to zero, confirms a further
+> segment is **refused** (dropped, `rcv_nxt` unmoved), `read`s to reopen the window by exactly that many
+> bytes, and confirms the refused data is finally **admitted** once there is room (redelivered by the Stage
+> 21e retransmission timer) — boot logs "TCP flow control over loopback = true". Verified by 75 tests (the
+> new `tcp_enforces_receive_window`). Simplifications kept for teaching clarity: the out-of-order
+> reassembly queue is not charged against the window, and reopening relies on the peer's retransmission
+> rather than a proactive window-update ACK or a zero-window persist timer. (The **sender** honoring the
+> peer's advertised window — the other half of the sliding window — is Stage 22c; congestion control is
+> 22d.)
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

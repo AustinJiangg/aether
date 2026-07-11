@@ -298,8 +298,13 @@ is done**: out-of-order reassembly — a data segment arriving ahead of `rcv_nxt
 per-connection reassembly queue (`Tcb::ooo`) and spliced into the stream once the gap fills, instead of
 being dropped; `on_established` routes data through `accept_segment_data` (old / in-order+`drain_ooo` /
 ahead-of-sequence+`buffer_ooo`), and it is proved via PHY loopback with a `REORDER_NEXT_TCP_TX` fault hook
-(mirroring 21e's drop hook) that delivers two segments in reversed order. `ROADMAP.md` records the full
-staged history (stages 0-22a).
+(mirroring 21e's drop hook) that delivers two segments in reversed order. **Stage 22b is also done**: the
+receiver's sliding window (flow control) — the advertised window is now the *real* free receive-buffer
+space (`recv_window`, capped at `RCV_WINDOW_MAX`), so it shrinks as unread data piles up, hits zero when
+full, and reopens when the app `read`s; the receive path enforces it (an in-order segment that does not fit
+the free window is dropped), and it is proved via loopback by filling the window to zero, confirming a
+further segment is refused, then reading to reopen it and watching the refused data get re-admitted.
+`ROADMAP.md` records the full staged history (stages 0-22b).
 
 ## Language and writing conventions
 
@@ -794,7 +799,14 @@ Exit QEMU: `Ctrl-A` then `X`.
   an ahead-of-sequence segment (`rcv_nxt < seq`) is held by `buffer_ooo` (bounded by `MAX_OOO_SEGMENTS`) and
   dup-ACKed. `net::tcp_reassembly_loopback_selftest` proves it via PHY loopback with a `REORDER_NEXT_TCP_TX`
   hook (holds one TCP frame back so two sends arrive reversed), confirming the bytes reassemble in order and
-  both are acknowledged.
+  both are acknowledged. **Stage 22b** adds the receiver's **sliding window** (flow control): the window
+  advertised on every segment is now `recv_window` = the free receive-buffer space (`RCV_WINDOW_MAX` minus
+  the unread `rx` bytes) instead of a fixed constant, so it shrinks as data piles up unread and reopens when
+  the app reads; `accept_segment_data` enforces it (an in-order segment that exceeds the free window is
+  dropped, keeping `rx` bounded), and `tcp::read`/`tcp::receive_window` (with `net::tcp_read`/
+  `net::tcp_receive_window` wrappers) let the application drain data and observe the window.
+  `net::tcp_flow_control_loopback_selftest` fills the window to zero, confirms a further segment is refused,
+  reads to reopen it, and confirms the refused data is then admitted (redelivered by the 21e timer).
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run
