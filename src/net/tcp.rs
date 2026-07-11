@@ -228,12 +228,19 @@ const INIT_SSTHRESH: u32 = u32::MAX;
 /// (a later segment overtaking an earlier one), but a third strongly implies the earlier segment was lost.
 const DUP_ACK_THRESHOLD: u32 = 3;
 
-// Stage 21e: retransmission-timer constants. Time is measured in timer ticks (`interrupts::timer_ticks`,
-// 100 Hz, so 1 tick = 10 ms). A real stack estimates the retransmission timeout from measured round-trip
-// times (RFC 6298); fixed, short values are enough to *demonstrate* recovery deterministically.
+// Retransmission-timer constants. Time is measured in timer ticks (`interrupts::timer_ticks`, 100 Hz, so
+// 1 tick = 10 ms). Stage 21e used a single fixed RTO; Stage 23a replaces it with an RTO *estimated* per
+// connection from measured round-trip times (RFC 6298), bounded by these floor/ceiling constants.
 
-/// Initial retransmission timeout: resend an unacknowledged segment after this many ticks (~150 ms).
-const RTO_TICKS: u64 = 15;
+/// The retransmission timeout before any RTT has been measured (~150 ms). RFC 6298 §2.1 suggests 1 s; a
+/// shorter default keeps the loopback self-tests fast while a real transfer quickly measures its own RTO.
+const RTO_INITIAL_TICKS: u32 = 15;
+/// The RTO floor. Our clock granularity is a whole tick (10 ms) and loopback RTTs are sub-millisecond, so a
+/// computed RTO would round toward zero — this floor keeps it sane (and the retransmit tests fast). RFC
+/// 6298 uses a 1 s minimum; we use a shorter one for the same reason as [`RTO_INITIAL_TICKS`].
+const RTO_MIN_TICKS: u32 = 15;
+/// The RTO ceiling (~60 s), so a wildly varying RTT estimate cannot push the timer arbitrarily far out.
+const RTO_MAX_TICKS: u32 = 6000;
 /// Give up (abort the connection) after resending the same segment this many times.
 const MAX_RETRIES: u32 = 5;
 /// How long the active closer lingers in TIME_WAIT before closing (~300 ms). A real stack waits 2*MSL
@@ -272,6 +279,9 @@ struct Unacked {
     deadline: u64,
     /// How many times it has already been resent — bounds retries and drives exponential backoff.
     tries: u32,
+    /// Stage 23a: the tick at which this segment was *first* sent. When the segment is acknowledged and was
+    /// never retransmitted (`tries == 0`, Karn's algorithm), `now - sent_at` is a clean RTT sample.
+    sent_at: u64,
     /// The exact segment bytes (already checksummed) to retransmit verbatim.
     segment: Vec<u8>,
 }
@@ -375,6 +385,14 @@ struct Tcb {
     /// the ACK that acknowledges the recovered data. While set, each further dup ACK inflates `cwnd` by one
     /// MSS; the first new ACK deflates `cwnd` back to `ssthresh` and clears this.
     in_fast_recovery: bool,
+    /// Stage 23a: the RFC 6298 RTT estimator. `srtt` is the smoothed RTT scaled by 8 (three fractional
+    /// bits) and `rttvar` is the RTT variation scaled by 4 (two fractional bits) — the classic integer
+    /// representation that avoids floating point. `rto` is the current retransmission timeout (in ticks),
+    /// recomputed from them on each RTT sample; `rtt_valid` is false until the first sample initializes them.
+    srtt: u32,
+    rttvar: u32,
+    rto: u32,
+    rtt_valid: bool,
     /// Receive space: `nxt` = next seq we expect from the peer, `irs` = the peer's initial seq.
     rcv_nxt: u32,
     irs: u32,
@@ -428,6 +446,10 @@ pub fn open_passive(local_port: u16) {
         ssthresh: INIT_SSTHRESH,
         dup_acks: 0,
         in_fast_recovery: false,
+        srtt: 0,
+        rttvar: 0,
+        rto: RTO_INITIAL_TICKS,
+        rtt_valid: false,
         rcv_nxt: 0,
         irs: 0,
         rx: Vec::new(),
@@ -462,6 +484,10 @@ pub fn open_active(
         ssthresh: INIT_SSTHRESH,
         dup_acks: 0,
         in_fast_recovery: false,
+        srtt: 0,
+        rttvar: 0,
+        rto: RTO_INITIAL_TICKS,
+        rtt_valid: false,
         rcv_nxt: 0, // unknown until the SYN-ACK tells us the peer's ISN
         irs: 0,
         rx: Vec::new(),
@@ -734,9 +760,21 @@ fn process_ack(tcb: &mut Tcb, seg: &Segment) -> bool {
         }
         tcb.dup_acks = 0;
         tcb.snd_una = seg.ack;
+        let una = tcb.snd_una;
+        // Stage 23a: sample the RTT from the most recently sent segment this ACK now acknowledges that was
+        // never retransmitted (Karn's algorithm — a retransmitted segment's ACK is ambiguous), and fold it
+        // into the RFC 6298 estimator, which recomputes `rto`. Done before the retain below removes them.
+        if let Some(sent) = tcb
+            .retransmit
+            .iter()
+            .filter(|u| u.tries == 0 && seq_leq(u.end_seq, una))
+            .map(|u| u.sent_at)
+            .max()
+        {
+            update_rtt(tcb, now_ticks().saturating_sub(sent) as u32);
+        }
         // Stage 21e: drop every queued segment the peer has now cumulatively acknowledged, so the
         // retransmission timer stops resending it.
-        let una = tcb.snd_una;
         tcb.retransmit.retain(|u| !seq_leq(u.end_seq, una));
     }
     false
@@ -774,6 +812,56 @@ fn on_rto(tcb: &mut Tcb) {
     tcb.cwnd = mss;
 }
 
+/// Stage 23a: one RFC 6298 RTT-estimator step, kept **pure** so it is unit-testable without a connection.
+/// `srtt` is the smoothed RTT scaled by 8 and `rttvar` the RTT variation scaled by 4 (the standard integer
+/// representation, gains alpha = 1/8 and beta = 1/4); `valid` says whether they hold a prior sample; `m` is
+/// the new RTT measurement in ticks. Returns the updated `(srtt, rttvar, rto)`, `rto` in ticks clamped to
+/// `[RTO_MIN_TICKS, RTO_MAX_TICKS]`.
+///
+/// - First sample: `SRTT = m`, `RTTVAR = m / 2` (so `srtt = m*8`, `rttvar = m*2`).
+/// - Later samples: `RTTVAR += (|m - SRTT| - RTTVAR) / 4`, then `SRTT += (m - SRTT) / 8` — in the scaled
+///   integers, `rttvar += |err| - rttvar/4` and `srtt += err` where `err = m - SRTT`.
+/// - `RTO = SRTT + max(G, 4*RTTVAR)`, with clock granularity `G` one tick; here `4*RTTVAR == rttvar`.
+fn rtt_step(srtt: u32, rttvar: u32, valid: bool, m: u32) -> (u32, u32, u32) {
+    let (srtt, rttvar) = if !valid {
+        (m << 3, m << 1)
+    } else {
+        let err = m as i64 - (srtt >> 3) as i64; // m - SRTT (may be negative)
+        let srtt = (srtt as i64 + err).max(0) as u32;
+        let rttvar = (rttvar as i64 + (err.abs() - (rttvar >> 2) as i64)).max(0) as u32;
+        (srtt, rttvar)
+    };
+    // RTO = SRTT + max(G, 4*RTTVAR). srtt>>3 is SRTT; rttvar already equals 4*RTTVAR in the scaled form.
+    let rto = ((srtt >> 3) + core::cmp::max(1, rttvar)).clamp(RTO_MIN_TICKS, RTO_MAX_TICKS);
+    (srtt, rttvar, rto)
+}
+
+/// Stage 23a: fold a new RTT measurement (in ticks) into the connection's estimator and update its `rto`.
+fn update_rtt(tcb: &mut Tcb, measured: u32) {
+    let (srtt, rttvar, rto) = rtt_step(tcb.srtt, tcb.rttvar, tcb.rtt_valid, measured);
+    tcb.srtt = srtt;
+    tcb.rttvar = rttvar;
+    tcb.rto = rto;
+    tcb.rtt_valid = true;
+}
+
+/// Stage 23a: a deterministic unit self-test of the RFC 6298 estimator ([`rtt_step`]), checkable without a
+/// live connection (loopback RTTs are below our tick granularity, so they only exercise the floor). Feeds
+/// known samples and asserts the known-answer outputs and the clamping. Returns whether all held.
+pub fn rtt_estimator_selftest() -> bool {
+    // First sample R = 40 ticks: SRTT = 40 (srtt = 320), RTTVAR = 20 (rttvar = 80), RTO = 40 + 4*20 = 120.
+    let (srtt, rttvar, rto) = rtt_step(0, 0, false, 40);
+    let first_ok = srtt == 320 && rttvar == 80 && rto == 120;
+    // A second identical sample shrinks the variation, so RTO falls back toward the RTT (120 -> 100).
+    let (_, _, rto2) = rtt_step(srtt, rttvar, true, 40);
+    let converge_ok = rto2 == 100 && rto2 < rto;
+    // Clamping: a zero RTT floors RTO at the minimum; a huge one caps it at the maximum.
+    let (_, _, rto_lo) = rtt_step(0, 0, false, 0);
+    let (_, _, rto_hi) = rtt_step(0, 0, false, 100_000);
+    let clamp_ok = rto_lo == RTO_MIN_TICKS && rto_hi == RTO_MAX_TICKS;
+    first_ok && converge_ok && clamp_ok
+}
+
 /// Move a connection into TIME_WAIT and stamp its 2*MSL linger deadline (Stage 21e), after which
 /// [`on_tick`] closes it. The active closer lingers here so a lost final ACK can still be retransmitted.
 fn enter_time_wait(tcb: &mut Tcb) {
@@ -797,8 +885,9 @@ fn on_established(
     // the retransmit queue) immediately instead of waiting for the RTO. A dup ACK carries no data or FIN, so
     // there is nothing else to process for this segment; return the resent segment as the response.
     if process_ack(tcb, seg) {
+        let rto = tcb.rto as u64;
         if let Some(u) = tcb.retransmit.first_mut() {
-            u.deadline = now_ticks() + RTO_TICKS; // push the RTO out so on_tick does not also resend it
+            u.deadline = now_ticks() + rto; // push the RTO out so on_tick does not also resend it
             return Some(u.segment.clone());
         }
     }
@@ -950,8 +1039,9 @@ fn emit_segment(tcb: &mut Tcb, local_ip: [u8; 4], n: usize) -> Vec<u8> {
     tcb.snd_nxt = tcb.snd_nxt.wrapping_add(n as u32);
     tcb.retransmit.push(Unacked {
         end_seq: tcb.snd_nxt,
-        deadline: now_ticks() + RTO_TICKS,
+        deadline: now_ticks() + tcb.rto as u64,
         tries: 0,
+        sent_at: now_ticks(),
         segment: seg.clone(),
     });
     DATA_SEGMENTS_SENT.fetch_add(1, Ordering::Relaxed);
@@ -1033,8 +1123,9 @@ pub fn close(local_ip: [u8; 4], local_port: u16, remote_port: u16) -> Option<(Ve
     // Stage 21e: queue the FIN for retransmission too — a lost FIN would otherwise stall teardown.
     tcb.retransmit.push(Unacked {
         end_seq: tcb.snd_nxt,
-        deadline: now_ticks() + RTO_TICKS,
+        deadline: now_ticks() + tcb.rto as u64,
         tries: 0,
+        sent_at: now_ticks(),
         segment: seg.clone(),
     });
     tcb.state = next_state;
@@ -1131,6 +1222,27 @@ pub fn slow_start_threshold(local_port: u16, remote_port: u16) -> Option<u32> {
         .map(|c| c.ssthresh)
 }
 
+/// Stage 23a: the connection's current **retransmission timeout**, in ticks — the RFC 6298 estimate
+/// (`SRTT + 4*RTTVAR`, clamped), or the initial default before any RTT has been measured. `None` if no such
+/// connection. The RTT self-test reads it to confirm a live transfer produced a sane RTO.
+pub fn current_rto(local_port: u16, remote_port: u16) -> Option<u32> {
+    CONNECTIONS
+        .lock()
+        .iter()
+        .find(|c| c.local_port == local_port && c.remote_port == remote_port)
+        .map(|c| c.rto)
+}
+
+/// Stage 23a: whether the connection has folded at least one RTT measurement into its estimator (so `rto`
+/// is measured, not the initial default). `None` if no such connection.
+pub fn rtt_sampled(local_port: u16, remote_port: u16) -> Option<bool> {
+    CONNECTIONS
+        .lock()
+        .iter()
+        .find(|c| c.local_port == local_port && c.remote_port == remote_port)
+        .map(|c| c.rtt_valid)
+}
+
 /// The state of the connection identified by `(local_port, remote_port)`, or `None` if there is no such
 /// TCB. Used by the connection driver in `net` to wait for [`State::Established`], and by tests.
 pub fn connection_state(local_port: u16, remote_port: u16) -> Option<State> {
@@ -1167,6 +1279,7 @@ pub fn on_tick() -> Vec<(Vec<u8>, [u8; 4])> {
             continue;
         }
         // Retransmit the oldest unacknowledged segment if its deadline has passed.
+        let rto = tcb.rto as u64; // read before borrowing tcb.retransmit below (Stage 23a estimated RTO)
         let mut timed_out = false;
         if let Some(u) = tcb.retransmit.first_mut() {
             if now >= u.deadline {
@@ -1177,8 +1290,9 @@ pub fn on_tick() -> Vec<(Vec<u8>, [u8; 4])> {
                     continue;
                 }
                 u.tries += 1;
-                // Exponential backoff, capped: each successive resend waits twice as long.
-                u.deadline = now + (RTO_TICKS << core::cmp::min(u.tries, 6));
+                // Exponential backoff (Karn), capped: each successive resend waits twice as long, based on
+                // the connection's current estimated RTO rather than a fixed constant.
+                u.deadline = now + (rto << core::cmp::min(u.tries, 6));
                 resends.push((u.segment.clone(), tcb.remote_ip));
                 timed_out = true;
             }

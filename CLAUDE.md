@@ -330,8 +330,11 @@ once, before the RTO) and enters **fast recovery** (halve `ssthresh`, set `cwnd 
 than collapsing to one MSS, deflating back to `ssthresh` on the recovering ACK). The loopback receive window
 (`RCV_WINDOW_MAX`) was enlarged from two to eight MSS so four segments fit in flight (one lost + three dup
 ACKs). Proved via loopback by bursting four segments with the first dropped ("fast-retransmits 1, rto-resends
-0, cwnd-min-after-loss 2048"). `ROADMAP.md` records the full staged history (stages 0-22d-3 — the roadmap is
-now complete).
+0, cwnd-min-after-loss 2048"). This completed the original roadmap (stages 0-22d-3). **Post-roadmap work has
+now begun (four follow-on tracks, Stage 23-26, planned in `ROADMAP.md`). Stage 23a is done**: adaptive RTO
+(RFC 6298) — the fixed retransmission timeout is replaced by a per-connection estimate measured from
+round-trip times (Karn's algorithm; `srtt`/`rttvar`/`rto` on the `Tcb`, `rto = clamp(SRTT + 4*RTTVAR, MIN,
+MAX)`). `ROADMAP.md` records the full staged history (stages 0-22d-3 complete, Stage 23a done).
 
 ## Language and writing conventions
 
@@ -866,7 +869,13 @@ Exit QEMU: `Ctrl-A` then `X`.
   `ssthresh`). `RCV_WINDOW_MAX` was raised from two to eight MSS so four segments fit in flight (one lost +
   three dup ACKs). The `fast_retransmits` counter backs `net::tcp_fast_retransmit_loopback_selftest`, which
   bursts four segments with the first dropped and confirms the fast retransmit fired, the RTO never did, and
-  `cwnd` only halved (not collapsed). This completes Stage 22d and the roadmap.
+  `cwnd` only halved (not collapsed). This completes Stage 22d and the roadmap. **Stage 23a** (post-roadmap)
+  adds **adaptive RTO (RFC 6298)**: each `Unacked` carries a `sent_at`; an ACK of a never-retransmitted
+  segment (Karn's algorithm) samples `now - sent_at` into a per-connection estimator (`srtt` scaled ×8,
+  `rttvar` ×4, the integer RFC 6298 form via the pure `rtt_step`), and `rto = clamp(SRTT + 4*RTTVAR, MIN,
+  MAX)` replaces the fixed `RTO_TICKS` in the retransmit timer/backoff. The formula is checked by a
+  known-answer unit test (`rtt_estimator_selftest`) since loopback RTT floors the live RTO; `current_rto`/
+  `rtt_sampled` back the live `net::tcp_rtt_estimation_loopback_selftest`.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

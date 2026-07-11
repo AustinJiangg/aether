@@ -1526,6 +1526,68 @@ pub fn tcp_fast_retransmit_loopback_selftest() -> bool {
     ok
 }
 
+/// Stage 23a self-test of **adaptive RTO** (RFC 6298 RTT estimation) — the first Stage 23 refinement.
+/// Two parts. (1) The pure estimator formula on known synthetic samples (`tcp::rtt_estimator_selftest`),
+/// since loopback RTTs are below our 10 ms tick granularity and so only exercise the RTO floor. (2) A live
+/// loopback transfer, confirming the sender actually *sampled* an RTT (its estimator went valid) and that
+/// the resulting RTO is within the sane `[floor, ceiling]` band while the data still arrives in order.
+pub fn tcp_rtt_estimation_loopback_selftest() -> bool {
+    // Part 1: the pure RFC 6298 recurrence and its clamping, on hand-chosen samples.
+    let formula_ok = tcp::rtt_estimator_selftest();
+
+    tcp::reset_connections();
+    let port: u16 = 7787;
+    tcp::open_passive(port);
+
+    e1000::set_loopback(true);
+    let mut sink = [0u8; 2048];
+    while e1000::poll_frame(&mut sink).is_some() {}
+
+    let client_port = match tcp_connect(our_ip(), port) {
+        Some(p) => p,
+        None => {
+            e1000::set_loopback(false);
+            serial_println!("[net] TCP RTT-estimation loopback selftest: handshake failed");
+            return false;
+        }
+    };
+    for _ in 0..200 {
+        if tcp::established_count() >= 2 {
+            break;
+        }
+        poll();
+        crate::apic::pit_sleep_us(500);
+    }
+
+    // Part 2: transfer data so ACKs return and the sender folds RTT samples into its estimator.
+    let total = 4096usize;
+    let data: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+    tcp_send(client_port, port, &data);
+    let mut got: Vec<u8> = Vec::new();
+    for _ in 0..8000 {
+        poll();
+        if let Some(chunk) = tcp_read(port, client_port, 8192) {
+            got.extend_from_slice(&chunk);
+        }
+        if got.len() >= total && tcp::all_data_acked(client_port, port) == Some(true) {
+            break;
+        }
+        crate::apic::pit_sleep_us(300);
+    }
+    e1000::set_loopback(false);
+
+    let sampled = tcp::rtt_sampled(client_port, port) == Some(true);
+    let rto = tcp::current_rto(client_port, port).unwrap_or(0);
+    let rto_sane = (15..=6000).contains(&rto); // >= floor, <= ceiling (loopback RTT floors it at the minimum)
+    let in_order = got == data;
+    let ok = formula_ok && sampled && rto_sane && in_order && got.len() == total;
+    serial_println!(
+        "[net] TCP RTT-estimation loopback selftest: formula {}, sampled {}, rto {} ticks, delivered {}/{} in order {}, ok = {}",
+        formula_ok, sampled, rto, got.len(), total, in_order, ok,
+    );
+    ok
+}
+
 /// Stage 21e self-test of **retransmission** with no external peer, via PHY loopback — the follow-on to
 /// [`tcp_teardown_loopback_selftest`] and the last piece that makes the transport truly *reliable*.
 /// Establish a loopback connection, then send a payload with the loss-injection hook armed so that data

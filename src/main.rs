@@ -977,6 +977,13 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 net::tcp_fast_retransmits(),
             );
 
+            // Stage 23a (networking): adaptive RTO — the sender now measures round-trip time and computes
+            // its retransmission timeout per RFC 6298 (SRTT + 4*RTTVAR, clamped) with Karn's algorithm,
+            // instead of a fixed constant. Prove the estimator formula on known samples and confirm a live
+            // loopback transfer samples an RTT and lands on a sane RTO.
+            let tcp_rtt_ok = net::tcp_rtt_estimation_loopback_selftest();
+            serial_println!("[ OK ] net 23a: TCP adaptive RTO over loopback = {}", tcp_rtt_ok);
+
             match net::ping(gw) {
                 Some(seq) => {
                     serial_println!(

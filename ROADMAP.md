@@ -797,7 +797,7 @@ unify later.
 
 ## Post-roadmap tracks (Stage 23+)
 
-> **Status: designed, not started.** With the original roadmap complete (stages 0-22d-3), four independent
+> **Status: in progress — Stage 23a done.** With the original roadmap complete (stages 0-22d-3), four independent
 > follow-on tracks extend it. They are **not** strictly ordered by dependency, but the recommended sequence
 > is **23 → 24 → 25 → 26**, chosen by risk and blast radius: do the isolated TCP polish first (it rides the
 > momentum of the just-finished TCP work), then the socket capstone that makes the stack usable, then the
@@ -811,6 +811,19 @@ unify later.
 ### Stage 23 (Networking) — TCP refinements toward a production stack
 
 Isolated to `net/tcp.rs` plus a few `net/mod.rs` self-tests; no new subsystems, lowest risk.
+
+> **Stage 23a is done — adaptive RTO (RFC 6298).** The fixed `RTO_TICKS` is replaced by a per-connection
+> estimate. Each `Unacked` carries a `sent_at` tick; when an ACK acknowledges a segment that was never
+> retransmitted (**Karn's algorithm** — `tries == 0`), `process_ack` samples `now - sent_at` and folds it
+> into the estimator. The estimator (`rtt_step`, kept pure so it is unit-testable) is the classic integer
+> RFC 6298: `srtt` holds the smoothed RTT scaled by 8 and `rttvar` the variation scaled by 4 (gains 1/8 and
+> 1/4), and `rto = clamp(SRTT + 4*RTTVAR, RTO_MIN, RTO_MAX)`. The retransmit timer and backoff now use this
+> per-connection `rto` instead of a constant. Because loopback RTTs are below our 10 ms tick granularity (a
+> measured RTT of 0 floors the RTO), the *formula* is verified by a deterministic known-answer unit test
+> (`rtt_estimator_selftest`: first sample R=40 → RTO 120; a repeat → 100; clamping at the floor/ceiling), and
+> a live loopback transfer (`tcp_rtt_estimation_loopback_selftest`) confirms the sender actually sampled an
+> RTT (its estimator went valid) and landed on a sane RTO while the data arrived in order. Verified by 81
+> tests (the new `tcp_rtt_estimator_known_answer` and `tcp_estimates_rtt_over_loopback`).
 
 | Sub-step | What to build | OS concepts | Smallest verifiable step |
 |----------|---------------|-------------|--------------------------|

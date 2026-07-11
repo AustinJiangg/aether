@@ -1365,6 +1365,29 @@ fn tcp_fast_retransmits_on_dup_acks() {
     assert!(net::tcp_fast_retransmits() > 0, "no fast retransmit ever fired");
 }
 
+/// Stage 23a: the RFC 6298 RTT estimator formula on known synthetic samples (loopback RTTs are below our
+/// tick granularity, so this pure check is where the real computation and clamping are verified).
+#[test_case]
+fn tcp_rtt_estimator_known_answer() {
+    use crate::net::tcp;
+
+    assert!(tcp::rtt_estimator_selftest(), "RFC 6298 RTT estimator produced a wrong RTO");
+}
+
+/// Stage 23a: adaptive RTO end to end via loopback — a live transfer samples an RTT into the estimator and
+/// lands on a sane RTO, with the data still delivered in order. Exercises the send-timestamp, Karn's
+/// algorithm (no sample from a retransmitted segment), and the per-connection RTO replacing the old fixed one.
+#[test_case]
+fn tcp_estimates_rtt_over_loopback() {
+    use crate::net;
+
+    assert!(crate::e1000::present(), "e1000 not initialized");
+    assert!(
+        net::tcp_rtt_estimation_loopback_selftest(),
+        "TCP adaptive RTO over loopback failed"
+    );
+}
+
 /// Stage 19b-2: the live DNS resolver — resolve a hostname through SLIRP's DNS server over the wire.
 /// Unlike the SLIRP-internal gateway ping, this depends on the *host* having working upstream DNS
 /// (SLIRP forwards to it), so the test is lenient: it always exercises the full path (build the query,
