@@ -1151,14 +1151,18 @@ fn boot_continue() -> ! {
         "[sched] spawn: {} child process(es) created at runtime via the spawn syscall",
         process::processes_spawned(),
     );
-    // Stage 24a: the connect demo has run. Turn the NIC's PHY loopback back off (it was
-    // enabled to route the demo's loopback handshake) so the shell's later `ping` and any
-    // real traffic reach the emulated wire again, and report how many ring 3 processes
-    // reached the network stack through the socket syscalls.
+    // Stage 24a/24b: the socket demo has run. Turn the NIC's PHY loopback back off (it was
+    // enabled to route the demo's loopback traffic) and stop the loopback echo server, so the
+    // shell's later `ping` and any real traffic reach the emulated wire again — then report how
+    // far the ring 3 process got through the socket syscalls (connect, send, recv).
     e1000::set_loopback(false);
+    net::tcp_echo_disable();
     serial_println!(
-        "[sched] socket: {} ring 3 process(es) connected to a loopback listener via connect()",
+        "[sched] socket: {} connected, {} send(s), {} recv(s) from ring 3; last recv {} byte(s)",
         process::processes_connected(),
+        process::processes_sent(),
+        process::processes_received(),
+        process::last_recv_len(),
     );
     println!("Back from running user processes; continuing boot.");
 

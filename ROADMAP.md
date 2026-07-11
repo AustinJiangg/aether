@@ -797,7 +797,7 @@ unify later.
 
 ## Post-roadmap tracks (Stage 23+)
 
-> **Status: in progress — Stage 23 complete (23a-23d); Stage 24 begun (24a done); Stages 24b-26 remain.** With the original roadmap complete (stages 0-22d-3), four independent
+> **Status: in progress — Stage 23 complete (23a-23d); Stage 24 in progress (24a-24b done); Stages 24c-26 remain.** With the original roadmap complete (stages 0-22d-3), four independent
 > follow-on tracks extend it. They are **not** strictly ordered by dependency, but the recommended sequence
 > is **23 → 24 → 25 → 26**, chosen by risk and blast radius: do the isolated TCP polish first (it rides the
 > momentum of the just-finished TCP work), then the socket capstone that makes the stack usable, then the
@@ -946,6 +946,25 @@ Connects the two finished lines — the network stack and ring 3 — so user pro
 > (ESTABLISHED)" and the ring 3 process prints its message; verified by 89 tests (the new
 > `ring3_process_connected_a_socket`). (Remaining: 24b `send`/`recv`, 24c `listen`/`accept`, 24d `close` + a
 > user netcat demo.)
+>
+> **Stage 24b is done — `send`/`recv` (stream I/O, `recv` blocking).** A ring 3 program now transfers data
+> over its socket. `SYS_SEND` (8) and `SYS_RECV` (9) are the stack's first **three-argument** syscalls
+> (`fd`, `ptr`, `len`) — 24a's lazy argument reads made adding a third slot at `[rsp+24]` trivial. `send`
+> is non-blocking: `on_user_send` looks up the socket's connection and hands the bytes to `net::tcp_send`
+> (TCP's own send buffer + sliding window pace the wire), returning the count via the stack ABI like
+> `write`. `recv` **blocks**: `on_user_recv` reuses the 24a pattern (park in `net_blocked`, drive `net::poll`
+> inline until data arrives), then copies the bytes into the caller's buffer and wakes it with the count in
+> `rax`. The copy is safe because a blocked syscall never switches CR3, so the caller's address space stays
+> active. To give a loopback `recv` something to receive with no real peer, the kernel-side listener becomes
+> a **TCP echo server** (`tcp::echo_service`, registered on the demo port and driven by `net::poll`, cleared
+> after the process phase) — the byte-stream analog of the existing UDP echo server on port 7. The demo
+> program is extended to the full client lifecycle: `socket(); connect(); send("hello from a ring 3
+> socket\n"); recv(); write(recv'd); exit()` — hand-assembled with new `emit_send`/`emit_recv` (the fd is
+> stashed in `rbx`, which the entry stub preserves across every syscall) and a dynamic-length `write`.
+> Boot logs "process 4 received 27 byte(s) on socket fd 0" and the ring 3 process prints the echoed message;
+> notably the socket state survives timer preemption between the `send` and `recv` (the other demos run in
+> between). Verified by 90 tests (the new `ring3_process_sent_and_received`). (Remaining: 24c `listen`/
+> `accept`, 24d `close` + a user netcat demo.)
 
 | Sub-step | What to build | OS concepts | Smallest verifiable step |
 |----------|---------------|-------------|--------------------------|

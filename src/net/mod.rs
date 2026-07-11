@@ -171,6 +171,11 @@ static DROP_TCP_TX_MASK: AtomicU32 = AtomicU32::new(0);
 static REORDER_NEXT_TCP_TX: AtomicBool = AtomicBool::new(false);
 /// The frame [`REORDER_NEXT_TCP_TX`] is holding back, released after the next `tx_tcp` (Stage 22a).
 static HELD_TCP_TX: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+/// Stage 24b: the local port of the kernel-side loopback TCP **echo server**, or 0 for none. When set (by
+/// [`tcp_listen_loopback`] for the socket demo), [`poll`] bounces any bytes that server received back to its
+/// client — so a ring 3 `recv` over loopback has something to receive without a real peer. Cleared by
+/// [`tcp_echo_disable`] after the process phase, so the shell's later network use is unaffected.
+static TCP_ECHO_PORT: AtomicU32 = AtomicU32::new(0);
 
 /// Bring the stack up: record our MAC and log our identity. Call once, after the e1000 is up. Our IP
 /// is still unconfigured here (`0.0.0.0`) — DHCP (Stage 20b) leases one immediately after.
@@ -226,6 +231,14 @@ pub fn poll() -> usize {
     while let Some(len) = e1000::poll_frame(&mut buf) {
         receive(&buf[..len]);
         n += 1;
+    }
+
+    // Stage 24b: if a loopback echo server is registered, move any bytes it just received into its send
+    // buffer and flush them back to the client — so a ring 3 `recv` over loopback has something to receive.
+    // Scoped to the demo's listener port (cleared after the process phase); the self-tests register none.
+    let echo_port = TCP_ECHO_PORT.load(Ordering::Relaxed);
+    if echo_port != 0 && tcp::echo_service(echo_port as u16) > 0 {
+        transmit_tcp_flush(tcp::flush(our_ip()));
     }
 
     // Stage 23d-2b: send any extra holes a SACK-guided fast retransmit queued while dispatching the ACKs
@@ -817,10 +830,19 @@ pub fn tcp_connect(remote_ip: [u8; 4], remote_port: u16) -> Option<u16> {
 pub fn tcp_listen_loopback(local_port: u16) {
     tcp::reset_connections();
     tcp::open_passive(local_port);
+    // Stage 24b: also make this listener an echo server, so a ring 3 `send` on the connection is bounced
+    // back for the following `recv` to read (driven by `poll`; see `TCP_ECHO_PORT`).
+    TCP_ECHO_PORT.store(local_port as u32, Ordering::Relaxed);
     e1000::set_loopback(true);
     // Drain any stale frames so the handshake sees a clean ring.
     let mut sink = [0u8; 2048];
     while e1000::poll_frame(&mut sink).is_some() {}
+}
+
+/// Stage 24b: stop echoing on the loopback listener (clears [`TCP_ECHO_PORT`]). Called after the process
+/// phase so the shell's later network use does not accidentally bounce traffic.
+pub fn tcp_echo_disable() {
+    TCP_ECHO_PORT.store(0, Ordering::Relaxed);
 }
 
 /// Stage 22c: transmit the segments a [`tcp::flush`] produced (queued data the window now admits, or a

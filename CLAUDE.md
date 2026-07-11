@@ -366,8 +366,15 @@ concurrent net thread, `on_user_connect` drives the handshake **inline** (`net::
 A ring 3 demo `socket()`+`connect()`s to a kernel-side loopback listener. This surfaced and fixed a latent
 bug: `syscall_dispatch` eagerly read all three stack slots, faulting when `socket` (the first syscall on a
 fresh stack, only the number pushed) read past `USER_STACK_TOP` — now `number` is read eagerly and each
-argument lazily. `ROADMAP.md` records the full staged history (stages 0-22d-3 complete, Stage 23 complete
-(23a-23d), Stage 24 begun (24a done); Stages 24b-26 remain).
+argument lazily. **Stage 24b is also done**: `send`/`recv` (stream I/O). `SYS_SEND`/`SYS_RECV` are the first
+**three-argument** syscalls (`fd`, `ptr`, `len` — a third slot at `[rsp+24]`, trivial after 24a's lazy arg
+reads). `send` is non-blocking (`on_user_send` → `net::tcp_send`); `recv` **blocks** (`on_user_recv` reuses
+24a's park-and-inline-poll, copies into the caller's buffer — safe since a blocked syscall never switches
+CR3 — and wakes with the count in `rax`). The loopback listener became a **TCP echo server**
+(`tcp::echo_service`, driven by `net::poll`) so a loopback `recv` has something to receive; the demo program
+grew to `socket/connect/send/recv/write/exit`, the fd riding in `rbx` across syscalls. `ROADMAP.md` records
+the full staged history (stages 0-22d-3 complete, Stage 23 complete (23a-23d), Stage 24 in progress (24a-24b
+done); Stages 24c-26 remain).
 
 ## Language and writing conventions
 
@@ -633,9 +640,10 @@ Exit QEMU: `Ctrl-A` then `X`.
 - `src/syscall.rs`: Stage 10 system calls over `int 0x80` (its IDT gate's DPL is 3 so
   ring 3 may invoke it) with a stack-based argument ABI:
   `write`/`getpid`/`exit`/`yield`/`wait`/`spawn` (Stage 12d's `spawn` creates a child
-  process from a kernel-known program and returns its pid), plus Stage 24a's
-  `socket`/`connect` (the socket syscalls). Since Stage 12c-2 the entry is a hand-written
-  *naked* stub (`syscall_entry`) that
+  process from a kernel-known program and returns its pid), plus Stage 24a/24b's
+  `socket`/`connect`/`send`/`recv` (the socket syscalls; `send`/`recv` are the first
+  three-argument calls, adding a `[rsp+24]` slot). Since Stage 12c-2 the entry is a
+  hand-written *naked* stub (`syscall_entry`) that
   builds a full `TrapFrame` and calls `syscall_dispatch`, mirroring the timer — so the
   general-purpose registers survive a context switch. Ring 3 `yield`/`exit` call
   `process::on_user_yield`/`on_user_exit` (which switch to another process or resume
@@ -672,9 +680,13 @@ Exit QEMU: `Ctrl-A` then `X`.
   **blocking syscall** — it parks the caller in a new `Scheduler::net_blocked` list, drives
   the TCP handshake to ESTABLISHED **inline** (`net::tcp_connect` pumps `net::poll`, since
   no background net thread runs during the process phase), then wakes it with the result in
-  rax (like `wait`). `spawn_connect_demo` stands up a kernel-side loopback listener
-  (`net::tcp_listen_loopback` + PHY loopback) and spawns a ring 3 program that
-  `socket()`+`connect()`s to it.
+  rax (like `wait`). Stage 24b adds `on_user_send` (non-blocking → `net::tcp_send`) and
+  `on_user_recv` (blocks like `connect`, then copies the received bytes into the caller's
+  buffer — safe because a blocked syscall never switches CR3). `spawn_connect_demo` stands up
+  a kernel-side loopback listener that also **echoes** (`net::tcp_listen_loopback` + PHY
+  loopback + `tcp::echo_service`) and spawns a ring 3 program running the full socket
+  lifecycle `socket()/connect()/send()/recv()/write()/exit()` (the fd rides in `rbx`, which
+  the syscall stub preserves across calls).
 - `src/ata.rs`: Stage 13a/13b block device driver — a minimal ATA (IDE) disk driver in
   PIO mode. `read_sector` reads one raw 512-byte sector from the primary master by
   the polled READ SECTORS (LBA28) protocol: write the LBA/count registers, issue the

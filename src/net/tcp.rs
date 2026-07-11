@@ -1560,6 +1560,26 @@ pub fn read(local_port: u16, remote_port: u16, max: usize) -> Option<Vec<u8>> {
     Some(tcb.rx.drain(..n).collect())
 }
 
+/// Stage 24b: the loopback **echo server's** pump. For every established connection whose *local* port is
+/// `local_port` (the kernel-side server of the loopback socket demo), move any received bytes straight from
+/// its receive buffer into its send buffer, so a following [`flush`] bounces them back to the client.
+/// Returns the number of bytes echoed. This is the byte-stream analog of the UDP echo server
+/// (`net::handle_udp` on port 7); it lets a ring 3 `recv` over loopback have something to receive without a
+/// real peer. `net::poll` calls it only when an echo port is registered, so the self-tests are unaffected.
+pub fn echo_service(local_port: u16) -> usize {
+    let mut table = CONNECTIONS.lock();
+    let mut echoed = 0;
+    for tcb in table.iter_mut() {
+        if tcb.state == State::Established && tcb.local_port == local_port && !tcb.rx.is_empty() {
+            // `take` drains rx (so the flow-control window reopens) and appends it to snd_buf.
+            let data = core::mem::take(&mut tcb.rx);
+            echoed += data.len();
+            tcb.snd_buf.extend_from_slice(&data);
+        }
+    }
+    echoed
+}
+
 /// Stage 22b: the receive window this connection currently advertises — the free space in its receive
 /// buffer (`RCV_WINDOW_MAX` minus the unread bytes). Zero means the buffer is full ("stop sending"). Used
 /// by the flow-control self-test to observe the window shrink to zero and reopen after a [`read`]. `None`

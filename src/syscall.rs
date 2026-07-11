@@ -67,6 +67,16 @@ pub const SYS_SOCKET: u64 = 6;
 /// like `wait` — it returns its result in `rax` (the connected fd, or `u64::MAX` on
 /// failure), since a blocking syscall resumes from its saved [`TrapFrame`].
 pub const SYS_CONNECT: u64 = 7;
+/// `send(fd, ptr, len)` — send `len` bytes at `ptr` on the connected socket `fd` (Stage 24b),
+/// returning the number of bytes accepted (`u64::MAX` on error). Meaningful only from ring 3;
+/// non-blocking (the bytes are queued and flushed), so it returns via the stack ABI like `write`.
+/// This is the stack's first **three-argument** syscall, so the caller pushes a third slot the
+/// handler reads at `[rsp+24]`.
+pub const SYS_SEND: u64 = 8;
+/// `recv(fd, ptr, len)` — receive up to `len` bytes into `ptr` on the connected socket `fd`
+/// (Stage 24b), returning the number of bytes read (0 on end-of-stream). Meaningful only from
+/// ring 3. Like `connect` it **blocks** — until data arrives — so it returns its count in `rax`.
+pub const SYS_RECV: u64 = 9;
 
 /// Count of syscalls that arrived from ring 3 — proof (for the Stage 10b test)
 /// that the user program really crossed into the kernel through `int 0x80`.
@@ -218,6 +228,28 @@ extern "C" fn syscall_dispatch(tf_ptr: *mut TrapFrame) {
         let fd = unsafe { args.add(1).read() };
         let dst = unsafe { args.add(2).read() };
         crate::process::on_user_connect(tf, fd, dst);
+        return;
+    }
+    if number == SYS_SEND && from_ring3 {
+        // `send` is non-blocking: queue the bytes and flush. It returns the count via the stack
+        // ABI (like `write`), and does not switch processes.
+        // SAFETY: `send` pushed all three arguments (fd, ptr, len) at [rsp+8], [rsp+16], [rsp+24].
+        let fd = unsafe { args.add(1).read() };
+        let ptr = unsafe { args.add(2).read() };
+        let len = unsafe { args.add(3).read() };
+        let n = crate::process::on_user_send(fd, ptr, len);
+        // SAFETY: the number slot is writable, as above.
+        unsafe { args.write(n) };
+        return;
+    }
+    if number == SYS_RECV && from_ring3 {
+        // `recv` *blocks* until data arrives, then rewrites this `TrapFrame` (rax = count) to
+        // resume the caller — like `connect`/`wait`. It returns in rax, not the stack.
+        // SAFETY: `recv` pushed all three arguments (fd, ptr, len) at [rsp+8], [rsp+16], [rsp+24].
+        let fd = unsafe { args.add(1).read() };
+        let ptr = unsafe { args.add(2).read() };
+        let len = unsafe { args.add(3).read() };
+        crate::process::on_user_recv(tf, fd, ptr, len);
         return;
     }
 

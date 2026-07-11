@@ -66,9 +66,18 @@ const CHILD_CODE_LEN: usize = 17 + 6;
 /// Length of the wait-demo parent's code (Stage 12d): `write` + `spawn` (6 B) +
 /// `wait` (4 B) + `write` + `exit`. The parent now creates its own child via `spawn`.
 const PARENT_CODE_LEN: usize = 17 + 6 + 4 + 17 + 6;
-/// Length of the Stage 24a connect-demo code: `socket` (5 B) + `connect` (19 B) +
-/// `write` (17 B) + `exit` (6 B).
-const CONNECT_CODE_LEN: usize = 5 + 19 + 17 + 6;
+/// Length of the Stage 24a/24b socket-demo code: `socket` (5 B) + `mov rbx, rax` (3 B, stash the
+/// fd) + `connect` (19 B) + `send` (18 B) + `recv` (18 B) + dynamic-length `write` (16 B) +
+/// `exit` (6 B).
+const SOCKET_DEMO_CODE_LEN: usize = 5 + 3 + 19 + 18 + 18 + 16 + 6;
+/// Capacity of the socket demo's receive buffer (Stage 24b): plenty for the short echoed message.
+const SOCKET_DEMO_RECV_CAP: u8 = 64;
+
+/// How many times [`on_user_recv`] pumps the network waiting for data before giving up (returning 0
+/// bytes), and the pause between pumps. Over PHY loopback the echo returns in a handful of pumps; the
+/// bound only guards against a silent peer hanging the process (a syscall runs with interrupts off).
+const RECV_POLL_ITERS: usize = 2000;
+const RECV_POLL_US: u32 = 500;
 
 /// Top of the program's user stack (the initial user `rsp`). It sits in the same
 /// private L4 slot as the loaded image, well above the code page; the stack grows
@@ -317,6 +326,45 @@ fn emit_connect(code: &mut Vec<u8>, dst: u64) {
     code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
 }
 
+/// `send(fd, ptr, len)` — 18 bytes (Stage 24b). The socket demo keeps the fd in `rbx` (stashed once
+/// after `socket`, and preserved across every syscall by the entry stub), so this reads it from there.
+/// A three-argument call: push `len`, `ptr`, `fd` (so the handler finds them at [rsp+24], +16, +8),
+/// push the number, trap. `send` returns via the stack ABI, which this program ignores.
+fn emit_send(code: &mut Vec<u8>, ptr: u64, len: u8) {
+    code.extend_from_slice(&[0x6A, len]); // push len          (arg3)
+    code.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 ...
+    code.extend_from_slice(&ptr.to_le_bytes()); // ... = ptr
+    code.push(0x50); // push rax          (arg2 = ptr)
+    code.push(0x53); // push rbx          (arg1 = fd)
+    code.extend_from_slice(&[0x6A, crate::syscall::SYS_SEND as u8]); // push SYS_SEND
+    code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
+}
+
+/// `recv(fd, ptr, len)` — 18 bytes (Stage 24b). Same three-argument shape as [`emit_send`], with the fd
+/// in `rbx`. `recv` blocks until data arrives and returns the byte count in `rax`, which the demo then
+/// hands to [`emit_write_dyn`] as the length to print.
+fn emit_recv(code: &mut Vec<u8>, ptr: u64, len: u8) {
+    code.extend_from_slice(&[0x6A, len]); // push len          (arg3 = capacity)
+    code.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 ...
+    code.extend_from_slice(&ptr.to_le_bytes()); // ... = ptr
+    code.push(0x50); // push rax          (arg2 = ptr)
+    code.push(0x53); // push rbx          (arg1 = fd)
+    code.extend_from_slice(&[0x6A, crate::syscall::SYS_RECV as u8]); // push SYS_RECV
+    code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
+}
+
+/// `write(ptr, rax)` — 16 bytes (Stage 24b). A `write` whose length is the value in `rax` (the count a
+/// preceding `recv` returned), rather than a compile-time immediate: push `rax` (the length), then `ptr`,
+/// then the number. Lets the demo print exactly the bytes it received.
+fn emit_write_dyn(code: &mut Vec<u8>, ptr: u64) {
+    code.push(0x50); // push rax          (arg2 = len, from recv)
+    code.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 ...
+    code.extend_from_slice(&ptr.to_le_bytes()); // ... = ptr
+    code.push(0x50); // push rax          (arg1 = ptr)
+    code.extend_from_slice(&[0x6A, crate::syscall::SYS_WRITE as u8]); // push SYS_WRITE
+    code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
+}
+
 /// A busy-spin of `count` iterations — `mov rcx, count; dec rcx; jnz` (12 bytes). A
 /// ring-3 delay long enough that a ~55 ms timer tick lands mid-spin and *preempts* the
 /// process (Stage 12c-3). `rcx` is live throughout, so a correct preemption must save
@@ -372,18 +420,22 @@ fn build_parent(msg_ptr: u64, msg_len: u8) -> Vec<u8> {
     code
 }
 
-/// Hand-assemble the Stage 24a connect demo: `socket(); connect(fd, dst); write(msg);
-/// exit(0)`. `dst` packs the loopback listener's address and port (see [`pack_dst`]). The
-/// `connect` blocks in ring 3 until the handshake establishes; on success the process prints
-/// `msg`, visibly proving a ring 3 program reached the network stack through the socket
-/// syscalls. Produces exactly [`CONNECT_CODE_LEN`] bytes.
-fn build_connect_demo(msg_ptr: u64, msg_len: u8, dst: u64) -> Vec<u8> {
+/// Hand-assemble the Stage 24a/24b socket demo: `socket(); connect(dst); send(send); recv(recv);
+/// write(recv); exit(0)`. It opens a socket, connects to the loopback listener (`dst` packs its
+/// address and port, see [`pack_dst`]), sends `send_msg`, blocks in `recv` until the echo server
+/// bounces it back, then prints exactly the bytes it received — the full client lifecycle from ring 3.
+/// The fd is stashed in `rbx` right after `socket` (the entry stub preserves it across every syscall),
+/// so `send`/`recv` reuse it. Produces exactly [`SOCKET_DEMO_CODE_LEN`] bytes.
+fn build_socket_demo(dst: u64, send_ptr: u64, send_len: u8, recv_ptr: u64, recv_cap: u8) -> Vec<u8> {
     let mut code = Vec::new();
     emit_socket(&mut code);
+    code.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax  (stash the fd for send/recv below)
     emit_connect(&mut code, dst);
-    emit_write(&mut code, msg_ptr, msg_len);
+    emit_send(&mut code, send_ptr, send_len);
+    emit_recv(&mut code, recv_ptr, recv_cap);
+    emit_write_dyn(&mut code, recv_ptr);
     emit_exit(&mut code, 0);
-    debug_assert_eq!(code.len(), CONNECT_CODE_LEN);
+    debug_assert_eq!(code.len(), SOCKET_DEMO_CODE_LEN);
     code
 }
 
@@ -511,19 +563,35 @@ fn pack_dst(ip: [u8; 4], port: u16) -> u64 {
     ((u32::from_be_bytes(ip) as u64) << 16) | port as u64
 }
 
-/// Build the Stage 24a connect-demo ELF (`socket`; `connect(dst)`; `write`; `exit`).
-fn connect_demo_elf(dst: u64) -> Vec<u8> {
-    let msg = b"user process: connected to loopback listener via socket syscalls\n";
-    let code = build_connect_demo(msg_vaddr(CONNECT_CODE_LEN), msg.len() as u8, dst);
-    build_elf(&code, msg)
+/// Build the Stage 24a/24b socket-demo ELF (`socket`; `connect`; `send`; `recv`; `write`; `exit`).
+///
+/// The program's data area is the message to *send* followed by a zeroed *receive* buffer — both in
+/// the (writable) loaded segment, so `recv` can copy the echo into the second region. The send
+/// message sits right after the code (at `msg_vaddr`), and the receive buffer right after it.
+fn socket_demo_elf(dst: u64) -> Vec<u8> {
+    let send_msg = b"hello from a ring 3 socket\n";
+    let send_ptr = msg_vaddr(SOCKET_DEMO_CODE_LEN);
+    let recv_ptr = send_ptr + send_msg.len() as u64;
+    let code = build_socket_demo(
+        dst,
+        send_ptr,
+        send_msg.len() as u8,
+        recv_ptr,
+        SOCKET_DEMO_RECV_CAP,
+    );
+    // Data = the send message, then a zeroed receive buffer of SOCKET_DEMO_RECV_CAP bytes.
+    let mut data = send_msg.to_vec();
+    data.extend_from_slice(&alloc::vec![0u8; SOCKET_DEMO_RECV_CAP as usize]);
+    build_elf(&code, &data)
 }
 
-/// Boot demo for the Stage 24a socket syscalls: stand up a kernel-side TCP listener on the
-/// loopback port with the NIC's PHY loopback enabled (so a locally-sent SYN returns to us,
-/// mirroring the `net` loopback self-tests), then load and spawn a ring 3 program that
-/// `socket()`s and `connect()`s to that listener. The blocking `connect` drives the
-/// handshake to ESTABLISHED before the process proceeds (see [`on_user_connect`]); the caller
-/// disables loopback again after the process phase. Returns the demo process's pid.
+/// Boot demo for the Stage 24a/24b socket syscalls: stand up a kernel-side loopback TCP listener
+/// (which, since 24b, also **echoes**) on the demo port with the NIC's PHY loopback enabled — so a
+/// locally-sent frame returns to us, mirroring the `net` loopback self-tests — then load and spawn a
+/// ring 3 program that `socket()`s, `connect()`s, `send()`s a message, and `recv()`s the echo. The
+/// blocking `connect`/`recv` drive the handshake and the reply inline (see [`on_user_connect`] /
+/// [`on_user_recv`]); the caller disables loopback and echoing again after the process phase. Returns
+/// the demo process's pid.
 pub fn spawn_connect_demo(
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
     physical_memory_offset: VirtAddr,
@@ -531,11 +599,11 @@ pub fn spawn_connect_demo(
     let ip = crate::net::our_ip();
     crate::net::tcp_listen_loopback(CONNECT_DEMO_PORT);
     let dst = pack_dst(ip, CONNECT_DEMO_PORT);
-    let img = load(&connect_demo_elf(dst), frame_allocator, physical_memory_offset)
-        .expect("failed to load the connect-demo program");
+    let img = load(&socket_demo_elf(dst), frame_allocator, physical_memory_offset)
+        .expect("failed to load the socket-demo program");
     let pid = spawn(img, None);
     serial_println!(
-        "[sched] connect-demo: spawned process {} (it will socket()+connect() to {}.{}.{}.{}:{} over loopback)",
+        "[sched] socket-demo: spawned process {} (it will socket/connect/send/recv over loopback to {}.{}.{}.{}:{})",
         pid, ip[0], ip[1], ip[2], ip[3], CONNECT_DEMO_PORT,
     );
     pid
@@ -643,6 +711,12 @@ static PROCESSES_SPAWNED: AtomicU64 = AtomicU64::new(0);
 /// How many ring 3 processes established a TCP connection via the `connect` syscall — Stage
 /// 24a test.
 static PROCESSES_CONNECTED: AtomicU64 = AtomicU64::new(0);
+/// How many `send` syscalls a ring 3 process completed — Stage 24b test.
+static PROCESSES_SENT: AtomicU64 = AtomicU64::new(0);
+/// How many `recv` syscalls returned data to a ring 3 process — Stage 24b test.
+static PROCESSES_RECEIVED: AtomicU64 = AtomicU64::new(0);
+/// Bytes the most recent `recv` delivered — Stage 24b test.
+static LAST_RECV_LEN: AtomicU64 = AtomicU64::new(0);
 
 /// Stage 24a: a user **socket** — the per-process handle a ring 3 program obtains from the
 /// `socket` syscall and connects with. It is a thin binding from a small-integer **file
@@ -652,9 +726,6 @@ static PROCESSES_CONNECTED: AtomicU64 = AtomicU64::new(0);
 /// establishes, so a later `send`/`recv` (Stage 24b) can find the connection's TCB. This is
 /// the kernel's first step toward Unix's "everything is a file descriptor".
 #[derive(Clone, Copy)]
-// The bound port pair is written by `connect` (Stage 24a) but not read until `send`/`recv`
-// (Stage 24b) look up the connection's TCB by it; allow it dead for this one stage.
-#[allow(dead_code)]
 struct UserSocket {
     local_port: u16,
     remote_port: u16,
@@ -1127,6 +1198,123 @@ pub fn on_user_connect(tf: &mut TrapFrame, fd: u64, dst: u64) {
     *tf = resume; // resume the caller (its rax now holds the connect result)
 }
 
+/// Look up the calling process's socket `fd` and return the `(local_port, remote_port)` of the
+/// connection it is bound to, or `None` if the fd is invalid or the socket is not connected
+/// (still port 0/0). Shared by `send` and `recv`. The caller must hold the scheduler lock.
+fn socket_ports(proc: &Process, fd: u64) -> Option<(u16, u16)> {
+    match proc.sockets.get(fd as usize).and_then(|s| *s) {
+        Some(sock) if sock.local_port != 0 => Some((sock.local_port, sock.remote_port)),
+        _ => None,
+    }
+}
+
+/// Called by the `send` syscall (ring 3, Stage 24b): send `len` bytes from the process's buffer
+/// at `ptr` on socket `fd`. Non-blocking — the bytes are queued and flushed by [`crate::net::tcp_send`]
+/// (TCP's own send buffer and sliding window pace the wire), so it returns immediately with the
+/// count via the stack ABI (`u64::MAX` on error: bad/unconnected fd, or no such connection).
+pub fn on_user_send(fd: u64, ptr: u64, len: u64) -> u64 {
+    let (local, remote) = {
+        let sched = SCHEDULER.lock();
+        let proc = match &sched.current {
+            Some(p) => p,
+            None => return u64::MAX,
+        };
+        match socket_ports(proc, fd) {
+            Some(ports) => ports,
+            None => {
+                serial_println!("[sched] send: no connected socket fd {}", fd);
+                return u64::MAX;
+            }
+        }
+    };
+    // SAFETY: `(ptr, len)` is a buffer in the caller's address space, which is the active one (a
+    // syscall runs on the caller's CR3). We only read it. A hardened kernel would bounds-check the
+    // range against the caller's own mappings, as `sys_write` notes.
+    let data = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
+    if crate::net::tcp_send(local, remote, data) {
+        PROCESSES_SENT.fetch_add(1, Ordering::SeqCst);
+        serial_println!("[sched] process sent {} byte(s) on socket fd {}", len, fd);
+        len
+    } else {
+        u64::MAX
+    }
+}
+
+/// Called by the `recv` syscall (ring 3, Stage 24b): receive up to `len` bytes into the process's
+/// buffer at `ptr` on socket `fd`, returning the count in **rax** (0 at end-of-stream). Like
+/// `connect` this **blocks** — if no data has arrived it parks the caller in `net_blocked` and
+/// drives [`crate::net::poll`] inline (the loopback echo server, driven by that same poll, produces
+/// the reply) until bytes are available, then copies them into the user buffer and wakes the caller.
+/// A later stage with a concurrent net thread would instead switch away and be woken by it.
+///
+/// The copy into `ptr` is safe throughout because we never switch CR3 while blocked — the caller's
+/// address space stays active — so its buffer is reachable the whole time.
+pub fn on_user_recv(tf: &mut TrapFrame, fd: u64, ptr: u64, len: u64) {
+    // Phase 1 (locked): validate the fd, resolve its connection, and park the caller.
+    let (pid, local, remote) = {
+        let mut sched = SCHEDULER.lock();
+        let proc = match sched.current.as_mut() {
+            Some(p) => p,
+            None => return,
+        };
+        let (local, remote) = match socket_ports(proc, fd) {
+            Some(ports) => ports,
+            None => {
+                serial_println!("[sched] recv: no connected socket fd {}", fd);
+                tf.rax = u64::MAX;
+                return;
+            }
+        };
+        let mut blocked = sched.current.take().expect("current is_some, checked above");
+        blocked.context = *tf;
+        let id = blocked.id;
+        sched.net_blocked.push(blocked);
+        (id, local, remote)
+    };
+
+    // Phase 2 (unlocked): drive the network until data arrives (or we give up), then copy it into
+    // the caller's buffer. `tcp_read` drains up to `len` bytes; `poll` runs the echo server that
+    // generates the reply. Bounded so a silent peer cannot hang the process forever.
+    let max = len as usize;
+    let mut got: Vec<u8> = Vec::new();
+    for _ in 0..RECV_POLL_ITERS {
+        if let Some(data) = crate::net::tcp_read(local, remote, max) {
+            if !data.is_empty() {
+                got = data;
+                break;
+            }
+        }
+        crate::net::poll();
+        crate::apic::pit_sleep_us(RECV_POLL_US);
+    }
+    let n = got.len().min(max);
+    if n > 0 {
+        // SAFETY: `(ptr, n)` is a writable buffer in the caller's address space, still the active
+        // one (we never switched CR3 while blocked), and `n <= len` bounds the write to the caller's
+        // requested size.
+        let dst = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, n) };
+        dst.copy_from_slice(&got[..n]);
+    }
+
+    // Phase 3 (locked): wake the parked process with the byte count and resume it.
+    let mut sched = SCHEDULER.lock();
+    let pos = sched
+        .net_blocked
+        .iter()
+        .position(|p| p.id == pid)
+        .expect("the process we just blocked is still in net_blocked");
+    let mut proc = sched.net_blocked.remove(pos);
+    proc.context.rax = n as u64;
+    if n > 0 {
+        PROCESSES_RECEIVED.fetch_add(1, Ordering::SeqCst);
+        LAST_RECV_LEN.store(n as u64, Ordering::SeqCst);
+        serial_println!("[sched] process {} received {} byte(s) on socket fd {}", proc.id, n, fd);
+    }
+    let resume = proc.context;
+    sched.current = Some(proc);
+    *tf = resume;
+}
+
 /// Called from the timer interrupt when it fires while a *user* process runs in ring 3
 /// — Stage 12c-3 preemption. Saves the running process's full register context,
 /// round-robins it to the back of the ready queue, switches to the next ready process
@@ -1231,4 +1419,19 @@ pub fn processes_spawned() -> u64 {
 /// Stage 24a test.
 pub fn processes_connected() -> u64 {
     PROCESSES_CONNECTED.load(Ordering::SeqCst)
+}
+
+/// How many `send` syscalls a ring 3 process completed. For the Stage 24b test.
+pub fn processes_sent() -> u64 {
+    PROCESSES_SENT.load(Ordering::SeqCst)
+}
+
+/// How many `recv` syscalls returned data to a ring 3 process. For the Stage 24b test.
+pub fn processes_received() -> u64 {
+    PROCESSES_RECEIVED.load(Ordering::SeqCst)
+}
+
+/// Bytes the most recent `recv` delivered. For the Stage 24b test.
+pub fn last_recv_len() -> u64 {
+    LAST_RECV_LEN.load(Ordering::SeqCst)
 }

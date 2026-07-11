@@ -312,6 +312,18 @@ fn ring3_process_connected_a_socket() {
     assert!(crate::process::processes_connected() >= 1);
 }
 
+/// Stage 24b: a ring 3 process did full stream I/O through the `send`/`recv` syscalls. The boot demo
+/// program `send`s a 27-byte message to the kernel-side loopback echo server and blocks in `recv`
+/// until the echo returns; the blocking recv drives the network inline and wakes the process with the
+/// bytes. So by the time this harness runs at least one send and one recv must have completed, and the
+/// last recv must have delivered exactly the echoed message ("hello from a ring 3 socket\n" = 27 B).
+#[test_case]
+fn ring3_process_sent_and_received() {
+    assert!(crate::process::processes_sent() >= 1);
+    assert!(crate::process::processes_received() >= 1);
+    assert_eq!(crate::process::last_recv_len(), 27);
+}
+
 /// Stage 13a: the ATA PIO driver reads a raw sector from disk. The bootimage QEMU attaches
 /// the kernel image as the primary IDE master, so sector 0 is the boot sector, whose final
 /// two bytes are the MBR boot signature 0x55 0xAA — a stable value to assert without
