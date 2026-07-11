@@ -183,8 +183,11 @@ pub fn checksum(src_ip: [u8; 4], dst_ip: [u8; 4], segment: &[u8]) -> u16 {
 /// The receive window we advertise, in bytes. Fixed for now; real flow control comes in a later step.
 const DEFAULT_WINDOW: u16 = 64240;
 
-/// The connection lifecycle states this sub-step needs (a subset of RFC 793's eleven — teardown states
-/// arrive with the FIN handshake later).
+/// The connection lifecycle states (RFC 793). The opening subset — `Closed`/`Listen`/`SynSent`/
+/// `SynReceived`/`Established` — is the three-way handshake (Stage 21b); the rest are the **teardown**
+/// states of the FIN handshake (Stage 21d). TCP is full-duplex, so each direction closes independently:
+/// the active closer walks `Established -> FinWait1 -> FinWait2 -> TimeWait -> Closed` (or via `Closing`
+/// on a simultaneous close), and the passive closer walks `Established -> CloseWait -> LastAck -> Closed`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum State {
     Closed,
@@ -192,6 +195,19 @@ pub enum State {
     SynSent,
     SynReceived,
     Established,
+    /// Active close: we sent a FIN, awaiting its ACK (and possibly the peer's FIN).
+    FinWait1,
+    /// Active close: our FIN is acknowledged; awaiting the peer's FIN.
+    FinWait2,
+    /// Passive close: the peer sent a FIN (we acknowledged it); awaiting our application's own close.
+    CloseWait,
+    /// Simultaneous close: both sides sent a FIN before either was acknowledged; awaiting our FIN's ACK.
+    Closing,
+    /// Passive close: we sent our FIN, awaiting its final ACK to complete the close.
+    LastAck,
+    /// Active close: the FIN handshake is done; linger 2*MSL (so a lost final ACK can be resent) before
+    /// truly closing. The timed transition to `Closed` arrives with the timers in Stage 21e.
+    TimeWait,
 }
 
 /// A Transmission Control Block: everything TCP tracks for one connection. Stage 21b uses only what the
@@ -381,51 +397,97 @@ fn step(tcb: &mut Tcb, local_ip: [u8; 4], remote_ip: [u8; 4], seg: &Segment) -> 
             None
         }
         State::Established => on_established(tcb, local_ip, remote_ip, seg),
-        _ => None, // teardown states (the FIN handshake) are handled in Stage 21d
+
+        // --- Stage 21d: the FIN handshake (connection teardown). Each direction closes independently, so
+        // the machine tracks our FIN's acknowledgement (snd_una catching up to snd_nxt, since our FIN
+        // advanced snd_nxt) and the peer's FIN (which consumes one of its sequence numbers). ---
+
+        // We sent a FIN (active close) and await its ACK — and possibly the peer's FIN too.
+        State::FinWait1 => {
+            process_ack(tcb, seg);
+            let our_fin_acked = tcb.snd_una == tcb.snd_nxt;
+            let peer_fin = seg.flags & FIN != 0 && seg.seq == tcb.rcv_nxt;
+            if peer_fin {
+                tcb.rcv_nxt = tcb.rcv_nxt.wrapping_add(1); // the peer's FIN consumes one seq
+            }
+            match (our_fin_acked, peer_fin) {
+                // Our FIN is acked and the peer has finished too: ACK its FIN and linger in TIME_WAIT.
+                (true, true) => {
+                    tcb.state = State::TimeWait;
+                    Some(build_ack(tcb, local_ip, remote_ip))
+                }
+                // Our FIN is acked; wait for the peer's FIN in FIN_WAIT_2.
+                (true, false) => {
+                    tcb.state = State::FinWait2;
+                    None
+                }
+                // Simultaneous close: the peer's FIN arrived before ours was acked. ACK it, wait (in
+                // CLOSING) for the ACK of our own FIN.
+                (false, true) => {
+                    tcb.state = State::Closing;
+                    Some(build_ack(tcb, local_ip, remote_ip))
+                }
+                (false, false) => None,
+            }
+        }
+
+        // Our FIN is acked; wait for the peer's FIN, then acknowledge it and enter TIME_WAIT.
+        State::FinWait2 => {
+            process_ack(tcb, seg);
+            if seg.flags & FIN != 0 && seg.seq == tcb.rcv_nxt {
+                tcb.rcv_nxt = tcb.rcv_nxt.wrapping_add(1);
+                tcb.state = State::TimeWait;
+                return Some(build_ack(tcb, local_ip, remote_ip));
+            }
+            None
+        }
+
+        // The peer closed first (we are the passive closer) and we already acknowledged its FIN. Wait for
+        // our application to close (`close`, which sends our FIN -> LAST_ACK); meanwhile re-ACK a
+        // retransmitted FIN in case the peer never saw our acknowledgement.
+        State::CloseWait => {
+            process_ack(tcb, seg);
+            if seg.flags & FIN != 0 {
+                return Some(build_ack(tcb, local_ip, remote_ip));
+            }
+            None
+        }
+
+        // Simultaneous close: both FINs are outstanding. Once ours is acked, enter TIME_WAIT.
+        State::Closing => {
+            process_ack(tcb, seg);
+            if tcb.snd_una == tcb.snd_nxt {
+                tcb.state = State::TimeWait;
+            }
+            None
+        }
+
+        // Passive closer: we sent our FIN and await its final ACK, which completes the close.
+        State::LastAck => {
+            process_ack(tcb, seg);
+            if tcb.snd_una == tcb.snd_nxt {
+                tcb.state = State::Closed;
+            }
+            None
+        }
+
+        // Active closer, waiting out 2*MSL. Re-ACK a retransmitted peer FIN (our final ACK was lost); the
+        // timed transition to CLOSED belongs with the retransmission timers (Stage 21e).
+        State::TimeWait => {
+            if seg.flags & FIN != 0 {
+                return Some(build_ack(tcb, local_ip, remote_ip));
+            }
+            None
+        }
+
+        State::Closed | State::Listen => None, // never reached via step (Listen is handled in on_segment)
     }
 }
 
-/// Handle a segment on an ESTABLISHED connection (Stage 21c) — the steady state, where the reliable byte
-/// stream is actually in motion. Two things happen, either or both per segment:
-///
-/// 1. **Process an acknowledgement.** If the peer ACKs bytes we sent, advance `snd_una` over them (so we
-///    know they arrived; a retransmission timer, Stage 21e, would use this to stop resending).
-/// 2. **Accept stream data.** If the segment carries payload *in order* (`seq == rcv_nxt`), append it to
-///    the receive buffer and advance `rcv_nxt`. Either way, reply with an ACK naming `rcv_nxt` — every
-///    data segment is acknowledged, which is what makes the transfer reliable.
-///
-/// Returns the ACK segment to send when we received data, else `None` (a bare ACK for our own data needs
-/// no reply — acknowledging an acknowledgement would loop forever).
-fn on_established(
-    tcb: &mut Tcb,
-    local_ip: [u8; 4],
-    remote_ip: [u8; 4],
-    seg: &Segment,
-) -> Option<Vec<u8>> {
-    // (1) An incoming acknowledgement advances snd_una over the bytes the peer now confirms. Accept an
-    // ack in (snd_una, snd_nxt] using wrapping arithmetic, so it stays correct across a sequence-number
-    // wrap; a duplicate ack (ack == snd_una) is a harmless no-op, and an ack beyond snd_nxt is ignored.
-    if seg.flags & ACK != 0 {
-        let acked = seg.ack.wrapping_sub(tcb.snd_una);
-        let outstanding = tcb.snd_nxt.wrapping_sub(tcb.snd_una);
-        if acked <= outstanding {
-            tcb.snd_una = seg.ack;
-        }
-    }
-
-    // (2) Accept stream data. We take only in-order segments: a real stack would queue out-of-order data
-    // for reassembly, but requiring `seq == rcv_nxt` keeps the byte stream simple and still correct — a
-    // gap is simply left unacknowledged until the peer retransmits it (Stage 21e).
-    if seg.payload.is_empty() {
-        return None; // a pure ACK (no data) needs no reply
-    }
-    if seg.seq == tcb.rcv_nxt {
-        tcb.rx.extend_from_slice(seg.payload);
-        tcb.rcv_nxt = tcb.rcv_nxt.wrapping_add(seg.payload.len() as u32);
-    }
-    // Reply with an ACK for rcv_nxt whether the data was in order (now acknowledged) or a duplicate /
-    // out-of-order segment (re-ACK the last byte we did receive, prompting the peer to resend the gap).
-    Some(build(
+/// Build a bare ACK for this connection's current sequence state (`seq = snd_nxt`, `ack = rcv_nxt`). The
+/// workhorse reply of every acknowledging state — data receipt, a FIN, or a re-ACK of a retransmission.
+fn build_ack(tcb: &Tcb, local_ip: [u8; 4], remote_ip: [u8; 4]) -> Vec<u8> {
+    build(
         local_ip,
         remote_ip,
         tcb.local_port,
@@ -435,7 +497,62 @@ fn on_established(
         ACK,
         DEFAULT_WINDOW,
         &[],
-    ))
+    )
+}
+
+/// Process an incoming acknowledgement: advance `snd_una` over the bytes the peer's `ack` newly confirms.
+/// Accepts an ack in `(snd_una, snd_nxt]` using wrapping arithmetic (so it stays correct across a
+/// sequence-number wrap); a duplicate ack (`ack == snd_una`) is a harmless no-op, and an ack beyond
+/// `snd_nxt` is ignored. After a FIN we sent, `snd_una == snd_nxt` therefore means our FIN was acked.
+fn process_ack(tcb: &mut Tcb, seg: &Segment) {
+    if seg.flags & ACK != 0 {
+        let acked = seg.ack.wrapping_sub(tcb.snd_una);
+        let outstanding = tcb.snd_nxt.wrapping_sub(tcb.snd_una);
+        if acked <= outstanding {
+            tcb.snd_una = seg.ack;
+        }
+    }
+}
+
+/// Handle a segment on an ESTABLISHED connection — the steady state (Stage 21c) plus the *start* of a
+/// passive close (Stage 21d). In order per segment: process any acknowledgement of our sent data; accept
+/// in-order stream data into the receive buffer; and, if the segment carries a **FIN** (the peer is done
+/// sending), consume its sequence number and move to CLOSE_WAIT. Anything that consumed sequence space
+/// (data or a FIN) is acknowledged; a bare ACK of our own data needs no reply (acknowledging an
+/// acknowledgement would loop forever).
+fn on_established(
+    tcb: &mut Tcb,
+    local_ip: [u8; 4],
+    remote_ip: [u8; 4],
+    seg: &Segment,
+) -> Option<Vec<u8>> {
+    process_ack(tcb, seg);
+
+    // Accept stream data, in order only: a real stack would queue out-of-order data for reassembly, but
+    // requiring `seq == rcv_nxt` keeps the byte stream simple and still correct — a gap is left
+    // unacknowledged until the peer retransmits it (Stage 21e).
+    let in_order = seg.seq == tcb.rcv_nxt;
+    if in_order && !seg.payload.is_empty() {
+        tcb.rx.extend_from_slice(seg.payload);
+        tcb.rcv_nxt = tcb.rcv_nxt.wrapping_add(seg.payload.len() as u32);
+    }
+
+    // A FIN occupies the sequence number just past the segment's data; honor it only in order. It moves
+    // us to CLOSE_WAIT — the peer will send no more data, though our side may still send until the
+    // application closes too (`close`, which then sends our own FIN).
+    let fin = seg.flags & FIN != 0 && seg.seq.wrapping_add(seg.payload.len() as u32) == tcb.rcv_nxt;
+    if fin {
+        tcb.rcv_nxt = tcb.rcv_nxt.wrapping_add(1); // the FIN consumes one sequence number
+        tcb.state = State::CloseWait;
+    }
+
+    // Acknowledge anything that consumed sequence space (data or a FIN); also re-ACK a duplicate segment
+    // to prompt the peer. A pure ACK of our own data (no payload, no FIN) needs no reply.
+    if fin || !seg.payload.is_empty() {
+        Some(build_ack(tcb, local_ip, remote_ip))
+    } else {
+        None
+    }
 }
 
 /// Stage 21c: queue application data to send on the ESTABLISHED connection `(local_port -> remote_port)`,
@@ -466,6 +583,39 @@ pub fn send_data(
         data,
     );
     tcb.snd_nxt = tcb.snd_nxt.wrapping_add(data.len() as u32);
+    Some((seg, tcb.remote_ip))
+}
+
+/// Stage 21d: close our end of the connection `(local_port -> remote_port)` — the application is done
+/// sending. Returns the **FIN segment** to transmit (with the peer's IP for framing), or `None` if the
+/// connection is not in a closable state. A FIN consumes one sequence number, like a SYN. Two cases:
+///
+/// - From ESTABLISHED this is an **active close**: send our FIN and enter FIN_WAIT_1.
+/// - From CLOSE_WAIT (the peer already closed and we acknowledged its FIN) this is the **passive close**:
+///   send our FIN and enter LAST_ACK.
+pub fn close(local_ip: [u8; 4], local_port: u16, remote_port: u16) -> Option<(Vec<u8>, [u8; 4])> {
+    let mut table = CONNECTIONS.lock();
+    let tcb = table
+        .iter_mut()
+        .find(|c| c.local_port == local_port && c.remote_port == remote_port)?;
+    let next_state = match tcb.state {
+        State::Established => State::FinWait1, // active close
+        State::CloseWait => State::LastAck,    // passive close (the peer already sent its FIN)
+        _ => return None,                      // not in a closable state (not established / already closing)
+    };
+    let seg = build(
+        local_ip,
+        tcb.remote_ip,
+        tcb.local_port,
+        tcb.remote_port,
+        tcb.snd_nxt,
+        tcb.rcv_nxt,
+        FIN | ACK,
+        DEFAULT_WINDOW,
+        &[],
+    );
+    tcb.snd_nxt = tcb.snd_nxt.wrapping_add(1); // the FIN consumes one sequence number
+    tcb.state = next_state;
     Some((seg, tcb.remote_ip))
 }
 

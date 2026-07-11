@@ -1250,6 +1250,18 @@ fn tcp_transfers_data_over_loopback() {
     assert!(net::tcp_data_loopback_selftest(), "TCP data transfer over loopback failed");
 }
 
+/// Stage 21d: TCP connection teardown via loopback (no external peer). Establish a loopback connection,
+/// then actively close one end and passively close the other, walking the full four-way FIN handshake —
+/// and assert the active closer ends in TIME_WAIT and the passive closer in CLOSED. Exercises the FIN
+/// handshake states, each FIN consuming a sequence number, and each FIN being acknowledged.
+#[test_case]
+fn tcp_tears_down_over_loopback() {
+    use crate::net;
+
+    assert!(crate::e1000::present(), "e1000 not initialized");
+    assert!(net::tcp_teardown_loopback_selftest(), "TCP teardown over loopback failed");
+}
+
 /// Stage 19b-2: the live DNS resolver — resolve a hostname through SLIRP's DNS server over the wire.
 /// Unlike the SLIRP-internal gateway ping, this depends on the *host* having working upstream DNS
 /// (SLIRP forwards to it), so the test is lenient: it always exercises the full path (build the query,

@@ -809,6 +809,103 @@ pub fn tcp_data_loopback_selftest() -> bool {
     ok
 }
 
+/// Stage 21d: close our end of the TCP connection `(local_port -> remote_port)` — the application is done
+/// sending. Builds the FIN segment ([`tcp::close`], which advances the send sequence and moves the state
+/// machine into the FIN handshake), frames it, and transmits. Returns `false` if there is no such
+/// connection in a closable state, or the peer's MAC cannot be resolved. The peer's ACK / FIN are handled
+/// by the normal [`poll`]/[`handle_tcp`] path, driving the connection through teardown to CLOSED.
+pub fn tcp_close(local_port: u16, remote_port: u16) -> bool {
+    let (seg, remote_ip) = match tcp::close(our_ip(), local_port, remote_port) {
+        Some(x) => x,
+        None => return false, // no connection in a closable state with this port pair
+    };
+    let mac = match tcp_next_hop(remote_ip) {
+        Some(m) => m,
+        None => return false,
+    };
+    let frame = ether::build(
+        mac,
+        our_mac(),
+        ether::ETHERTYPE_IPV4,
+        &ipv4::build(our_ip(), remote_ip, tcp::PROTO_TCP, &seg),
+    );
+    e1000::transmit(&frame);
+    true
+}
+
+/// Stage 21d self-test of connection **teardown** with no external peer, via PHY loopback — the follow-on
+/// to [`tcp_data_loopback_selftest`]. Establish a loopback connection, then walk both ends through the
+/// four-way FIN handshake:
+///
+/// 1. The client actively closes (`tcp_close`): its FIN loops back, the server acknowledges it (reaching
+///    CLOSE_WAIT) and the client, seeing that ACK, reaches FIN_WAIT_2.
+/// 2. The server then closes its own end: its FIN loops back, the client acknowledges it (reaching
+///    TIME_WAIT) and the server, seeing that final ACK, reaches CLOSED.
+///
+/// Success is the client in TIME_WAIT and the server in CLOSED — proving the full teardown state machine,
+/// each FIN consuming a sequence number and each being acknowledged. Returns whether both ends arrived.
+pub fn tcp_teardown_loopback_selftest() -> bool {
+    tcp::reset_connections();
+    let port: u16 = 7779;
+    tcp::open_passive(port);
+
+    e1000::set_loopback(true);
+    let mut sink = [0u8; 2048];
+    while e1000::poll_frame(&mut sink).is_some() {}
+
+    let client_port = match tcp_connect(our_ip(), port) {
+        Some(p) => p,
+        None => {
+            e1000::set_loopback(false);
+            serial_println!("[net] TCP teardown loopback selftest: handshake failed");
+            return false;
+        }
+    };
+    for _ in 0..200 {
+        if tcp::established_count() >= 2 {
+            break;
+        }
+        poll();
+        crate::apic::pit_sleep_us(500);
+    }
+
+    // Step 1 — the client actively closes. Pump until the server ACKs the FIN (CLOSE_WAIT) and the client
+    // reaches FIN_WAIT_2. (The server must reach CLOSE_WAIT before it can passively close in step 2.)
+    tcp_close(client_port, port);
+    for _ in 0..400 {
+        poll();
+        if tcp::connection_state(port, client_port) == Some(tcp::State::CloseWait)
+            && tcp::connection_state(client_port, port) == Some(tcp::State::FinWait2)
+        {
+            break;
+        }
+        crate::apic::pit_sleep_us(500);
+    }
+
+    // Step 2 — the server closes its own end. Pump until the client ACKs the server's FIN (TIME_WAIT) and
+    // the server, seeing that final ACK, reaches CLOSED.
+    tcp_close(port, client_port);
+    for _ in 0..400 {
+        poll();
+        if tcp::connection_state(client_port, port) == Some(tcp::State::TimeWait)
+            && tcp::connection_state(port, client_port) == Some(tcp::State::Closed)
+        {
+            break;
+        }
+        crate::apic::pit_sleep_us(500);
+    }
+    e1000::set_loopback(false);
+
+    let client_state = tcp::connection_state(client_port, port);
+    let server_state = tcp::connection_state(port, client_port);
+    let ok = client_state == Some(tcp::State::TimeWait) && server_state == Some(tcp::State::Closed);
+    serial_println!(
+        "[net] TCP teardown loopback selftest: client {:?}, server {:?}, ok = {}",
+        client_state, server_state, ok,
+    );
+    ok
+}
+
 /// Stage 21b self-test of the three-way handshake with no external peer, via PHY loopback. Listen on a
 /// port, then actively connect to *ourselves* on it: our SYN loops back, the listener answers SYN-ACK,
 /// that loops back and we answer ACK, which loops back to the listener — so both a client TCB and a

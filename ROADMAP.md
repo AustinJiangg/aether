@@ -622,9 +622,24 @@ unify later.
 > deterministically with no peer via PHY loopback: `tcp_data_loopback_selftest` establishes a loopback
 > connection, sends a payload from the client, and confirms the server buffered exactly those bytes **in
 > order** and the client saw them **acknowledged** — boot logs "TCP data transfer over loopback = true" (25
-> bytes received, acknowledged = true). Verified by 71 tests (`tcp_transfers_data_over_loopback`). Still to
-> come: **21d** teardown (the FIN handshake, TIME_WAIT) and **21e** retransmission timers (plus real
-> sliding-window flow control).
+> bytes received, acknowledged = true). Verified by 71 tests (`tcp_transfers_data_over_loopback`).
+>
+> **Stage 21d** adds **connection teardown** — the FIN handshake. TCP is full-duplex, so each direction of
+> the stream closes independently; closing is a **four-way** exchange (FIN + ACK each way). The `State`
+> enum grows the RFC 793 teardown states — `FinWait1`/`FinWait2`/`TimeWait` (active closer),
+> `CloseWait`/`LastAck` (passive closer), and `Closing` (simultaneous close) — with **no new TCB fields**:
+> a FIN, like a SYN, consumes one sequence number, so the existing `snd_nxt`/`snd_una`/`rcv_nxt` bookkeeping
+> tracks it (our FIN is acknowledged when `snd_una` catches up to `snd_nxt`). `on_established` now also
+> accepts a peer's FIN (advancing `rcv_nxt`, moving to CLOSE_WAIT); `step` gains an arm per teardown state;
+> and `tcp::close` sends our FIN (ESTABLISHED -> FIN_WAIT_1 active, or CLOSE_WAIT -> LAST_ACK passive).
+> `net::tcp_close` frames and transmits it, and the peer's ACK/FIN are handled by the normal `poll` path.
+> Proved deterministically with no peer via PHY loopback: `tcp_teardown_loopback_selftest` establishes a
+> loopback connection, then actively closes one end and passively closes the other, walking both TCBs
+> through the full handshake until the active closer is in **TIME_WAIT** and the passive closer is
+> **CLOSED** — boot logs "TCP teardown over loopback = true (client TimeWait, server Closed)". Verified by
+> 72 tests (`tcp_tears_down_over_loopback`). Still to come: **21e** retransmission timers — a resend queue
+> and a timeout that resends unacknowledged segments (and expires TIME_WAIT after 2*MSL), plus real
+> sliding-window flow control.
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

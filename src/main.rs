@@ -902,6 +902,16 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 tcp_data_ok,
             );
 
+            // Stage 21d (networking): TCP teardown. Closing is a four-way FIN handshake — each direction
+            // of the full-duplex stream closes independently. Prove it via loopback: actively close one
+            // end and passively close the other, walking through FIN_WAIT/CLOSE_WAIT/LAST_ACK/TIME_WAIT
+            // until the active closer is in TIME_WAIT and the passive closer is CLOSED.
+            let tcp_teardown_ok = net::tcp_teardown_loopback_selftest();
+            serial_println!(
+                "[ OK ] net 21d: TCP teardown over loopback = {}",
+                tcp_teardown_ok,
+            );
+
             match net::ping(gw) {
                 Some(seq) => {
                     serial_println!(
