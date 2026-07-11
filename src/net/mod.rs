@@ -980,6 +980,12 @@ pub fn tcp_retransmits() -> u64 {
     TCP_RETRANSMITS.load(Ordering::Relaxed)
 }
 
+/// Stage 22d-3: how many TCP fast retransmits have fired (a segment resent on the third duplicate ACK
+/// rather than on a retransmission timeout), over the whole run. The fast-retransmit test reads it.
+pub fn tcp_fast_retransmits() -> u64 {
+    tcp::fast_retransmits()
+}
+
 /// Stage 22a: how many out-of-order TCP segments the receiver has buffered for reassembly (whole run).
 pub fn tcp_out_of_order_buffered() -> u64 {
     tcp::out_of_order_buffered()
@@ -1415,6 +1421,107 @@ pub fn tcp_congestion_backoff_loopback_selftest() -> bool {
     serial_println!(
         "[net] TCP congestion-backoff loopback selftest: cwnd {} -> {} (min after loss), ssthresh {} -> {}, delivered {}/{} in order {}, ok = {}",
         cwnd_grown, cwnd_min, ssthresh_before, ssthresh_after, got.len(), total, in_order, ok,
+    );
+    ok
+}
+
+/// Stage 22d-3 self-test of **fast retransmit + fast recovery** with no external peer, via PHY loopback — the
+/// final congestion-control sub-step. Stage 22d-2 recovered a loss only via the RTO (wait a whole timeout,
+/// then collapse `cwnd` to one MSS). Fast retransmit recovers *sooner* and *gentler*: the receiver's
+/// duplicate ACKs (a later segment arrived but an earlier one is missing) tell the sender about the loss
+/// before the timer would, and after resending it the sender only halves `cwnd` (fast recovery) rather than
+/// collapsing it — because the dup ACKs prove data is still flowing, so the path is not fully congested.
+///
+/// The test grows `cwnd` past four MSS (so four segments can be in flight), then sends four MSS-sized
+/// segments in one burst with the **first dropped**. The three that arrive are out of order, so the receiver
+/// sends three duplicate ACKs; the third fires the fast retransmit of the missing segment. It confirms the
+/// fast-retransmit path ran, the RTO timer did *not* fire (recovery beat it), `cwnd` never collapsed to one
+/// MSS (fast recovery, not an RTO backoff), and every byte still arrived in order.
+pub fn tcp_fast_retransmit_loopback_selftest() -> bool {
+    tcp::reset_connections();
+    let port: u16 = 7786;
+    tcp::open_passive(port);
+
+    e1000::set_loopback(true);
+    let mut sink = [0u8; 2048];
+    while e1000::poll_frame(&mut sink).is_some() {}
+
+    let client_port = match tcp_connect(our_ip(), port) {
+        Some(p) => p,
+        None => {
+            e1000::set_loopback(false);
+            serial_println!("[net] TCP fast-retransmit loopback selftest: handshake failed");
+            return false;
+        }
+    };
+    for _ in 0..200 {
+        if tcp::established_count() >= 2 {
+            break;
+        }
+        poll();
+        crate::apic::pit_sleep_us(500);
+    }
+
+    // Phase 1: grow cwnd above four MSS so four segments can be in flight at once — the setup needed to put
+    // three later segments behind one lost segment (three duplicate ACKs). Stream a batch and drain it.
+    let warmup = 6144usize;
+    let d1: Vec<u8> = (0..warmup).map(|i| (i % 251) as u8).collect();
+    tcp_send(client_port, port, &d1);
+    let mut got: Vec<u8> = Vec::new();
+    for _ in 0..8000 {
+        poll();
+        if let Some(chunk) = tcp_read(port, client_port, 8192) {
+            got.extend_from_slice(&chunk);
+        }
+        if got.len() >= warmup && tcp::all_data_acked(client_port, port) == Some(true) {
+            break;
+        }
+        crate::apic::pit_sleep_us(300);
+    }
+
+    // Phase 2: send four MSS-sized segments in one burst with the first dropped on the wire. The three that
+    // arrive are ahead of the receiver's next-expected byte (a gap precedes them), so it dup-ACKs each; the
+    // third dup ACK fires the fast retransmit — before the ~150 ms RTO — and enters fast recovery.
+    let fast_before = tcp::fast_retransmits();
+    let rto_before = tcp_retransmits();
+    DROP_NEXT_TCP_TX.store(1, Ordering::Release);
+    let payload_len = 4096usize; // 4 * MSS
+    let d2: Vec<u8> = (0..payload_len).map(|i| ((i + 7) % 251) as u8).collect();
+    tcp_send(client_port, port, &d2);
+
+    let total = warmup + payload_len;
+    let mut cwnd_min = u32::MAX;
+    for _ in 0..6000 {
+        poll();
+        if let Some(c) = tcp::congestion_window(client_port, port) {
+            cwnd_min = cwnd_min.min(c);
+        }
+        if let Some(chunk) = tcp_read(port, client_port, 8192) {
+            got.extend_from_slice(&chunk);
+        }
+        if got.len() >= total && tcp::all_data_acked(client_port, port) == Some(true) {
+            break;
+        }
+        crate::apic::pit_sleep_us(300);
+    }
+    e1000::set_loopback(false);
+
+    let mut expected = d1.clone();
+    expected.extend_from_slice(&d2);
+    let fast_fired = tcp::fast_retransmits() > fast_before; // the third dup ACK triggered a fast retransmit
+    let no_rto = tcp_retransmits() == rto_before; // recovery beat the RTO timer — it never resent anything
+    let no_collapse = cwnd_min > 1024; // fast recovery halves cwnd; an RTO would have collapsed it to 1 MSS
+    let in_order = got == expected;
+    let ok = fast_fired && no_rto && no_collapse && in_order && got.len() == total;
+    serial_println!(
+        "[net] TCP fast-retransmit loopback selftest: fast-retransmits {}, rto-resends {}, cwnd-min-after-loss {}, delivered {}/{} in order {}, ok = {}",
+        tcp::fast_retransmits() - fast_before,
+        tcp_retransmits() - rto_before,
+        cwnd_min,
+        got.len(),
+        total,
+        in_order,
+        ok,
     );
     ok
 }

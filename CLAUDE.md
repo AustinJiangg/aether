@@ -323,8 +323,15 @@ half of AIMD) — when the Stage 21e retransmit timer (`on_tick`) resends a segm
 which lowers `ssthresh` to `max(flight/2, 2*MSS)` and collapses `cwnd` back to one MSS (re-entering slow start,
 so `cwnd` then ramps up and eventually crosses `ssthresh` into congestion avoidance). Proved via loopback by
 growing `cwnd`, then dropping a segment so the RTO fires and backs the sender off ("cwnd 7168 -> 1059,
-ssthresh 4294967295 -> 2048") while the bytes still recover in order. `ROADMAP.md` records the full staged
-history (stages 0-22d-2).
+ssthresh 4294967295 -> 2048") while the bytes still recover in order. **Stage 22d-3 is also done — fast
+retransmit + fast recovery, completing Stage 22d (congestion control) and the whole roadmap.** `process_ack`
+counts duplicate ACKs; the third fires a **fast retransmit** (`on_established` resends the missing segment at
+once, before the RTO) and enters **fast recovery** (halve `ssthresh`, set `cwnd = ssthresh + 3*MSS` rather
+than collapsing to one MSS, deflating back to `ssthresh` on the recovering ACK). The loopback receive window
+(`RCV_WINDOW_MAX`) was enlarged from two to eight MSS so four segments fit in flight (one lost + three dup
+ACKs). Proved via loopback by bursting four segments with the first dropped ("fast-retransmits 1, rto-resends
+0, cwnd-min-after-loss 2048"). `ROADMAP.md` records the full staged history (stages 0-22d-3 — the roadmap is
+now complete).
 
 ## Language and writing conventions
 
@@ -850,7 +857,16 @@ Exit QEMU: `Ctrl-A` then `X`.
   `cwnd` re-ramps and eventually crosses the lowered `ssthresh` into congestion avoidance — the branch 22d-1
   could not reach). The `slow_start_threshold` accessor backs `net::tcp_congestion_backoff_loopback_selftest`,
   which grows `cwnd`, drops a segment (the 21e `DROP_NEXT_TCP_TX` hook) so the RTO fires, and confirms `cwnd`
-  falls back to ~one MSS and `ssthresh` drops while the bytes recover in order.
+  falls back to ~one MSS and `ssthresh` drops while the bytes recover in order. **Stage 22d-3** adds **fast
+  retransmit + fast recovery**: `process_ack` (now returning whether to fast-retransmit) counts consecutive
+  **duplicate ACKs** (an ACK advancing nothing, no payload, data outstanding), and the third
+  (`DUP_ACK_THRESHOLD`) fires a fast retransmit — `on_established` resends the head of the retransmit queue at
+  once, before the RTO — and enters fast recovery (`ssthresh` halves, `cwnd = ssthresh + 3*MSS` instead of
+  collapsing to one MSS; further dup ACKs inflate it by an MSS, the recovering new ACK deflates it back to
+  `ssthresh`). `RCV_WINDOW_MAX` was raised from two to eight MSS so four segments fit in flight (one lost +
+  three dup ACKs). The `fast_retransmits` counter backs `net::tcp_fast_retransmit_loopback_selftest`, which
+  bursts four segments with the first dropped and confirms the fast retransmit fired, the RTO never did, and
+  `cwnd` only halved (not collapsed). This completes Stage 22d and the roadmap.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

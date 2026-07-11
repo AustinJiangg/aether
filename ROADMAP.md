@@ -711,7 +711,8 @@ unify later.
 > window, confirms it caps in-flight data at the window and buffers the excess (segmented into ≥2 MSS
 > pieces), then drains the receiver so the buffered remainder flows out — via the probe — until all bytes
 > arrive **in order** and acknowledged — boot logs "TCP sender window over loopback = true (... delivered
-> 2560/2560 in order)". Verified by 76 tests (the new `tcp_sender_obeys_peer_window`). This completes the
+> 8704/8704 in order)" (the window was two MSS when 22c landed; Stage 22d-3 later enlarged it to eight).
+> Verified by 76 tests (the new `tcp_sender_obeys_peer_window`). This completes the
 > bidirectional sliding window (receiver advertises, sender obeys, zero-window probe). (**Congestion
 > control** — slow start / congestion avoidance / fast retransmit, pacing the sender to the *network*
 > rather than the peer — is the remaining refinement, Stage 22d.)
@@ -729,7 +730,7 @@ unify later.
 > `min(snd_wnd, cwnd)` — `flush` takes the smaller of the peer's advertised window and `cwnd` — so whichever
 > of the receiver or the network is the tighter bottleneck governs. `cwnd` is not advertised; the sender
 > infers it: it starts at one **MSS** (`INIT_CWND`, deliberately small so the ramp is visible and so `cwnd`,
-> not the two-MSS loopback receive window, is the binding limit early) and `grow_cwnd` — called on every ACK
+> not the loopback receive window, is the binding limit early) and `grow_cwnd` — called on every ACK
 > that confirms new data (`process_ack`) — adds one MSS per ACK while `cwnd < ssthresh` (**slow start**:
 > `cwnd` doubles every RTT, exponential, since a full window yields `cwnd/MSS` ACKs per round trip), or
 > `MSS*MSS/cwnd` per ACK once `cwnd >= ssthresh` (**congestion avoidance**: ~one MSS per RTT, linear). A pure
@@ -739,8 +740,8 @@ unify later.
 > via PHY loopback: `tcp_congestion_control_loopback_selftest` establishes a connection (initial `cwnd` = one
 > MSS), streams 8 KiB while draining the receiver so ACKs flow, and confirms `cwnd` climbs well above its
 > initial value (boot logs "cwnd 1024 -> 9216") with every byte still in order. Because `INIT_CWND` (one MSS)
-> is now smaller than the two-MSS loopback receive window, the sender's *first* burst is one segment, not two,
-> so `cwnd` genuinely binds — the Stage 22c `tcp_sender_window_loopback_selftest` was updated to count its
+> is smaller than the loopback receive window, the sender's *first* burst is a single segment (not a full
+> window), so `cwnd` genuinely binds — the Stage 22c `tcp_sender_window_loopback_selftest` was updated to count its
 > segmentation over the whole transfer (slow start spreads the pieces over several round trips) rather than
 > the first instant. Verified by 77 tests (the new `tcp_grows_congestion_window`).
 >
@@ -760,6 +761,30 @@ unify later.
 > and every byte still arrives in order. Verified by 78 tests (the new `tcp_backs_off_on_loss`). (Remaining:
 > Stage 22d-3, fast retransmit / fast recovery on three duplicate ACKs — recover from a single loss without
 > waiting for the full RTO.)
+>
+> **Stage 22d-3 is done — fast retransmit + fast recovery, completing Stage 22d (congestion control), Stage 22
+> (TCP refinements), the networking track, and the whole roadmap.** Stage 22d-2 recovered a loss only via the
+> RTO: wait a whole timeout, then collapse `cwnd` to one MSS. Fast retransmit recovers **sooner** and
+> **gentler**. When a segment is lost but later ones arrive, the receiver re-ACKs the same byte (a **duplicate
+> ACK**) for each; `process_ack` now counts consecutive dup ACKs (an ACK advancing nothing, no payload, data
+> still outstanding), and the **third** (`DUP_ACK_THRESHOLD`) fires a **fast retransmit** — `on_established`
+> resends the missing segment (the head of the retransmit queue) immediately, before the RTO. That also enters
+> **fast recovery**: `ssthresh` halves (like an RTO) but `cwnd` is set to `ssthresh + 3*MSS` (the three dup
+> ACKs mean three segments already left the network) rather than collapsing to one MSS — each further dup ACK
+> inflates `cwnd` by an MSS, and the first new ACK deflates it back to `ssthresh` and exits recovery. Because
+> three dup ACKs need one lost segment plus three later ones in flight at once — four segments — the receive
+> window `RCV_WINDOW_MAX` was enlarged from two to eight MSS (2048 → 8192); every self-test uses the dynamic
+> window value, so this only enlarges the numbers they exercise (the Stage 22b/22c logs now show an 8192-byte
+> window). Proved deterministically with no peer via PHY loopback: `tcp_fast_retransmit_loopback_selftest`
+> grows `cwnd` past four MSS, then bursts four MSS-sized segments with the first dropped (the Stage 21e
+> `DROP_NEXT_TCP_TX` hook); the three that arrive trigger three dup ACKs and a fast retransmit — boot logs
+> "fast-retransmits 1, rto-resends 0, cwnd-min-after-loss 2048", confirming recovery beat the RTO timer
+> (`rto-resends 0`), `cwnd` only halved to two MSS (not one, so it was fast recovery), and all bytes arrived in
+> order. Verified by 79 tests (the new `tcp_fast_retransmits_on_dup_acks`). **This completes the from-scratch
+> TCP: reliable ordered delivery, the full close handshake, retransmission, out-of-order reassembly, the
+> bidirectional sliding window, and congestion control (slow start, congestion avoidance, AIMD backoff, and
+> fast retransmit / fast recovery) — over the hand-written Ethernet/ARP/IPv4/UDP stack and the
+> interrupt-driven e1000.**
 
 | Stage | Track | What to build | OS concepts |
 |-------|-------|---------------|-------------|

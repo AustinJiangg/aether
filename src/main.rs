@@ -965,6 +965,18 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             let tcp_bk_ok = net::tcp_congestion_backoff_loopback_selftest();
             serial_println!("[ OK ] net 22d-2: TCP congestion backoff over loopback = {}", tcp_bk_ok);
 
+            // Stage 22d-3 (networking): fast retransmit + fast recovery. Three duplicate ACKs (a later
+            // segment arrived but an earlier one is missing) let the sender recover a loss without waiting
+            // for the full RTO, and only halve cwnd instead of collapsing it (the dup ACKs prove data still
+            // flows). Prove it via loopback: burst four segments with the first dropped, so the three that
+            // arrive trigger three dup ACKs and a fast retransmit — recovered before the timer, cwnd intact.
+            let tcp_fr_ok = net::tcp_fast_retransmit_loopback_selftest();
+            serial_println!(
+                "[ OK ] net 22d-3: TCP fast retransmit over loopback = {} ({} fast retransmit(s) total)",
+                tcp_fr_ok,
+                net::tcp_fast_retransmits(),
+            );
+
             match net::ping(gw) {
                 Some(seq) => {
                     serial_println!(

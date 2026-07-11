@@ -182,9 +182,11 @@ pub fn checksum(src_ip: [u8; 4], dst_ip: [u8; 4], segment: &[u8]) -> u16 {
 
 /// Stage 22b: the maximum receive buffer, in bytes — the largest window we ever advertise. Kept modest
 /// (a real stack uses tens of KiB, auto-tuned) so a self-test can fill it and drive the window to zero
-/// cheaply. The window we actually advertise on each segment is this minus the unread bytes already
-/// buffered (`recv_window`), so it shrinks as data piles up unread and reopens when the app reads.
-const RCV_WINDOW_MAX: usize = 2048;
+/// cheaply, but large enough to hold **several `MSS`-sized segments** — Stage 22d-3's fast-retransmit test
+/// needs four segments in flight at once (one lost, three later ones each triggering a duplicate ACK), so a
+/// two-segment window would be too small. The window we actually advertise on each segment is this minus the
+/// unread bytes already buffered (`recv_window`), so it shrinks as data piles up unread and reopens on a read.
+const RCV_WINDOW_MAX: usize = 8192;
 
 /// Stage 22b: the receive window to advertise given `rx_used` unread bytes already buffered — the free
 /// space left in the receive buffer, clamped to the 16-bit window field. Zero means "stop sending".
@@ -219,6 +221,12 @@ const INIT_CWND: u32 = MSS as u32;
 /// arbitrarily high, so a fresh connection begins in slow start and stays there until the first loss
 /// lowers it (Stage 22d-2). Until then the congestion-avoidance branch of [`grow_cwnd`] is unreachable.
 const INIT_SSTHRESH: u32 = u32::MAX;
+
+/// Stage 22d-3: how many **duplicate ACKs** (ACKs that acknowledge no new data, so the peer is still stuck
+/// waiting for the same byte) trigger a **fast retransmit** — resend the missing segment at once, without
+/// waiting for the RTO. Three is the classic RFC 5681 value: one or two dup ACKs may just be reordering
+/// (a later segment overtaking an earlier one), but a third strongly implies the earlier segment was lost.
+const DUP_ACK_THRESHOLD: u32 = 3;
 
 // Stage 21e: retransmission-timer constants. Time is measured in timer ticks (`interrupts::timer_ticks`,
 // 100 Hz, so 1 tick = 10 ms). A real stack estimates the retransmission timeout from measured round-trip
@@ -294,6 +302,15 @@ pub fn data_segments_sent() -> u64 {
     DATA_SEGMENTS_SENT.load(Ordering::Relaxed)
 }
 
+/// Stage 22d-3: how many **fast retransmits** have fired since boot — a segment resent on the third
+/// duplicate ACK rather than on a retransmission timeout. A test reads it to confirm the fast path ran.
+static FAST_RETRANSMITS: AtomicU64 = AtomicU64::new(0);
+
+/// Total fast retransmits since boot (Stage 22d-3; see [`FAST_RETRANSMITS`]).
+pub fn fast_retransmits() -> u64 {
+    FAST_RETRANSMITS.load(Ordering::Relaxed)
+}
+
 /// The connection lifecycle states (RFC 793). The opening subset — `Closed`/`Listen`/`SynSent`/
 /// `SynReceived`/`Established` — is the three-way handshake (Stage 21b); the rest are the **teardown**
 /// states of the FIN handshake (Stage 21d). TCP is full-duplex, so each direction closes independently:
@@ -350,6 +367,14 @@ struct Tcb {
     /// start's exponential growth to congestion avoidance's linear growth. Starts high (see
     /// [`INIT_SSTHRESH`]) and is lowered to about half the flight on a loss.
     ssthresh: u32,
+    /// Stage 22d-3: count of consecutive **duplicate ACKs** received (each acknowledging no new data while
+    /// data is still outstanding). Reset to zero by any ACK that advances `snd_una`. Reaching
+    /// [`DUP_ACK_THRESHOLD`] fires a fast retransmit and enters fast recovery.
+    dup_acks: u32,
+    /// Stage 22d-3: whether the connection is in **fast recovery** — the window between a fast retransmit and
+    /// the ACK that acknowledges the recovered data. While set, each further dup ACK inflates `cwnd` by one
+    /// MSS; the first new ACK deflates `cwnd` back to `ssthresh` and clears this.
+    in_fast_recovery: bool,
     /// Receive space: `nxt` = next seq we expect from the peer, `irs` = the peer's initial seq.
     rcv_nxt: u32,
     irs: u32,
@@ -401,6 +426,8 @@ pub fn open_passive(local_port: u16) {
         snd_buf: Vec::new(),
         cwnd: INIT_CWND,
         ssthresh: INIT_SSTHRESH,
+        dup_acks: 0,
+        in_fast_recovery: false,
         rcv_nxt: 0,
         irs: 0,
         rx: Vec::new(),
@@ -433,6 +460,8 @@ pub fn open_active(
         snd_buf: Vec::new(),
         cwnd: INIT_CWND,
         ssthresh: INIT_SSTHRESH,
+        dup_acks: 0,
+        in_fast_recovery: false,
         rcv_nxt: 0, // unknown until the SYN-ACK tells us the peer's ISN
         irs: 0,
         rx: Vec::new(),
@@ -656,29 +685,61 @@ fn build_ack(tcb: &Tcb, local_ip: [u8; 4], remote_ip: [u8; 4]) -> Vec<u8> {
 /// Accepts an ack in `(snd_una, snd_nxt]` using wrapping arithmetic (so it stays correct across a
 /// sequence-number wrap); a duplicate ack (`ack == snd_una`) is a harmless no-op, and an ack beyond
 /// `snd_nxt` is ignored. After a FIN we sent, `snd_una == snd_nxt` therefore means our FIN was acked.
-fn process_ack(tcb: &mut Tcb, seg: &Segment) {
+/// Process an incoming acknowledgement (see the field-level comments). Returns `true` when the third
+/// duplicate ACK just fired a **fast retransmit** (Stage 22d-3), so the caller should resend the missing
+/// segment now; `false` otherwise.
+fn process_ack(tcb: &mut Tcb, seg: &Segment) -> bool {
     if seg.flags & ACK == 0 {
-        return;
+        return false;
     }
     // Stage 22c: track the peer's advertised window from every acceptable ACK (including a pure
     // window-update / duplicate ACK), so the sender's [`flush`] paces to it.
     tcb.snd_wnd = seg.window as u32;
     let acked = seg.ack.wrapping_sub(tcb.snd_una);
     let outstanding = tcb.snd_nxt.wrapping_sub(tcb.snd_una);
-    if acked <= outstanding {
-        tcb.snd_una = seg.ack;
-        // Stage 22d: an ACK that confirmed new data (`acked != 0`) reached the peer without loss is the
-        // signal that the network is coping — grow the congestion window. A pure duplicate or
-        // window-update ACK has `acked == 0` and must not grow it (a duplicate ACK is, in fact, a *hint of*
-        // loss — Stage 22d-3 will count them for fast retransmit).
-        if acked != 0 {
+    let mss = MSS as u32;
+
+    // Stage 22d-3: a *duplicate* ACK — acknowledges no new data (`acked == 0`) while data is still
+    // outstanding and carries no payload/SYN/FIN — hints that a later segment reached the peer but an
+    // earlier one is missing. Count consecutive ones; the third fires a fast retransmit + fast recovery.
+    if acked == 0 && outstanding > 0 && seg.payload.is_empty() && seg.flags & (SYN | FIN) == 0 {
+        tcb.dup_acks += 1;
+        if tcb.dup_acks == DUP_ACK_THRESHOLD {
+            // Multiplicative decrease, but gentler on `cwnd` than an RTO: halve `ssthresh` to the flight
+            // size, then set `cwnd` to `ssthresh` plus the three segments that have already left the network
+            // (the three dup ACKs). Tell the caller to retransmit the missing segment now, not at the RTO.
+            tcb.ssthresh = core::cmp::max(outstanding / 2, 2 * mss);
+            tcb.cwnd = tcb.ssthresh + DUP_ACK_THRESHOLD * mss;
+            tcb.in_fast_recovery = true;
+            FAST_RETRANSMITS.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        if tcb.in_fast_recovery {
+            // Each further dup ACK during recovery means another segment left the network — inflate `cwnd`
+            // by one MSS so new data can flow out to keep the pipe full.
+            tcb.cwnd = tcb.cwnd.saturating_add(mss);
+        }
+        return false;
+    }
+
+    // A new ACK that advances the window (acknowledges new data).
+    if acked != 0 && acked <= outstanding {
+        if tcb.in_fast_recovery {
+            // Recovery is over: deflate `cwnd` back to `ssthresh` (RFC 5681) and leave fast recovery.
+            tcb.cwnd = tcb.ssthresh;
+            tcb.in_fast_recovery = false;
+        } else {
+            // Stage 22d: an ACK confirming new data without loss means the network is coping — grow `cwnd`.
             grow_cwnd(tcb, acked);
         }
+        tcb.dup_acks = 0;
+        tcb.snd_una = seg.ack;
         // Stage 21e: drop every queued segment the peer has now cumulatively acknowledged, so the
         // retransmission timer stops resending it.
         let una = tcb.snd_una;
         tcb.retransmit.retain(|u| !seq_leq(u.end_seq, una));
     }
+    false
 }
 
 /// Stage 22d: grow the congestion window after an ACK confirmed `acked` new bytes, per RFC 5681. Two modes,
@@ -732,7 +793,15 @@ fn on_established(
     remote_ip: [u8; 4],
     seg: &Segment,
 ) -> Option<Vec<u8>> {
-    process_ack(tcb, seg);
+    // Stage 22d-3: a third duplicate ACK fires a fast retransmit — resend the missing segment (the head of
+    // the retransmit queue) immediately instead of waiting for the RTO. A dup ACK carries no data or FIN, so
+    // there is nothing else to process for this segment; return the resent segment as the response.
+    if process_ack(tcb, seg) {
+        if let Some(u) = tcb.retransmit.first_mut() {
+            u.deadline = now_ticks() + RTO_TICKS; // push the RTO out so on_tick does not also resend it
+            return Some(u.segment.clone());
+        }
+    }
 
     // Accept stream data with **reassembly** (Stage 22a): in-order bytes extend the stream and let any
     // buffered out-of-order bytes be spliced in behind them, while a segment ahead of `rcv_nxt` (a gap

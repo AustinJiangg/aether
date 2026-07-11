@@ -1348,6 +1348,23 @@ fn tcp_backs_off_on_loss() {
     );
 }
 
+/// Stage 22d-3: TCP fast retransmit + fast recovery via loopback (no external peer). Grow cwnd past four
+/// MSS, then burst four segments with the first dropped: the three that arrive trigger three duplicate ACKs,
+/// whose third fires a fast retransmit of the missing segment — recovering before the RTO would, and only
+/// halving cwnd (fast recovery) instead of collapsing it. Exercises the dup-ACK counter, the fast-retransmit
+/// trigger, and the cwnd inflate/deflate of fast recovery. Also confirms the RTO timer never fired.
+#[test_case]
+fn tcp_fast_retransmits_on_dup_acks() {
+    use crate::net;
+
+    assert!(crate::e1000::present(), "e1000 not initialized");
+    assert!(
+        net::tcp_fast_retransmit_loopback_selftest(),
+        "TCP fast retransmit over loopback failed"
+    );
+    assert!(net::tcp_fast_retransmits() > 0, "no fast retransmit ever fired");
+}
+
 /// Stage 19b-2: the live DNS resolver — resolve a hostname through SLIRP's DNS server over the wire.
 /// Unlike the SLIRP-internal gateway ping, this depends on the *host* having working upstream DNS
 /// (SLIRP forwards to it), so the test is lenient: it always exercises the full path (build the query,
