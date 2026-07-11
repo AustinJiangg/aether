@@ -347,7 +347,12 @@ a 4-byte boundary with the data offset set to match (`build` is now its no-optio
 `options` slice + a `sack_permitted()` accessor over a bounds-checked TLV walker (`find_option`). The handshake
 negotiates: our SYN always offers SACK-permitted, a listener echoes it in its SYN-ACK only if the SYN carried
 it, and each end records the result on `Tcb::sack_permitted` (so SACK is on only if both SYNs offered it).
-`ROADMAP.md` records the full staged history (stages 0-22d-3 complete, Stage 23a-23c and 23d-1 done).
+**Stage 23d-2a is also done**: the receiver advertises **SACK blocks** — when SACK is negotiated and
+out-of-order data is buffered, `build_ack` attaches an RFC 2018 SACK option (`kind 5`) whose `[left, right)`
+ranges (`sack_blocks` coalesces `Tcb::ooo`) tell the sender exactly which segments already arrived, so a
+duplicate ACK now names the received range; the sender does not yet act on it (that is 23d-2b), so behavior is
+unchanged. `ROADMAP.md` records the full staged history (stages 0-22d-3 complete, Stage 23a-23c and
+23d-1/23d-2a done).
 
 ## Language and writing conventions
 
@@ -905,7 +910,12 @@ Exit QEMU: `Ctrl-A` then `X`.
   (`build` delegates to it with no options), `Segment` exposes an `options` slice + `sack_permitted()` over a
   bounds-checked TLV walker (`find_option`), and the SYN/SYN-ACK carry the RFC 2018 **SACK-permitted** option,
   negotiated onto `Tcb::sack_permitted` (both SYNs must offer it). `net::tcp_sack_negotiation_loopback_selftest`
-  confirms both ends of a loopback handshake enable SACK.
+  confirms both ends of a loopback handshake enable SACK. Stage 23d-2a adds the **SACK option** (`kind 5`):
+  `sack_blocks` coalesces the out-of-order queue (`Tcb::ooo`) into `[left, right)` ranges, `build_sack_option`
+  encodes them, `Segment::sack_blocks`/`parse_sack_blocks` decode them, and `build_ack` attaches the option
+  whenever SACK is negotiated and out-of-order data is buffered — so a dup ACK reports exactly what arrived
+  (`sack_acks_sent` counts them). The sender ignores the blocks until 23d-2b.
+  `net::tcp_sack_blocks_loopback_selftest` reorders two segments and confirms the dup ACK carried SACK.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

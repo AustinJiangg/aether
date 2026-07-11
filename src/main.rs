@@ -1005,6 +1005,13 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             let tcp_sack_ok = net::tcp_sack_negotiation_loopback_selftest();
             serial_println!("[ OK ] net 23d-1: TCP SACK-permitted negotiated = {}", tcp_sack_ok);
 
+            // Stage 23d-2a (networking): the receiver reports out-of-order data in SACK option blocks. When a
+            // segment arrives ahead of the missing one, the dup ACK now carries a SACK block naming the range
+            // it holds, so the sender (23d-2b) will learn exactly what to retransmit. Prove it via loopback:
+            // reorder two segments and confirm the receiver emitted a SACK-carrying ACK and still reassembled.
+            let tcp_sack_blk_ok = net::tcp_sack_blocks_loopback_selftest();
+            serial_println!("[ OK ] net 23d-2a: TCP SACK blocks advertised = {}", tcp_sack_blk_ok);
+
             match net::ping(gw) {
                 Some(seq) => {
                     serial_println!(

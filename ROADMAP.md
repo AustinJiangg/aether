@@ -797,7 +797,7 @@ unify later.
 
 ## Post-roadmap tracks (Stage 23+)
 
-> **Status: in progress — Stage 23a-23c and 23d-1 done.** With the original roadmap complete (stages 0-22d-3), four independent
+> **Status: in progress — Stage 23a-23c and 23d-1/23d-2a done.** With the original roadmap complete (stages 0-22d-3), four independent
 > follow-on tracks extend it. They are **not** strictly ordered by dependency, but the recommended sequence
 > is **23 → 24 → 25 → 26**, chosen by risk and blast radius: do the isolated TCP polish first (it rides the
 > momentum of the just-finished TCP work), then the socket capstone that makes the stack usable, then the
@@ -871,6 +871,25 @@ Isolated to `net/tcp.rs` plus a few `net/mod.rs` self-tests; no new subsystems, 
 > tests (the pure `tcp_sack_permitted_option_round_trips` — a SYN's option round-trips through build/parse
 > with the enlarged data offset and a valid checksum — and the live `tcp_negotiates_sack_over_loopback`).
 > (Remaining: Stage 23d-2, SACK blocks in ACKs + the sender retransmitting only the holes.)
+>
+> **Stage 23d-2a is done — the receiver advertises SACK blocks.** Now that SACK is negotiated (23d-1), the
+> receiver reports its **out-of-order data** to the sender. The RFC 2018 **SACK option** (`kind 5`) carries a
+> list of `[left, right)` sequence ranges the receiver has buffered *above* the cumulative `ack`, so the
+> sender learns exactly which segments already arrived. In `net/tcp.rs`: `sack_blocks` coalesces the
+> reassembly queue (`Tcb::ooo`) into maximal contiguous ranges (sorted by distance past `rcv_nxt`, capped at
+> four); `build_sack_option` encodes them with the conventional two-NOP alignment; `parse_sack_blocks` /
+> `Segment::sack_blocks` decode them (for the sender in 23d-2b and the test); and `build_ack` — the workhorse
+> for every ACK — now attaches a SACK option whenever SACK is negotiated and out-of-order data is buffered,
+> so a **duplicate ACK for a reordered segment tells the sender precisely what to keep** (counted in
+> `SACK_ACKS_SENT`). The sender does not yet act on the blocks — `process_ack` still ignores the option — so
+> existing behavior is unchanged (a SACK block is purely additive information). Proved deterministically with
+> no peer via PHY loopback, reusing the Stage 22a `REORDER_NEXT_TCP_TX` hook:
+> `tcp_sack_blocks_loopback_selftest` sends two segments reordered so the second is buffered out of order, and
+> confirms the receiver's dup ACK carried a SACK option (`sack_acks_sent` rose) while the stream still
+> reassembled in order — boot logs "TCP SACK blocks loopback selftest: sack-acks 1, reassembled true". Verified
+> by 87 tests (the pure `tcp_sack_option_round_trips` — two ranges round-trip through build/parse with a valid
+> checksum and the enlarged data offset — and the live `tcp_advertises_sack_blocks`). (Remaining: Stage 23d-2b,
+> the sender consuming the blocks to retransmit only the holes.)
 
 | Sub-step | What to build | OS concepts | Smallest verifiable step |
 |----------|---------------|-------------|--------------------------|

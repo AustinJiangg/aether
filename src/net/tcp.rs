@@ -79,6 +79,13 @@ const OPT_NOP: u8 = 1; // no-operation, one byte, used to align a following opti
 const OPT_SACK_PERMITTED: u8 = 4;
 /// The SACK-permitted option's on-the-wire bytes (`[kind, length]`, no value).
 const SACK_PERMITTED_OPTION: [u8; 2] = [OPT_SACK_PERMITTED, 2];
+/// Stage 23d-2: RFC 2018 **SACK** — the option carrying the actual selectively-acknowledged ranges. Its
+/// value is a list of `[left_edge, right_edge)` pairs (each two big-endian `u32`s), so its length is
+/// `2 + 8 * blocks`. Sent in an ACK to report data received *out of order* (above the cumulative `ack`).
+const OPT_SACK: u8 = 5;
+/// The most SACK blocks one option can carry: the option length is a single byte and the header holds at
+/// most 40 option bytes, so `2 + 8*4 = 34` fits four blocks (RFC 2018's limit without a timestamp option).
+const MAX_SACK_BLOCKS: usize = 4;
 
 /// Find the value bytes of the first option of kind `want` in a TCP option field, or `None` if it is
 /// absent. Walks the TLV sequence, honoring the one-byte END (stop) and NOP (skip-one) options, and is
@@ -104,6 +111,39 @@ fn find_option(options: &[u8], want: u8) -> Option<&[u8]> {
         }
     }
     None
+}
+
+/// Stage 23d-2: encode a **SACK option** carrying `blocks` (each a `[left, right)` sequence range received
+/// out of order). Two leading NOPs align the 8-byte blocks onto a 4-byte boundary — the conventional
+/// `NOP NOP SACK ...` layout — so the whole option is `4 + 8*n` bytes, already a multiple of 4. At most
+/// [`MAX_SACK_BLOCKS`] blocks are emitted. Pass to [`build_with_options`] as the `options` argument.
+pub fn build_sack_option(blocks: &[(u32, u32)]) -> Vec<u8> {
+    let n = blocks.len().min(MAX_SACK_BLOCKS);
+    let mut opt = Vec::with_capacity(4 + 8 * n);
+    opt.push(OPT_NOP);
+    opt.push(OPT_NOP);
+    opt.push(OPT_SACK);
+    opt.push((2 + 8 * n) as u8); // option length: the kind + length bytes plus n 8-byte blocks
+    for &(left, right) in &blocks[..n] {
+        opt.extend_from_slice(&left.to_be_bytes());
+        opt.extend_from_slice(&right.to_be_bytes());
+    }
+    opt
+}
+
+/// Stage 23d-2: decode the `[left, right)` ranges from a segment's **SACK option**, or an empty list if it
+/// carries none. Reads only whole 8-byte pairs ([`slice::chunks_exact`] drops any trailing partial block, so
+/// a malformed option cannot misread).
+fn parse_sack_blocks(options: &[u8]) -> Vec<(u32, u32)> {
+    let mut blocks = Vec::new();
+    if let Some(value) = find_option(options, OPT_SACK) {
+        for b in value.chunks_exact(8) {
+            let left = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+            let right = u32::from_be_bytes([b[4], b[5], b[6], b[7]]);
+            blocks.push((left, right));
+        }
+    }
+    blocks
 }
 
 /// A parsed, borrowed TCP segment. `payload` borrows the caller's buffer, starting after the header (and
@@ -157,6 +197,13 @@ impl<'a> Segment<'a> {
     /// connection.
     pub fn sack_permitted(&self) -> bool {
         find_option(self.options, OPT_SACK_PERMITTED).is_some()
+    }
+
+    /// Stage 23d-2: the `[left, right)` sequence ranges named by this segment's **SACK option** (empty if it
+    /// has none). The sender reads these off an incoming ACK to learn which out-of-order segments the peer
+    /// already holds, so it can retransmit only the gaps between them (Stage 23d-2b).
+    pub fn sack_blocks(&self) -> Vec<(u32, u32)> {
+        parse_sack_blocks(self.options)
     }
 }
 
@@ -410,6 +457,15 @@ static ACKS_SENT: AtomicU64 = AtomicU64::new(0);
 /// Total ACK segments built since boot (Stage 23b; see [`ACKS_SENT`]).
 pub fn acks_sent() -> u64 {
     ACKS_SENT.load(Ordering::Relaxed)
+}
+
+/// Stage 23d-2a: how many ACKs carried a **SACK option** (built while out-of-order data was buffered). A
+/// test reads it to confirm the receiver actually reported its out-of-order ranges to the sender.
+static SACK_ACKS_SENT: AtomicU64 = AtomicU64::new(0);
+
+/// Total SACK-carrying ACKs built since boot (Stage 23d-2a; see [`SACK_ACKS_SENT`]).
+pub fn sack_acks_sent() -> u64 {
+    SACK_ACKS_SENT.load(Ordering::Relaxed)
 }
 
 /// The connection lifecycle states (RFC 793). The opening subset — `Closed`/`Listen`/`SynSent`/
@@ -822,11 +878,60 @@ fn step(tcb: &mut Tcb, local_ip: [u8; 4], remote_ip: [u8; 4], seg: &Segment) -> 
     }
 }
 
+/// Stage 23d-2a: the **SACK blocks** to advertise — the out-of-order reassembly queue ([`Tcb::ooo`])
+/// coalesced into maximal contiguous `[left, right)` ranges, each above the cumulative `rcv_nxt`. Sorted by
+/// distance past `rcv_nxt` (wrap-correct within the window) and capped at [`MAX_SACK_BLOCKS`]. Empty when no
+/// data is held out of order. (RFC 2018 SHOULD list the most recently received block first; we sort by
+/// sequence instead — simpler, and our own sender consumes the blocks in any order.)
+fn sack_blocks(tcb: &Tcb) -> Vec<(u32, u32)> {
+    if tcb.ooo.is_empty() {
+        return Vec::new();
+    }
+    let base = tcb.rcv_nxt;
+    let mut ranges: Vec<(u32, u32)> = tcb
+        .ooo
+        .iter()
+        .map(|o| (o.seq, o.seq.wrapping_add(o.data.len() as u32)))
+        .collect();
+    ranges.sort_by_key(|&(left, _)| left.wrapping_sub(base));
+    // Coalesce ranges that overlap or abut the previous block into one.
+    let mut merged: Vec<(u32, u32)> = Vec::new();
+    for (left, right) in ranges {
+        match merged.last_mut() {
+            Some(last) if seq_leq(left, last.1) => {
+                if seq_lt(last.1, right) {
+                    last.1 = right;
+                }
+            }
+            _ => merged.push((left, right)),
+        }
+    }
+    merged.truncate(MAX_SACK_BLOCKS);
+    merged
+}
+
 /// Build a bare ACK for this connection's current sequence state (`seq = snd_nxt`, `ack = rcv_nxt`). The
 /// workhorse reply of every acknowledging state — data receipt, a FIN, or a re-ACK of a retransmission.
+/// Stage 23d-2a: when SACK is negotiated and out-of-order data is buffered, the ACK also carries a SACK
+/// option naming those received ranges, so the sender (23d-2b) learns exactly which segments arrived.
 fn build_ack(tcb: &Tcb, local_ip: [u8; 4], remote_ip: [u8; 4]) -> Vec<u8> {
     ACKS_SENT.fetch_add(1, Ordering::Relaxed); // Stage 23b: count ACKs so a test can see delayed ACK coalesce them
-    build(
+    let blocks = if tcb.sack_permitted { sack_blocks(tcb) } else { Vec::new() };
+    if blocks.is_empty() {
+        return build(
+            local_ip,
+            remote_ip,
+            tcb.local_port,
+            tcb.remote_port,
+            tcb.snd_nxt,
+            tcb.rcv_nxt,
+            ACK,
+            recv_window(tcb),
+            &[],
+        );
+    }
+    SACK_ACKS_SENT.fetch_add(1, Ordering::Relaxed);
+    build_with_options(
         local_ip,
         remote_ip,
         tcb.local_port,
@@ -835,6 +940,7 @@ fn build_ack(tcb: &Tcb, local_ip: [u8; 4], remote_ip: [u8; 4]) -> Vec<u8> {
         tcb.rcv_nxt,
         ACK,
         recv_window(tcb),
+        &build_sack_option(&blocks),
         &[],
     )
 }

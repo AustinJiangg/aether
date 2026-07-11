@@ -1073,6 +1073,78 @@ pub fn tcp_reassembly_loopback_selftest() -> bool {
     ok
 }
 
+/// Stage 23d-2a self-test of the receiver's **SACK block** emission, via PHY loopback (no external peer).
+/// Mirrors [`tcp_reassembly_loopback_selftest`]: send a payload as two segments with the reorder hook armed
+/// so the second reaches the receiver first, leaving a gap. With SACK negotiated (every SYN now offers it),
+/// the dup ACK the receiver sends for that out-of-order segment must carry a **SACK option** naming the
+/// buffered range — so `sack_acks_sent` rises — and the stream still reassembles in order once the gap
+/// fills. Returns whether a SACK-carrying ACK was emitted and all bytes arrived in order.
+pub fn tcp_sack_blocks_loopback_selftest() -> bool {
+    tcp::reset_connections();
+    let port: u16 = 7783;
+    tcp::open_passive(port);
+
+    REORDER_NEXT_TCP_TX.store(false, Ordering::Release);
+    *HELD_TCP_TX.lock() = None;
+    e1000::set_loopback(true);
+    let mut sink = [0u8; 2048];
+    while e1000::poll_frame(&mut sink).is_some() {}
+
+    let client_port = match tcp_connect(our_ip(), port) {
+        Some(p) => p,
+        None => {
+            e1000::set_loopback(false);
+            serial_println!("[net] TCP SACK blocks loopback selftest: handshake failed");
+            return false;
+        }
+    };
+    for _ in 0..200 {
+        if tcp::established_count() >= 2 {
+            break;
+        }
+        poll();
+        crate::apic::pit_sleep_us(500);
+    }
+
+    // Send the two segments at once (no Nagle hold), reordered so #2 lands before #1 and is buffered.
+    tcp::set_nodelay(client_port, port, true);
+    let payload = b"aether tcp sack 23d-2a: selective ack blocks";
+    let split = 20;
+    let sack_before = tcp::sack_acks_sent();
+    REORDER_NEXT_TCP_TX.store(true, Ordering::Release);
+    tcp_send(client_port, port, &payload[..split]); // #1: held back by the hook
+    tcp_send(client_port, port, &payload[split..]); // #2: sent first -> buffered out of order -> SACK dup-ACK
+
+    let mut sack_seen = false;
+    let mut reassembled = false;
+    for _ in 0..2000 {
+        poll();
+        if tcp::sack_acks_sent() > sack_before {
+            sack_seen = true; // the receiver reported its out-of-order range in a SACK option
+        }
+        if tcp::received_data(port, client_port).as_deref() == Some(&payload[..])
+            && tcp::all_data_acked(client_port, port) == Some(true)
+        {
+            reassembled = true;
+            break;
+        }
+        crate::apic::pit_sleep_us(500);
+    }
+
+    REORDER_NEXT_TCP_TX.store(false, Ordering::Release);
+    *HELD_TCP_TX.lock() = None;
+    e1000::set_loopback(false);
+
+    let ok = sack_seen && reassembled;
+    serial_println!(
+        "[net] TCP SACK blocks loopback selftest: sack-acks {}, reassembled {}, ok = {}",
+        tcp::sack_acks_sent() - sack_before,
+        reassembled,
+        ok,
+    );
+    ok
+}
+
 /// Stage 22b: the application consuming received data — drain up to `max` bytes from the connection's
 /// receive buffer, reopening the flow-control window. Thin pass-through to [`tcp::read`].
 pub fn tcp_read(local_port: u16, remote_port: u16, max: usize) -> Option<Vec<u8>> {

@@ -1464,6 +1464,49 @@ fn tcp_negotiates_sack_over_loopback() {
     );
 }
 
+/// Stage 23d-2a: the SACK option build/parse round-trips. Pure logic (no connection): encode two
+/// selectively-acknowledged ranges into an ACK's SACK option, confirm the data offset grew and the segment
+/// self-checksums, then parse the ranges back off it.
+#[test_case]
+fn tcp_sack_option_round_trips() {
+    use crate::net::tcp;
+
+    let src_ip = [10, 0, 2, 15];
+    let dst_ip = [10, 0, 2, 2];
+    let blocks = [(0x1000u32, 0x1400u32), (0x2000u32, 0x2200u32)];
+    let opt = tcp::build_sack_option(&blocks);
+    // NOP, NOP, kind 5, length (2 + 16), then two 8-byte blocks = 20 option bytes (a multiple of 4).
+    assert_eq!(opt.len(), 20, "two SACK blocks encode as 4 + 16 option bytes");
+
+    let ack = tcp::build_with_options(
+        src_ip, dst_ip, 80, 40000, 0x3333, 0x4444, tcp::ACK, 1024, &opt, &[],
+    );
+    assert_eq!(ack[12] >> 4, 10, "data offset = 10 words (20-byte header + 20-byte options)");
+    assert_eq!(
+        tcp::checksum(src_ip, dst_ip, &ack),
+        0,
+        "an ACK with a SACK option must still carry a valid checksum"
+    );
+
+    let s = tcp::Segment::parse(&ack).expect("ACK with a SACK option should parse");
+    assert_eq!(s.flags, tcp::ACK);
+    assert_eq!(s.sack_blocks(), blocks.to_vec(), "the SACK ranges must round-trip");
+    assert!(s.payload.is_empty(), "a pure SACK ACK carries no stream data");
+}
+
+/// Stage 23d-2a: the receiver advertises out-of-order data in SACK blocks, via loopback — the dup ACK for a
+/// reordered segment carries a SACK option naming the buffered range, and the stream still reassembles.
+#[test_case]
+fn tcp_advertises_sack_blocks() {
+    use crate::net;
+
+    assert!(crate::e1000::present(), "e1000 not initialized");
+    assert!(
+        net::tcp_sack_blocks_loopback_selftest(),
+        "TCP SACK block advertisement over loopback failed"
+    );
+}
+
 /// Stage 19b-2: the live DNS resolver — resolve a hostname through SLIRP's DNS server over the wire.
 /// Unlike the SLIRP-internal gateway ping, this depends on the *host* having working upstream DNS
 /// (SLIRP forwards to it), so the test is lenient: it always exercises the full path (build the query,
