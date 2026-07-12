@@ -797,7 +797,7 @@ unify later.
 
 ## Post-roadmap tracks (Stage 23+)
 
-> **Status: in progress — Stage 23 complete (23a-23d); Stage 24 in progress (24a-24b done, 24c-1 done); Stages 24c-2/24d-26 remain.** With the original roadmap complete (stages 0-22d-3), four independent
+> **Status: in progress — Stage 23 complete (23a-23d); Stage 24 in progress (24a-24c done); Stages 24d-26 remain.** With the original roadmap complete (stages 0-22d-3), four independent
 > follow-on tracks extend it. They are **not** strictly ordered by dependency, but the recommended sequence
 > is **23 → 24 → 25 → 26**, chosen by risk and blast radius: do the isolated TCP polish first (it rides the
 > momentum of the just-finished TCP work), then the socket capstone that makes the stack usable, then the
@@ -990,6 +990,28 @@ Connects the two finished lines — the network stack and ring 3 — so user pro
 > (the new `ring3_process_listened_and_accepted`; the 24a/24b tests still pass unchanged). (Remaining: 24c-2,
 > a *two-process* client + server — needs a "connection-established -> wake the accept-blocked server"
 > mechanism, or the net thread running during the process phase; then 24d `close` + a user netcat demo.)
+>
+> **Stage 24c-2 is done — two *distinct* ring 3 processes, a server and a client, cooperating over the
+> scheduler.** This completes what 24c-1's inline-pump model could not: a **separate** server process is woken
+> by a **client** process's `connect`. The mechanism is the crux — `accept` becomes **switch-blocking**: when
+> no connection is queued and other processes are ready, it parks the server in `net_blocked` tagged with its
+> `accept_port` and **switches to another ready process** (rather than pumping inline). A new
+> `service_net_blocked` **wake sweep**, run at every `yield`/`exit` (before choosing the next process), pumps
+> `net::poll` when an accept is pending and, for each parked server whose port now has a claimable connection,
+> fulfills the accept (binds a new fd, sets `rax`) and moves it to `ready`. So the flow is: the server
+> `listen`s and blocks in `accept` (yielding the CPU); the client `connect`s, `send`s, and exits; the client's
+> exit runs the sweep, which wakes the server with the accepted fd. `accept` keeps a fast path (a queued
+> connection returns at once — this is the 24c-1 single-process demo's path) and a lone-server inline fallback
+> (when nothing else is ready). The demo is two hand-assembled programs — a **server** (`socket`/`listen`/
+> `accept`/`write`/`exit`) and a **client** (`socket`/`connect`/`send`/`exit`) on distinct loopback port 7901
+> — and the kernel verifies, after the process phase, that the client process's bytes reached the server
+> process's accepted connection (driving `poll` to complete any retransmit, so it is deterministic — boot logs
+> "server-side connection on port 7901 received 29 byte(s) ... = true"). Two subtle races were closed to make
+> it non-flaky (checked over 50+ test runs): the data verification **pumps `poll`** until the bytes arrive
+> (the handshake's final ACK can race the data segment, dropping its payload until the client TCB
+> retransmits), and `on_user_exit` **drives the network** rather than stranding an accept-blocked server when
+> it is the last process to exit. Verified by 92 tests (the new `two_processes_accepted_across_the_scheduler`).
+> (Remaining: 24d `SYS_CLOSE` + a user netcat demo, then Stages 25-26.)
 
 | Sub-step | What to build | OS concepts | Smallest verifiable step |
 |----------|---------------|-------------|--------------------------|

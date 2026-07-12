@@ -851,6 +851,13 @@ pub fn tcp_accept(local_port: u16) -> Option<(u16, u16)> {
     tcp::accept_one(local_port)
 }
 
+/// Stage 24c-2: the bytes a connection (server side) on `local_port` has received. Backs the cross-process
+/// demo's kernel verification that a client process's data reached a *separate* server process's accepted
+/// connection. `None` if no such connection.
+pub fn tcp_received_on_port(local_port: u16) -> Option<Vec<u8>> {
+    tcp::received_on_port(local_port)
+}
+
 /// Stage 24b: stop echoing on the loopback listener (clears [`TCP_ECHO_PORT`]). Called after the process
 /// phase so the shell's later network use does not accidentally bounce traffic.
 pub fn tcp_echo_disable() {

@@ -76,11 +76,24 @@ const ACCEPT_DEMO_CODE_LEN: usize = 5 + 3 + 10 + 5 + 3 + 19 + 3 + 5 + 3 + 18 + 3
 /// Capacity of the socket demo's receive buffer (Stage 24b/24c): plenty for the short message.
 const SOCKET_DEMO_RECV_CAP: u8 = 64;
 
+/// Length of the Stage 24c-2 cross-process **client** program: `socket` (5 B) + `mov rbx,rax` (3 B, stash
+/// the fd) + `connect` (19 B) + `send` (18 B) + `exit` (6 B). It connects to the server process and sends.
+const CROSS_CLIENT_CODE_LEN: usize = 5 + 3 + 19 + 18 + 6;
+/// Length of the Stage 24c-2 cross-process **server** program: `socket` (5 B) + `listen` (10 B) + `accept`
+/// (5 B) + `write` (17 B, a fixed confirmation) + `exit` (6 B). It listens, accepts the client's
+/// connection, and prints — the accept is what proves a *separate* process was woken to serve.
+const CROSS_SERVER_CODE_LEN: usize = 5 + 10 + 5 + 17 + 6;
+
 /// How many times [`on_user_recv`] pumps the network waiting for data before giving up (returning 0
 /// bytes), and the pause between pumps. Over PHY loopback the echo returns in a handful of pumps; the
 /// bound only guards against a silent peer hanging the process (a syscall runs with interrupts off).
 const RECV_POLL_ITERS: usize = 2000;
 const RECV_POLL_US: u32 = 500;
+
+/// How many times the Stage 24c-2 [`service_net_blocked`] wake sweep pumps `net::poll` when an accept is
+/// pending — enough to deliver a loopback client's final handshake ACK and any data it sent (established-path
+/// delivery over loopback is immediate). Small and unsleeped, since the sweep runs at every `yield`/`exit`.
+const ACCEPT_WAKE_POLLS: usize = 8;
 
 /// Top of the program's user stack (the initial user `rsp`). It sits in the same
 /// private L4 slot as the loaded image, well above the code page; the stack grows
@@ -656,6 +669,121 @@ pub fn spawn_accept_demo(
     pid
 }
 
+/// The loopback TCP port the Stage 24c-2 cross-process demo uses (distinct from the single-process demo's
+/// [`CONNECT_DEMO_PORT`], so the two demos' connections never collide). The server process `listen`s here;
+/// the client process `connect`s here.
+pub const CROSS_DEMO_PORT: u16 = 7901;
+
+/// The exact bytes the Stage 24c-2 **client** process sends. The kernel later confirms these reached the
+/// **server** process's accepted connection ([`verify_cross_demo`]) — proof that two distinct ring 3
+/// processes exchanged application data.
+const CROSS_CLIENT_MSG: &[u8] = b"data from the client process\n";
+
+/// Hand-assemble the Stage 24c-2 cross-process **client**: `socket(); connect(dst); send(msg); exit(0)`.
+/// It connects to the server process's listener and sends [`CROSS_CLIENT_MSG`], then exits — its exit is
+/// what triggers the [`service_net_blocked`] sweep that wakes the server's `accept`. The fd stays in `rbx`
+/// (for `send`) and `rax` (for `connect`) as in the other socket demos.
+fn build_cross_client(dst: u64, send_ptr: u64, send_len: u8) -> Vec<u8> {
+    let mut code = Vec::new();
+    emit_socket(&mut code); // rax = client fd
+    code.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax  (stash fd; rax still = it)
+    emit_connect(&mut code, dst); // connect(fd, dst) -> blocks inline until ESTABLISHED
+    emit_send(&mut code, send_ptr, send_len); // send(fd, msg)  [reads rbx]
+    emit_exit(&mut code, 0);
+    debug_assert_eq!(code.len(), CROSS_CLIENT_CODE_LEN);
+    code
+}
+
+/// Hand-assemble the Stage 24c-2 cross-process **server**: `socket(); listen(port); accept(); write(msg);
+/// exit(0)`. It listens, **blocks in `accept`** (parking and switching to another process) until the client
+/// connects, then — woken by the sweep — prints a confirmation and exits. The accepted fd (returned in `rax`)
+/// is not used further; the [`write`] is a fixed message, and the kernel verifies the received data.
+fn build_cross_server(port: u16, msg_ptr: u64, msg_len: u8) -> Vec<u8> {
+    let mut code = Vec::new();
+    emit_socket(&mut code); // rax = listen fd
+    emit_listen(&mut code, port); // listen(fd, port); rax still = fd
+    emit_accept(&mut code); // accept(fd) -> blocks, then rax = accepted fd
+    emit_write(&mut code, msg_ptr, msg_len); // write(msg) — proof the server ran past accept
+    emit_exit(&mut code, 0);
+    debug_assert_eq!(code.len(), CROSS_SERVER_CODE_LEN);
+    code
+}
+
+/// Build the Stage 24c-2 client ELF (data area = [`CROSS_CLIENT_MSG`], placed right after the code).
+fn cross_client_elf(dst: u64) -> Vec<u8> {
+    let send_ptr = msg_vaddr(CROSS_CLIENT_CODE_LEN);
+    let code = build_cross_client(dst, send_ptr, CROSS_CLIENT_MSG.len() as u8);
+    build_elf(&code, CROSS_CLIENT_MSG)
+}
+
+/// Build the Stage 24c-2 server ELF (data area = its confirmation message).
+fn cross_server_elf() -> Vec<u8> {
+    let msg = b"server process: accepted a client connection\n";
+    let msg_ptr = msg_vaddr(CROSS_SERVER_CODE_LEN);
+    let code = build_cross_server(CROSS_DEMO_PORT, msg_ptr, msg.len() as u8);
+    build_elf(&code, msg)
+}
+
+/// Boot demo for Stage 24c-2 — **two distinct ring 3 processes**, a server and a client, cooperating over
+/// loopback. The **server** process (spawned first, so it registers its listener before the client connects)
+/// `socket`s, `listen`s on [`CROSS_DEMO_PORT`], and **blocks in `accept`** — parking and yielding the CPU
+/// rather than spinning. The **client** process `socket`s, `connect`s to that port, `send`s
+/// [`CROSS_CLIENT_MSG`], and exits; its exit runs the [`service_net_blocked`] sweep, which wakes the server's
+/// `accept` with a fresh fd. This is the crux of 24c-2: a *separate* server process is woken by a *client*
+/// process's connect — impossible under 24c-1's inline-pump model. Assumes loopback is already on (the
+/// [`spawn_accept_demo`] setup enabled it and reset the connection table); returns `(server_pid, client_pid)`.
+pub fn spawn_cross_demo(
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    physical_memory_offset: VirtAddr,
+) -> (u64, u64) {
+    let ip = crate::net::our_ip();
+    // Server first (its listener must exist before the client's SYN), then the client.
+    let server_img = load(&cross_server_elf(), frame_allocator, physical_memory_offset)
+        .expect("failed to load the cross-demo server");
+    let server_pid = spawn(server_img, None);
+    let dst = pack_dst(ip, CROSS_DEMO_PORT);
+    let client_img = load(&cross_client_elf(dst), frame_allocator, physical_memory_offset)
+        .expect("failed to load the cross-demo client");
+    let client_pid = spawn(client_img, None);
+    serial_println!(
+        "[sched] cross-demo: spawned server process {} (listens on {}) and client process {} (connects+sends)",
+        server_pid, CROSS_DEMO_PORT, client_pid
+    );
+    (server_pid, client_pid)
+}
+
+/// Stage 24c-2: after the process phase, confirm the cross-process **client**'s bytes reached the
+/// **server**'s accepted connection — the two distinct processes really exchanged application data. Sets
+/// [`CROSS_DATA_OK`]. Called from the kernel once the process scheduler has returned.
+///
+/// It **pumps `net::poll`** until the data matches (or a bound elapses), rather than checking once: if the
+/// handshake's final ACK raced the client's data segment (so the segment reached a still-`SynReceived`
+/// server side and its payload was dropped), the client's TCB retransmits the data, and driving `poll` here
+/// delivers it. Loopback is still enabled at this point (the caller disables it right after).
+pub fn verify_cross_demo() {
+    let mut got = None;
+    for _ in 0..RECV_POLL_ITERS {
+        got = crate::net::tcp_received_on_port(CROSS_DEMO_PORT);
+        if got.as_deref() == Some(CROSS_CLIENT_MSG) {
+            break;
+        }
+        crate::net::poll(); // drive delivery / the client TCB's retransmit of unacked data
+        crate::apic::pit_sleep_us(RECV_POLL_US);
+    }
+    let ok = got.as_deref() == Some(CROSS_CLIENT_MSG);
+    CROSS_DATA_OK.store(ok, Ordering::SeqCst);
+    match got {
+        Some(bytes) => serial_println!(
+            "[sched] cross-demo: server-side connection on port {} received {} byte(s); matches client's data = {}",
+            CROSS_DEMO_PORT, bytes.len(), ok,
+        ),
+        None => serial_println!(
+            "[sched] cross-demo: no server-side connection found on port {} (data not delivered)",
+            CROSS_DEMO_PORT,
+        ),
+    }
+}
+
 /// Set once the boot demo has loaded the demo ELF into a fresh space and verified
 /// the entry's bytes. Read by the Stage 11b test.
 static ELF_LOAD_OK: AtomicBool = AtomicBool::new(false);
@@ -770,6 +898,14 @@ static PROCESSES_LISTENED: AtomicU64 = AtomicU64::new(0);
 static PROCESSES_ACCEPTED: AtomicU64 = AtomicU64::new(0);
 /// The fd the most recent `accept` returned (`u64::MAX` = none yet) — Stage 24c test.
 static LAST_ACCEPTED_FD: AtomicU64 = AtomicU64::new(u64::MAX);
+/// How many accepts were fulfilled by the **wake sweep** — i.e. a server process was woken to accept a
+/// connection a *different* client process made (Stage 24c-2). Distinct from the fast-path accept (where
+/// the same process had already queued the connection), this is the cross-process proof.
+static CROSS_ACCEPTS: AtomicU64 = AtomicU64::new(0);
+/// Set true once the kernel confirms the Stage 24c-2 client process's bytes reached the server process's
+/// accepted connection (checked after the process phase) — proof that two *distinct* ring 3 processes
+/// exchanged application data over an accepted connection.
+static CROSS_DATA_OK: AtomicBool = AtomicBool::new(false);
 
 /// Stage 24a: a user **socket** — the per-process handle a ring 3 program obtains from the
 /// `socket` syscall and connects with. It is a thin binding from a small-integer **file
@@ -806,6 +942,12 @@ struct Process {
     /// `socket`. Per-process, so the same small fd means different connections in different
     /// processes — the point of a handle table.
     sockets: Vec<Option<UserSocket>>,
+    /// Stage 24c-2: if this process is parked in `net_blocked` waiting inside a blocking `accept`,
+    /// the port it is accepting on; `None` otherwise. It is the **wake condition** — when a
+    /// connection becomes claimable on this port, [`service_net_blocked`] fulfills the accept
+    /// (allocates a new fd, sets `rax`) and moves the process back to `ready`. This is what lets a
+    /// *separate* server process be woken by a *client* process's `connect`, the crux of 24c-2.
+    accept_port: Option<u16>,
 }
 
 /// An exited child whose parent has not yet `wait`ed for it — a "zombie". We keep only
@@ -867,6 +1009,7 @@ pub fn spawn(image: UserImage, parent: Option<u64>) -> u64 {
         context: TrapFrame::new(iframe),
         parent,
         sockets: Vec::new(), // no sockets until the process calls `socket` (Stage 24a)
+        accept_port: None,   // not blocked in accept (Stage 24c-2)
     });
     id
 }
@@ -954,6 +1097,9 @@ pub fn on_user_yield(tf: &mut TrapFrame) {
         } else {
             0
         };
+        // Stage 24c-2: give any accept-blocked server a chance to wake (a client may have connected
+        // since we last ran) before we pick the next process to run.
+        service_net_blocked(&mut sched);
         let next = activate_next(&mut sched);
         if let Some((id, _)) = next {
             serial_println!("[sched] process {} yielded; switching to process {}", yielded_id, id);
@@ -1001,7 +1147,23 @@ pub fn on_user_exit(tf: &mut TrapFrame, code: u64) {
             }
         }
 
-        let next = activate_next(&mut sched);
+        // Stage 24c-2: a client process that just connected+sent+exited leaves an established
+        // connection (and its data) for an accept-blocked server; wake it before choosing the next.
+        service_net_blocked(&mut sched);
+        let mut next = activate_next(&mut sched);
+        // If nothing else is ready but a server is still parked in `accept`, this is the last process
+        // exiting — there will be no further yield/exit to sweep it, so drive the network here until it can
+        // be woken, rather than strand it (bounded, so a truly stuck handshake still returns to the kernel).
+        let mut guard = 0;
+        while next.is_none()
+            && guard < RECV_POLL_ITERS
+            && sched.net_blocked.iter().any(|p| p.accept_port.is_some())
+        {
+            crate::apic::pit_sleep_us(RECV_POLL_US);
+            service_net_blocked(&mut sched);
+            next = activate_next(&mut sched);
+            guard += 1;
+        }
         match next {
             Some((id, _)) => serial_println!(
                 "[sched] process {} exited (code {}); switching to process {}",
@@ -1213,25 +1375,46 @@ pub fn on_user_listen(fd: u64, port: u64) -> u64 {
     0
 }
 
+/// Bind a freshly-accepted connection `(local_port, remote_port)` to a new fd in `proc`'s handle table,
+/// record it for the tests, and return the fd. Shared by the two ways an accept completes: the fast path
+/// (a connection is already queued) and the wake sweep ([`service_net_blocked`], a client connected while
+/// the server was parked).
+fn bind_accepted(proc: &mut Process, port: u16, local_port: u16, remote_port: u16) -> u64 {
+    let newfd = alloc_socket(proc, UserSocket { local_port, remote_port, listening: false });
+    PROCESSES_ACCEPTED.fetch_add(1, Ordering::SeqCst);
+    LAST_ACCEPTED_FD.store(newfd, Ordering::SeqCst);
+    serial_println!(
+        "[sched] process {} accepted a connection on port {}: new socket fd {} -> {}:{}",
+        proc.id, port, newfd, local_port, remote_port,
+    );
+    newfd
+}
+
 /// Called by the `accept` syscall (ring 3, Stage 24c): take the next connection from the listening socket
 /// `fd`'s accept queue and return a **new** file descriptor bound to it (the listening `fd` stays open for
-/// more). Like `connect`/`recv` this **blocks** — until a connection is ready — and drives the network
-/// **inline** while parked (see [`on_user_connect`] for why): it pumps [`crate::net::poll`], which completes
-/// a loopback client's handshake (the forked server-side TCB reaches ESTABLISHED), then claims that
-/// connection with [`crate::net::tcp_accept`]. Returns the new fd in **rax** (`u64::MAX` on error/timeout).
+/// more). **Blocks** until a connection is ready. Three paths:
 ///
-/// Structurally identical to [`on_user_recv`]: park the caller in `net_blocked`, drive `poll` until the
-/// condition is met (or a bound elapses), then wake the caller with the result. Allocating the new fd is
-/// safe from Phase 3 because the parked process's own handle table is reachable (we never switched CR3).
+/// - **Fast path** — a connection is already queued (e.g. the same process connected first, as in the
+///   single-process 24c-1 demo): claim it and return the new fd in `rax` right away.
+/// - **Park + switch (Stage 24c-2)** — no connection yet, but other processes are ready: park the caller in
+///   `net_blocked` tagged with `accept_port`, and **switch to another ready process**. A *client* process's
+///   later `connect` establishes the connection, and the next [`service_net_blocked`] sweep (run at every
+///   `yield`/`exit`) wakes this server with the new fd in `rax` — so two *distinct* ring 3 processes,
+///   server and client, cooperate without either blocking the other. This is the crux of 24c-2.
+/// - **Lone inline drive** — nothing else is ready (a solitary server): fall back to the 24c-1 behavior of
+///   pumping `net::poll` inline until a connection appears, then resume in place.
+///
+/// Returns the new fd in **rax** (`u64::MAX` on error/timeout), like `connect`/`recv`.
 pub fn on_user_accept(tf: &mut TrapFrame, fd: u64) {
-    // Phase 1 (locked): validate that `fd` is a listening socket, capture its port, and park the caller.
-    let (pid, port) = {
+    let pid;
+    let port;
+    {
         let mut sched = SCHEDULER.lock();
         let proc = match sched.current.as_mut() {
             Some(p) => p,
             None => return,
         };
-        let port = match proc.sockets.get(fd as usize).and_then(|s| *s) {
+        let p = match proc.sockets.get(fd as usize).and_then(|s| *s) {
             Some(sock) if sock.listening => sock.local_port,
             _ => {
                 serial_println!("[sched] accept: process {} has no listening socket fd {}", proc.id, fd);
@@ -1239,17 +1422,38 @@ pub fn on_user_accept(tf: &mut TrapFrame, fd: u64) {
                 return;
             }
         };
+
+        // Fast path: a connection is already waiting in the accept queue — claim it and return now.
+        if let Some((local, remote)) = crate::net::tcp_accept(p) {
+            let newfd = bind_accepted(proc, p, local, remote);
+            tf.rax = newfd;
+            return;
+        }
+
+        // Nothing ready yet: park the caller (tagged with its accept port for the wake sweep).
         let mut blocked = sched.current.take().expect("current is_some, checked above");
         blocked.context = *tf;
+        blocked.accept_port = Some(p);
         let id = blocked.id;
         sched.net_blocked.push(blocked);
-        (id, port)
-    };
 
-    // Phase 2 (unlocked): drive the network until a connection is ready to accept (or we give up). Over
-    // loopback the client's handshake finishes here — its final ACK is delivered by `poll`, moving the forked
-    // server-side TCB to ESTABLISHED — and `tcp_accept` then claims it. Bounded so a silent peer cannot hang
-    // the process forever (a syscall runs with interrupts off).
+        // If another process is ready, switch to it; a later `service_net_blocked` sweep wakes this one.
+        if let Some((next_id, context)) = activate_next(&mut sched) {
+            serial_println!(
+                "[sched] process {} blocked in accept(port {}); switching to process {}",
+                id, p, next_id
+            );
+            *tf = context;
+            return;
+        }
+
+        // No other process to run: drive the network ourselves (lone-server fallback, 24c-1 style).
+        serial_println!("[sched] process {} blocked in accept(port {}); no other process, driving inline", id, p);
+        pid = id;
+        port = p;
+    }
+
+    // Lone inline drive: pump until a connection is ready (or we give up), then wake ourselves.
     let mut accepted: Option<(u16, u16)> = None;
     for _ in 0..RECV_POLL_ITERS {
         if let Some(ports) = crate::net::tcp_accept(port) {
@@ -1259,8 +1463,6 @@ pub fn on_user_accept(tf: &mut TrapFrame, fd: u64) {
         crate::net::poll();
         crate::apic::pit_sleep_us(RECV_POLL_US);
     }
-
-    // Phase 3 (locked): allocate a new fd bound to the accepted connection and resume the caller with it.
     let mut sched = SCHEDULER.lock();
     let pos = sched
         .net_blocked
@@ -1268,20 +1470,9 @@ pub fn on_user_accept(tf: &mut TrapFrame, fd: u64) {
         .position(|p| p.id == pid)
         .expect("the process we just blocked is still in net_blocked");
     let mut proc = sched.net_blocked.remove(pos);
+    proc.accept_port = None;
     let result = match accepted {
-        Some((local_port, remote_port)) => {
-            let newfd = alloc_socket(
-                &mut proc,
-                UserSocket { local_port, remote_port, listening: false },
-            );
-            PROCESSES_ACCEPTED.fetch_add(1, Ordering::SeqCst);
-            LAST_ACCEPTED_FD.store(newfd, Ordering::SeqCst);
-            serial_println!(
-                "[sched] process {} accepted a connection on port {}: new socket fd {} -> {}:{}",
-                proc.id, port, newfd, local_port, remote_port,
-            );
-            newfd
-        }
+        Some((local_port, remote_port)) => bind_accepted(&mut proc, port, local_port, remote_port),
         None => {
             serial_println!("[sched] process {} accept timed out on port {}", proc.id, port);
             u64::MAX
@@ -1291,6 +1482,40 @@ pub fn on_user_accept(tf: &mut TrapFrame, fd: u64) {
     let resume = proc.context;
     sched.current = Some(proc);
     *tf = resume;
+}
+
+/// Stage 24c-2: the **accept wake sweep**. Called at every `yield`/`exit` (before choosing the next
+/// process) so that a server parked in `accept` is woken once a *client* process establishes a connection
+/// on its listen port. If any process is accept-blocked, pump `net::poll` a bounded number of times (to
+/// deliver a loopback client's final handshake ACK and any data it sent — established-path delivery is
+/// immediate, so no inter-poll sleep is needed), then for each accept-blocked process whose port now has a
+/// claimable connection, fulfill the accept (bind a new fd, set `rax`) and move it back to `ready`.
+///
+/// `poll` takes the connection/NIC locks, never the scheduler lock, so calling it while the scheduler lock
+/// is held is safe (no lock-ordering cycle). The whole sweep runs with interrupts off (inside a syscall).
+fn service_net_blocked(sched: &mut Scheduler) {
+    if !sched.net_blocked.iter().any(|p| p.accept_port.is_some()) {
+        return; // nobody is waiting on accept — skip the poll entirely
+    }
+    for _ in 0..ACCEPT_WAKE_POLLS {
+        crate::net::poll();
+    }
+    let mut i = 0;
+    while i < sched.net_blocked.len() {
+        if let Some(port) = sched.net_blocked[i].accept_port {
+            if let Some((local, remote)) = crate::net::tcp_accept(port) {
+                let mut proc = sched.net_blocked.remove(i);
+                proc.accept_port = None;
+                let newfd = bind_accepted(&mut proc, port, local, remote);
+                proc.context.rax = newfd;
+                CROSS_ACCEPTS.fetch_add(1, Ordering::SeqCst);
+                serial_println!("[sched] woke process {} from accept(port {}) with new fd {}", proc.id, port, newfd);
+                sched.ready.push(proc);
+                continue; // element `i` was removed; re-check the new element at `i`
+            }
+        }
+        i += 1;
+    }
 }
 
 /// Called by the `connect` syscall (ring 3, Stage 24a): actively open a TCP connection from
@@ -1632,4 +1857,16 @@ pub fn processes_accepted() -> u64 {
 /// The fd the most recent `accept` returned (`u64::MAX` if none yet). For the Stage 24c test.
 pub fn last_accepted_fd() -> u64 {
     LAST_ACCEPTED_FD.load(Ordering::SeqCst)
+}
+
+/// How many accepts were fulfilled by the wake sweep — a server process woken to accept a *different*
+/// client process's connection. For the Stage 24c-2 test.
+pub fn cross_accepts() -> u64 {
+    CROSS_ACCEPTS.load(Ordering::SeqCst)
+}
+
+/// Whether the Stage 24c-2 client process's bytes reached the server process's accepted connection
+/// (set by [`verify_cross_demo`]). For the Stage 24c-2 test.
+pub fn cross_data_ok() -> bool {
+    CROSS_DATA_OK.load(Ordering::SeqCst)
 }

@@ -338,6 +338,18 @@ fn ring3_process_listened_and_accepted() {
     assert_ne!(crate::process::last_accepted_fd(), u64::MAX);
 }
 
+/// Stage 24c-2: **two distinct** ring 3 processes — a server and a client — cooperated over loopback. The
+/// server process blocked in `accept` (parking and yielding the CPU); the client process connected and sent
+/// data; the client's exit ran the wake sweep, which woke the server's accept with a new fd. So at least one
+/// accept must have been fulfilled by the *wake sweep* (not the same-process fast path), and the client
+/// process's bytes must have reached the server process's accepted connection — proof that two separate
+/// ring 3 processes exchanged application data through the accept path.
+#[test_case]
+fn two_processes_accepted_across_the_scheduler() {
+    assert!(crate::process::cross_accepts() >= 1);
+    assert!(crate::process::cross_data_ok());
+}
+
 /// Stage 13a: the ATA PIO driver reads a raw sector from disk. The bootimage QEMU attaches
 /// the kernel image as the primary IDE master, so sector 0 is the boot sector, whose final
 /// two bytes are the MBR boot signature 0x55 0xAA — a stable value to assert without

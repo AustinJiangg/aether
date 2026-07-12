@@ -1101,6 +1101,13 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // `boot_continue` after the process phase.
     let connector = process::spawn_accept_demo(&mut frame_allocator, phys_mem_offset);
     serial_println!("[sched] spawned accept-demo process {}", connector);
+    // Stage 24c-2: also spawn *two distinct* ring 3 processes — a server and a client — that cooperate over
+    // loopback. The server `listen`s and **blocks in `accept`** (parking and yielding the CPU); the client
+    // `connect`s and `send`s, and its exit wakes the server's accept. This proves a separate server process
+    // is woken by a client process's connect, which the 24c-1 single-process inline model cannot do.
+    // (Loopback is already on from `spawn_accept_demo` above.)
+    let (cross_server, cross_client) = process::spawn_cross_demo(&mut frame_allocator, phys_mem_offset);
+    serial_println!("[sched] spawned cross-demo server {} and client {}", cross_server, cross_client);
     // Stage 12d: hand the frame allocator + physical-memory offset to the kernel globals
     // so the `spawn` syscall can load an ELF at runtime from inside the trap handler
     // (which cannot borrow these locals). This *moves* `frame_allocator`; nothing below
@@ -1156,6 +1163,9 @@ fn boot_continue() -> ! {
     // route the demo's loopback traffic) and stop any loopback echo server, so the shell's later `ping`
     // and any real traffic reach the emulated wire again — then report how far the ring 3 process got
     // through the socket syscalls (listen, connect, accept, send, recv).
+    // Stage 24c-2: verify the cross-process demo (a client process's bytes reached a *separate* server
+    // process's accepted connection) *before* disabling loopback, while the connection table is intact.
+    process::verify_cross_demo();
     e1000::set_loopback(false);
     net::tcp_echo_disable();
     serial_println!(
@@ -1167,6 +1177,11 @@ fn boot_continue() -> ! {
         process::processes_received(),
         process::last_recv_len(),
         process::last_accepted_fd(),
+    );
+    serial_println!(
+        "[sched] socket (24c-2): {} cross-process accept(s) (a server process woken by a client), client->server data delivered = {}",
+        process::cross_accepts(),
+        process::cross_data_ok(),
     );
     println!("Back from running user processes; continuing boot.");
 

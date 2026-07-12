@@ -385,9 +385,19 @@ syscalls run with interrupts off, two *distinct* ring-3 processes cannot both pr
 inline pump, so 24c-1 proves it with a **single** ring-3 program playing *both* ends over PHY loopback
 (`socket`/`listen`/`socket`/`connect`/`accept`/`send`/`recv`/`write`/`exit`) — which subsumes and so
 **replaces** the 24a/24b connect demo (the kernel-side listener/echo scaffolding, `tcp_listen_loopback`,
-becomes a plain `tcp_loopback_reset`). `ROADMAP.md` records the full staged history (stages 0-22d-3 complete,
-Stage 23 complete (23a-23d), Stage 24 in progress (24a-24b done, 24c-1 done); Stages 24c-2/24d-26 remain: a
-two-process client+server needs a "connection-established -> wake the accept-blocked server" mechanism).
+becomes a plain `tcp_loopback_reset`). **Stage 24c-2 is also done**: two *distinct* ring 3 processes — a
+server and a client — cooperating over the scheduler (what 24c-1's inline model could not do). `accept`
+becomes **switch-blocking**: with no connection queued and other processes ready, it parks the server in
+`net_blocked` tagged with `accept_port` and switches to another ready process; a new `service_net_blocked`
+wake sweep, run at every `yield`/`exit`, pumps `net::poll` and wakes any parked server whose port now has a
+claimable connection (binding a new fd, setting `rax`). So a *client* process's `connect`+`send`+`exit` wakes
+a *separate* server's `accept`. `accept` keeps a fast path (queued connection returns at once — 24c-1's demo)
+and a lone-server inline fallback. The demo is two hand-assembled programs (a server `socket`/`listen`/
+`accept`/`write`/`exit` and a client `socket`/`connect`/`send`/`exit` on port 7901); the kernel verifies the
+client's bytes reached the server's accepted connection (`verify_cross_demo`, which pumps `poll` to complete
+any retransmit — made non-flaky over 50+ test runs). `ROADMAP.md` records the full staged history (stages
+0-22d-3 complete, Stage 23 complete (23a-23d), Stage 24 in progress (24a-24c done); Stages 24d-26 remain: 24d
+is `SYS_CLOSE` + a user netcat demo).
 
 ## Language and writing conventions
 
@@ -706,9 +716,16 @@ Exit QEMU: `Ctrl-A` then `X`.
   listener/echo) and spawns **one** ring 3 program that plays both ends over loopback —
   `socket()`(server)/`listen()`/`socket()`(client)/`connect()`/`accept()`/`send()`(client
   fd)/`recv()`(accepted fd)/`write()/exit()` (the fds ride in `rbx`/`r14`/`r15`, which the
-  syscall stub preserves across calls). Two distinct ring-3 processes cannot both progress
-  inside a blocking inline pump during the process phase, so the single-process demo is 24c-1's
-  proof; the true two-process client+server is 24c-2.
+  syscall stub preserves across calls). Stage 24c-2 makes `on_user_accept` **switch-blocking**:
+  with no connection queued and other processes ready, it parks the server (tagged with
+  `Process::accept_port`) and switches to another ready process, and a new `service_net_blocked`
+  wake sweep — run at every `yield`/`exit` — pumps `net::poll` and wakes any parked server whose
+  port now has a claimable connection (binding a new fd, setting rax). So a *client* process's
+  `connect`+`send`+`exit` wakes a *separate* server's `accept` (`spawn_cross_demo` runs the two
+  programs on port 7901; `verify_cross_demo` confirms the client's bytes reached the server's
+  accepted connection). `accept` keeps a fast path (queued connection) and a lone-server inline
+  fallback; `on_user_exit` also drives the network rather than stranding a last accept-blocked
+  process.
 - `src/ata.rs`: Stage 13a/13b block device driver — a minimal ATA (IDE) disk driver in
   PIO mode. `read_sector` reads one raw 512-byte sector from the primary master by
   the polled READ SECTORS (LBA28) protocol: write the LBA/count registers, issue the
@@ -991,7 +1008,9 @@ Exit QEMU: `Ctrl-A` then `X`.
   existing-connection lookup, so only the first forks). `accept_one(port)` claims the oldest established,
   unaccepted connection; `net::tcp_listen`/`tcp_accept` wrap it for the `listen`/`accept` syscalls, and
   `net::tcp_loopback_reset` replaces the old `tcp_listen_loopback` (the accept demo does its own ring-3
-  `listen`, so no kernel-side listener/echo is set up).
+  `listen`, so no kernel-side listener/echo is set up). Stage 24c-2 adds `received_on_port(port)`
+  (`net::tcp_received_on_port`), a server-side connection's received bytes, so the kernel can verify a
+  cross-process client's data reached the server's accepted connection.
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

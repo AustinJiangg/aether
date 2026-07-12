@@ -1542,6 +1542,18 @@ pub fn received_data(local_port: u16, remote_port: u16) -> Option<Vec<u8>> {
         .map(|c| c.rx.clone())
 }
 
+/// Stage 24c-2: a clone of the receive buffer of a *connection* (not a listener) on `local_port` — the
+/// bytes the accepted server-side TCB received. Skips the listener (`remote_port == 0`). Used by the
+/// cross-process demo's kernel-side verification: after two distinct ring 3 processes have run, confirm the
+/// client's bytes reached the server's accepted connection. `None` if no such connection.
+pub fn received_on_port(local_port: u16) -> Option<Vec<u8>> {
+    CONNECTIONS
+        .lock()
+        .iter()
+        .find(|c| c.local_port == local_port && c.remote_port != 0)
+        .map(|c| c.rx.clone())
+}
+
 /// Stage 22b: the application **consuming** received data — drain up to `max` bytes from the front of the
 /// connection's receive buffer and return them. This is what reopens the flow-control window: the buffer
 /// shrinks, so the next segment we send advertises a larger [`recv_window`]. `None` if no such connection.
