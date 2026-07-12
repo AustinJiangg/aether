@@ -86,6 +86,12 @@ pub const SYS_LISTEN: u64 = 10;
 /// `connect`/`recv` it **blocks** — until a connection is ready — so it returns the new fd in `rax`
 /// (`u64::MAX` on error/timeout). The listening `fd` stays open to accept more.
 pub const SYS_ACCEPT: u64 = 11;
+/// `close(fd)` — release the socket `fd` (Stage 24d), the missing end of the socket lifecycle: free the
+/// descriptor slot for reuse and tear down what it was bound to (a connected socket sends its FIN,
+/// starting the four-way teardown; a listening socket unregisters its listener). Meaningful only from
+/// ring 3; non-blocking — like Unix `close`, it does not wait for the FIN handshake to finish — so it
+/// returns via the stack ABI (0 on success, `u64::MAX` for a fd that is not an open socket).
+pub const SYS_CLOSE: u64 = 12;
 
 /// Count of syscalls that arrived from ring 3 — proof (for the Stage 10b test)
 /// that the user program really crossed into the kernel through `int 0x80`.
@@ -278,6 +284,16 @@ extern "C" fn syscall_dispatch(tf_ptr: *mut TrapFrame) {
         // SAFETY: `accept` pushed its one argument (fd) at [rsp+8].
         let fd = unsafe { args.add(1).read() };
         crate::process::on_user_accept(tf, fd);
+        return;
+    }
+    if number == SYS_CLOSE && from_ring3 {
+        // `close` frees the fd and starts any TCP teardown (FIN) or listener removal. Non-blocking, so it
+        // returns via the stack ABI (like `listen`) and does not switch processes.
+        // SAFETY: `close` pushed its one argument (fd) at [rsp+8].
+        let fd = unsafe { args.add(1).read() };
+        let result = crate::process::on_user_close(fd);
+        // SAFETY: the number slot is writable, as above.
+        unsafe { args.write(result) };
         return;
     }
 

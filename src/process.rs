@@ -68,11 +68,14 @@ const CHILD_CODE_LEN: usize = 17 + 6;
 const PARENT_CODE_LEN: usize = 17 + 6 + 4 + 17 + 6;
 /// Length of the Stage 24c accept-demo code — one ring 3 process playing both ends over loopback:
 /// `socket` (5 B, server) + `mov r15,rax` (3 B, stash the listen fd) + `listen` (10 B) + `socket` (5 B,
-/// client) + `mov rbx,rax` (3 B, stash the client fd) + `connect` (19 B) + `mov rax,r15` (3 B, restore the
+/// client) + `mov rbx,rax` (3 B, stash the client fd) + `mov r13,rax` (3 B, keep the client fd for the
+/// close — rbx is overwritten before then) + `connect` (19 B) + `mov rax,r15` (3 B, restore the
 /// listen fd) + `accept` (5 B) + `mov r14,rax` (3 B, stash the accepted fd) + `send` (18 B, on the client
 /// fd) + `mov rbx,r14` (3 B, the accepted fd) + `recv` (18 B, on the accepted fd) + dynamic `write` (16 B) +
-/// `exit` (6 B).
-const ACCEPT_DEMO_CODE_LEN: usize = 5 + 3 + 10 + 5 + 3 + 19 + 3 + 5 + 3 + 18 + 3 + 18 + 16 + 6;
+/// Stage 24d's closing tail: three `mov rax,<fd reg>` + `close` pairs (3 + 6 B each) + one more `socket`
+/// (5 B, must reuse freed fd 0) + `exit` (6 B).
+const ACCEPT_DEMO_CODE_LEN: usize =
+    5 + 3 + 10 + 5 + 3 + 3 + 19 + 3 + 5 + 3 + 18 + 3 + 18 + 16 + (3 + 6) * 3 + 5 + 6;
 /// Capacity of the socket demo's receive buffer (Stage 24b/24c): plenty for the short message.
 const SOCKET_DEMO_RECV_CAP: u8 = 64;
 
@@ -94,6 +97,12 @@ const RECV_POLL_US: u32 = 500;
 /// pending — enough to deliver a loopback client's final handshake ACK and any data it sent (established-path
 /// delivery over loopback is immediate). Small and unsleeped, since the sweep runs at every `yield`/`exit`.
 const ACCEPT_WAKE_POLLS: usize = 8;
+
+/// How many times [`on_user_close`] pumps `net::poll` after sending a FIN, so a loopback peer's replies
+/// (the ACK of our FIN, or the final ACK of its own) are processed at once — loopback delivery is
+/// synchronous, so a few polls complete each half of the teardown. A real remote peer's replies would
+/// arrive through later polls instead; `close` never waits on them (it is non-blocking, like Unix's).
+const CLOSE_DRIVE_POLLS: usize = 8;
 
 /// Top of the program's user stack (the initial user `rsp`). It sits in the same
 /// private L4 slot as the loaded image, well above the code page; the stack grows
@@ -403,6 +412,17 @@ fn emit_accept(code: &mut Vec<u8>) {
     code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
 }
 
+/// `close(fd)` — 6 bytes (Stage 24d). Closes the socket whose fd is in `rax` — the missing end of the
+/// lifecycle. A one-argument call returning via the stack ABI: push `rax` (the fd), push the number, trap,
+/// then `pop rax` (the result: 0, or `u64::MAX` for a bad fd). Non-blocking: the kernel sends any FIN /
+/// removes any listener and returns at once — the caller does not wait for the peer.
+fn emit_close(code: &mut Vec<u8>) {
+    code.push(0x50); // push rax          (arg1 = fd)
+    code.extend_from_slice(&[0x6A, crate::syscall::SYS_CLOSE as u8]); // push SYS_CLOSE
+    code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
+    code.push(0x58); // pop rax           (the result)
+}
+
 /// A busy-spin of `count` iterations — `mov rcx, count; dec rcx; jnz` (12 bytes). A
 /// ring-3 delay long enough that a ~55 ms timer tick lands mid-spin and *preempts* the
 /// process (Stage 12c-3). `rcx` is live throughout, so a correct preemption must save
@@ -458,16 +478,21 @@ fn build_parent(msg_ptr: u64, msg_len: u8) -> Vec<u8> {
     code
 }
 
-/// Hand-assemble the Stage 24c accept demo: one ring 3 process that plays **both ends** of a loopback TCP
-/// connection, exercising the whole socket lifecycle — `socket`(server) → `listen`(port) → `socket`(client)
-/// → `connect`(dst) → `accept` → `send`(client) → `recv`(accepted) → `write` → `exit`. The `connect` forks a
-/// server-side TCB into the listener's accept queue; `accept` claims it and returns a *new* fd; the client
-/// then `send`s a message that the accepted (server) socket `recv`s directly (no echo server needed — the
-/// two fds are the two ends of the same loopback connection), and the program prints what it received.
+/// Hand-assemble the Stage 24c/24d accept demo: one ring 3 process that plays **both ends** of a loopback
+/// TCP connection, exercising the whole socket lifecycle — `socket`(server) → `listen`(port) →
+/// `socket`(client) → `connect`(dst) → `accept` → `send`(client) → `recv`(accepted) → `write`, and (Stage
+/// 24d) `close` of all three fds plus one final `socket` → `exit`. The `connect` forks a server-side TCB
+/// into the listener's accept queue; `accept` claims it and returns a *new* fd; the client then `send`s a
+/// message that the accepted (server) socket `recv`s directly (no echo server needed — the two fds are the
+/// two ends of the same loopback connection), and the program prints what it received. The closes then
+/// drive the four-way FIN teardown from ring 3 — client fd first (the active close), accepted fd second
+/// (the passive close), listener last — and the final `socket` must come back as fd 0, proving the freed
+/// slots are reused (the lowest-fd rule).
 ///
 /// Register plan (every GP register survives a syscall — the entry stub saves the full `TrapFrame`): the
-/// listen fd lives in `r15`, the client fd in `rbx`, the accepted fd in `r14`; `rax` carries each `socket`'s
-/// result and is reloaded from `r15`/`r14` when a specific fd is needed. Produces exactly
+/// listen fd lives in `r15`, the client fd in `rbx` *and* `r13` (rbx is repointed at the accepted fd for
+/// `recv`, so the close reloads the client fd from r13), the accepted fd in `r14`; `rax` carries each
+/// `socket`'s result and is reloaded from a stash register when a specific fd is needed. Produces exactly
 /// [`ACCEPT_DEMO_CODE_LEN`] bytes. `dst` packs our own address + `port` (loopback; see [`pack_dst`]).
 fn build_accept_demo(
     dst: u64,
@@ -483,6 +508,7 @@ fn build_accept_demo(
     emit_listen(&mut code, port); // listen(fd, port); leaves rax = listen fd
     emit_socket(&mut code); // rax = client fd
     code.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax   (stash the client fd; rax still = it)
+    code.extend_from_slice(&[0x49, 0x89, 0xC5]); // mov r13, rax   (keep it for the close — rbx is repointed below)
     emit_connect(&mut code, dst); // connect(client fd, dst) -> forks + queues a server-side TCB
     code.extend_from_slice(&[0x4C, 0x89, 0xF8]); // mov rax, r15   (restore the listen fd for accept)
     emit_accept(&mut code); // accept(listen fd) -> rax = accepted fd
@@ -491,6 +517,17 @@ fn build_accept_demo(
     code.extend_from_slice(&[0x4C, 0x89, 0xF3]); // mov rbx, r14   (rbx = accepted fd for recv)
     emit_recv(&mut code, recv_ptr, recv_cap); // recv(accepted fd, buf) [reads rbx = accepted fd]
     emit_write_dyn(&mut code, recv_ptr); // write(buf, count)
+    // Stage 24d: the lifecycle ends with `close` — tear down both ends of the connection (client fd
+    // first: an active close, our FIN -> FIN_WAIT_1; then the accepted fd: the passive close,
+    // CLOSE_WAIT -> LAST_ACK), unregister the listener, and prove the freed descriptors are reusable
+    // by opening one more socket, which must come back as the lowest freed fd (0).
+    code.extend_from_slice(&[0x4C, 0x89, 0xE8]); // mov rax, r13   (the client fd)
+    emit_close(&mut code); // close(client fd): our FIN starts the four-way teardown
+    code.extend_from_slice(&[0x4C, 0x89, 0xF0]); // mov rax, r14   (the accepted fd)
+    emit_close(&mut code); // close(accepted fd): the server end's FIN completes it
+    code.extend_from_slice(&[0x4C, 0x89, 0xF8]); // mov rax, r15   (the listen fd)
+    emit_close(&mut code); // close(listen fd): unregister the listener
+    emit_socket(&mut code); // socket() -> must reuse freed fd 0 (the lowest-fd rule)
     emit_exit(&mut code, 0);
     debug_assert_eq!(code.len(), ACCEPT_DEMO_CODE_LEN);
     code
@@ -620,8 +657,8 @@ fn pack_dst(ip: [u8; 4], port: u16) -> u64 {
     ((u32::from_be_bytes(ip) as u64) << 16) | port as u64
 }
 
-/// Build the Stage 24c accept-demo ELF (`socket`; `listen`; `socket`; `connect`; `accept`; `send`; `recv`;
-/// `write`; `exit`).
+/// Build the Stage 24c/24d accept-demo ELF (`socket`; `listen`; `socket`; `connect`; `accept`; `send`;
+/// `recv`; `write`; `close` ×3; `socket`; `exit`).
 ///
 /// The program's data area is the message to *send* followed by a zeroed *receive* buffer — both in the
 /// (writable) loaded segment, so `recv` can copy the received bytes into the second region. The send message
@@ -645,13 +682,15 @@ fn accept_demo_elf(dst: u64) -> Vec<u8> {
     build_elf(&code, &data)
 }
 
-/// Boot demo for the Stage 24c server-socket syscalls (subsuming 24a/24b's client path): with the NIC's PHY
+/// Boot demo for the Stage 24c/24d socket syscalls (subsuming 24a/24b's client path): with the NIC's PHY
 /// loopback enabled — so a locally-sent frame returns to us, mirroring the `net` loopback self-tests — load
 /// and spawn a ring 3 program that plays **both ends** of a loopback TCP connection: `socket`/`listen` a
 /// server socket, `socket`/`connect` a client socket to it, `accept` the connection (a new fd), then `send`
-/// on the client fd and `recv` on the accepted fd. The blocking `connect`/`accept`/`recv` drive the network
-/// inline (see [`on_user_connect`] / [`on_user_accept`] / [`on_user_recv`]); the caller disables loopback
-/// again after the process phase. Returns the demo process's pid.
+/// on the client fd and `recv` on the accepted fd — and (Stage 24d) `close` all three fds, driving the FIN
+/// teardown from ring 3, plus one final `socket` that must reuse a freed descriptor. The blocking
+/// `connect`/`accept`/`recv` drive the network inline (see [`on_user_connect`] / [`on_user_accept`] /
+/// [`on_user_recv`]); the caller disables loopback again after the process phase (after
+/// [`verify_close_demo`] has inspected the torn-down connection). Returns the demo process's pid.
 pub fn spawn_accept_demo(
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
     physical_memory_offset: VirtAddr,
@@ -663,7 +702,7 @@ pub fn spawn_accept_demo(
         .expect("failed to load the accept-demo program");
     let pid = spawn(img, None);
     serial_println!(
-        "[sched] accept-demo: spawned process {} (it listens on {}, connects to {}.{}.{}.{}:{}, accepts, and exchanges data over loopback)",
+        "[sched] accept-demo: spawned process {} (it listens on {}, connects to {}.{}.{}.{}:{}, accepts, exchanges data, and closes over loopback)",
         pid, CONNECT_DEMO_PORT, ip[0], ip[1], ip[2], ip[3], CONNECT_DEMO_PORT,
     );
     pid
@@ -782,6 +821,22 @@ pub fn verify_cross_demo() {
             CROSS_DEMO_PORT,
         ),
     }
+}
+
+/// Stage 24d: after the process phase, confirm the accept demo's ring 3 `close` syscalls really drove the
+/// four-way FIN teardown over loopback — closing the client fd sent the first FIN (client end: ESTABLISHED
+/// -> FIN_WAIT_1 -> FIN_WAIT_2), closing the accepted fd answered with the second (server end: CLOSE_WAIT
+/// -> LAST_ACK -> CLOSED, whose final ACK moves the client end to TIME_WAIT — often already expired to
+/// CLOSED by the 2*MSL timer by the time this runs), and closing the listening fd unregistered the
+/// listener. Sets [`CLOSE_TEARDOWN_OK`]. Called from the kernel once the process scheduler has returned,
+/// while loopback is still enabled and the connection table intact.
+pub fn verify_close_demo() {
+    let ok = crate::net::tcp_teardown_settled(CONNECT_DEMO_PORT);
+    CLOSE_TEARDOWN_OK.store(ok, Ordering::SeqCst);
+    serial_println!(
+        "[sched] close-demo: ring 3 close drove the connection teardown on port {} = {}",
+        CONNECT_DEMO_PORT, ok,
+    );
 }
 
 /// Set once the boot demo has loaded the demo ELF into a fresh space and verified
@@ -906,6 +961,15 @@ static CROSS_ACCEPTS: AtomicU64 = AtomicU64::new(0);
 /// accepted connection (checked after the process phase) — proof that two *distinct* ring 3 processes
 /// exchanged application data over an accepted connection.
 static CROSS_DATA_OK: AtomicBool = AtomicBool::new(false);
+/// How many `close` syscalls a ring 3 process completed — Stage 24d test.
+static PROCESSES_CLOSED: AtomicU64 = AtomicU64::new(0);
+/// How many times `socket`/`accept` reused a **freed** descriptor slot (filled a hole a `close` left,
+/// rather than growing the table) — Stage 24d test. Nothing frees an fd except `close`, so a nonzero
+/// count proves the close demo's final `socket()` got a recycled descriptor.
+static FD_SLOTS_REUSED: AtomicU64 = AtomicU64::new(0);
+/// Set true once the kernel confirms the close demo's FIN teardown completed over loopback (client end
+/// TIME_WAIT/CLOSED, server end CLOSED, listener gone) — checked after the process phase (Stage 24d test).
+static CLOSE_TEARDOWN_OK: AtomicBool = AtomicBool::new(false);
 
 /// Stage 24a: a user **socket** — the per-process handle a ring 3 program obtains from the
 /// `socket` syscall and connects with. It is a thin binding from a small-integer **file
@@ -1330,6 +1394,7 @@ fn alloc_socket(proc: &mut Process, sock: UserSocket) -> u64 {
     let fd = match proc.sockets.iter().position(|s| s.is_none()) {
         Some(i) => {
             proc.sockets[i] = Some(sock);
+            FD_SLOTS_REUSED.fetch_add(1, Ordering::SeqCst); // a hole a `close` freed (Stage 24d)
             i
         }
         None => {
@@ -1723,6 +1788,66 @@ pub fn on_user_recv(tf: &mut TrapFrame, fd: u64, ptr: u64, len: u64) {
     *tf = resume;
 }
 
+/// Called by the `close` syscall (ring 3, Stage 24d): release the process's socket `fd` — the missing end
+/// of the socket lifecycle (Unix's `close`). What is torn down depends on what the fd is bound to:
+///
+/// - a **connected** socket: start the TCP teardown — send our FIN ([`crate::net::tcp_close`], which moves
+///   the connection into FIN_WAIT_1, or LAST_ACK if the peer closed first) and pump a few polls so a
+///   loopback peer's replies are processed at once; the rest of the FIN handshake completes through later
+///   polls and the retransmission timer, the way a real kernel finishes a close in the background.
+/// - a **listening** socket: unregister the listener ([`crate::net::tcp_unlisten`]). Connections it
+///   already forked live on — closing the listener only stops *new* connections.
+/// - an **unbound** socket: nothing to tear down.
+///
+/// In every case the fd slot is freed, so [`alloc_socket`]'s lowest-fd rule can hand it out again.
+/// Non-blocking: like Unix `close` it does not wait for the teardown, returning 0 via the stack ABI
+/// (`u64::MAX` for a fd that is not an open socket) without switching processes.
+pub fn on_user_close(fd: u64) -> u64 {
+    // Phase 1 (locked): look up the fd, remember its binding, and free the slot.
+    let (pid, sock) = {
+        let mut sched = SCHEDULER.lock();
+        let proc = match sched.current.as_mut() {
+            Some(p) => p,
+            None => return u64::MAX,
+        };
+        let sock = match proc.sockets.get(fd as usize).and_then(|s| *s) {
+            Some(s) => s,
+            None => {
+                serial_println!("[sched] close: process {} has no open socket fd {}", proc.id, fd);
+                return u64::MAX;
+            }
+        };
+        proc.sockets[fd as usize] = None; // free the slot for the lowest-fd rule to reuse
+        (proc.id, sock)
+    };
+
+    // Phase 2 (unlocked — the TCP calls take the connection lock): tear down the binding.
+    if sock.listening {
+        let removed = crate::net::tcp_unlisten(sock.local_port);
+        serial_println!(
+            "[sched] process {} closed listening socket fd {} (port {}, listener removed = {})",
+            pid, fd, sock.local_port, removed,
+        );
+    } else if sock.local_port != 0 {
+        let fin_sent = crate::net::tcp_close(sock.local_port, sock.remote_port);
+        if fin_sent {
+            // Drive the loopback replies (the ACK of our FIN, or the final ACK of the peer's) now; a
+            // real remote peer's replies would arrive through later polls instead.
+            for _ in 0..CLOSE_DRIVE_POLLS {
+                crate::net::poll();
+            }
+        }
+        serial_println!(
+            "[sched] process {} closed socket fd {} ({}:{}, FIN sent = {})",
+            pid, fd, sock.local_port, sock.remote_port, fin_sent,
+        );
+    } else {
+        serial_println!("[sched] process {} closed unbound socket fd {}", pid, fd);
+    }
+    PROCESSES_CLOSED.fetch_add(1, Ordering::SeqCst);
+    0
+}
+
 /// Called from the timer interrupt when it fires while a *user* process runs in ring 3
 /// — Stage 12c-3 preemption. Saves the running process's full register context,
 /// round-robins it to the back of the ready queue, switches to the next ready process
@@ -1869,4 +1994,20 @@ pub fn cross_accepts() -> u64 {
 /// (set by [`verify_cross_demo`]). For the Stage 24c-2 test.
 pub fn cross_data_ok() -> bool {
     CROSS_DATA_OK.load(Ordering::SeqCst)
+}
+
+/// How many `close` syscalls a ring 3 process completed. For the Stage 24d test.
+pub fn processes_closed() -> u64 {
+    PROCESSES_CLOSED.load(Ordering::SeqCst)
+}
+
+/// How many times a freed descriptor slot was reused by a later `socket`/`accept`. For the Stage 24d test.
+pub fn fd_slots_reused() -> u64 {
+    FD_SLOTS_REUSED.load(Ordering::SeqCst)
+}
+
+/// Whether the close demo's FIN teardown completed over loopback (set by [`verify_close_demo`]). For the
+/// Stage 24d test.
+pub fn close_teardown_ok() -> bool {
+    CLOSE_TEARDOWN_OK.load(Ordering::SeqCst)
 }

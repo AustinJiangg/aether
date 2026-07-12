@@ -1554,6 +1554,46 @@ pub fn received_on_port(local_port: u16) -> Option<Vec<u8>> {
         .map(|c| c.rx.clone())
 }
 
+/// Stage 24d: remove the passive **listener** on `local_port` — the TCP side of `close` on a listening
+/// socket. Only the `Listen`-state TCB is removed: connections it already forked (accepted or still
+/// queued) live on independently, exactly like Unix, where closing the listening fd stops *new*
+/// connections but severs nothing already established. Returns whether a listener was registered.
+pub fn remove_listener(local_port: u16) -> bool {
+    let mut table = CONNECTIONS.lock();
+    let before = table.len();
+    table.retain(|c| !(c.state == State::Listen && c.local_port == local_port));
+    table.len() != before
+}
+
+/// Stage 24d: whether a `Listen`-state TCB is registered on `local_port`. For the close-demo
+/// verification: after a ring 3 `close` of the listening fd, the listener must be gone.
+pub fn listener_exists(local_port: u16) -> bool {
+    CONNECTIONS
+        .lock()
+        .iter()
+        .any(|c| c.state == State::Listen && c.local_port == local_port)
+}
+
+/// Stage 24d: the state of the *connection* (not the listener) whose local port is `local_port` — the
+/// server end of a loopback pair. `None` if no such connection.
+pub fn state_on_port(local_port: u16) -> Option<State> {
+    CONNECTIONS
+        .lock()
+        .iter()
+        .find(|c| c.local_port == local_port && c.remote_port != 0)
+        .map(|c| c.state)
+}
+
+/// Stage 24d: the state of the connection whose *remote* port is `remote_port` — the client end of a
+/// loopback pair, whose local (ephemeral) port the caller does not know. `None` if no such connection.
+pub fn state_to_port(remote_port: u16) -> Option<State> {
+    CONNECTIONS
+        .lock()
+        .iter()
+        .find(|c| c.remote_port == remote_port)
+        .map(|c| c.state)
+}
+
 /// Stage 22b: the application **consuming** received data — drain up to `max` bytes from the front of the
 /// connection's receive buffer and return them. This is what reopens the flow-control window: the buffer
 /// shrinks, so the next segment we send advertises a larger [`recv_window`]. `None` if no such connection.

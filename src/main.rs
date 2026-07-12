@@ -1092,13 +1092,15 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         "[sched] spawned workers {} and {}, wait-demo parent {} (spawns its own child)",
         p1, p2, parent
     );
-    // Stage 24c: also spawn a ring 3 program that exercises the full socket lifecycle — the network
+    // Stage 24c/24d: also spawn a ring 3 program that exercises the full socket lifecycle — the network
     // stack and ring 3, joined. `spawn_accept_demo` enables PHY loopback and the program plays *both*
     // ends of a loopback TCP connection: `socket`/`listen` a server socket, `socket`/`connect` a client
     // socket to it, `accept` the connection (a new fd), then `send` on the client fd and `recv` on the
-    // accepted fd. The blocking `connect`/`accept`/`recv` drive the network inline (see
+    // accepted fd — and (Stage 24d) `close`s all three fds, driving the four-way FIN teardown from
+    // ring 3, plus one final `socket` that must reuse a freed descriptor. The blocking
+    // `connect`/`accept`/`recv` drive the network inline (see
     // `process::on_user_connect`/`on_user_accept`/`on_user_recv`). Loopback is turned back off in
-    // `boot_continue` after the process phase.
+    // `boot_continue` after the process phase (after the teardown is verified).
     let connector = process::spawn_accept_demo(&mut frame_allocator, phys_mem_offset);
     serial_println!("[sched] spawned accept-demo process {}", connector);
     // Stage 24c-2: also spawn *two distinct* ring 3 processes — a server and a client — that cooperate over
@@ -1159,29 +1161,38 @@ fn boot_continue() -> ! {
         "[sched] spawn: {} child process(es) created at runtime via the spawn syscall",
         process::processes_spawned(),
     );
-    // Stage 24a-24c: the socket demo has run. Turn the NIC's PHY loopback back off (it was enabled to
+    // Stage 24a-24d: the socket demo has run. Turn the NIC's PHY loopback back off (it was enabled to
     // route the demo's loopback traffic) and stop any loopback echo server, so the shell's later `ping`
     // and any real traffic reach the emulated wire again — then report how far the ring 3 process got
-    // through the socket syscalls (listen, connect, accept, send, recv).
+    // through the socket syscalls (listen, connect, accept, send, recv, close).
     // Stage 24c-2: verify the cross-process demo (a client process's bytes reached a *separate* server
     // process's accepted connection) *before* disabling loopback, while the connection table is intact.
+    // Stage 24d: likewise verify the close demo's FIN teardown (driven by ring 3 `close` syscalls)
+    // completed, while the torn-down connection pair is still inspectable.
     process::verify_cross_demo();
+    process::verify_close_demo();
     e1000::set_loopback(false);
     net::tcp_echo_disable();
     serial_println!(
-        "[sched] socket: {} listen(s), {} connect(s), {} accept(s), {} send(s), {} recv(s) from ring 3; last recv {} byte(s), last accepted fd {}",
+        "[sched] socket: {} listen(s), {} connect(s), {} accept(s), {} send(s), {} recv(s), {} close(s) from ring 3; last recv {} byte(s), last accepted fd {}, freed-fd reuses {}",
         process::processes_listened(),
         process::processes_connected(),
         process::processes_accepted(),
         process::processes_sent(),
         process::processes_received(),
+        process::processes_closed(),
         process::last_recv_len(),
         process::last_accepted_fd(),
+        process::fd_slots_reused(),
     );
     serial_println!(
         "[sched] socket (24c-2): {} cross-process accept(s) (a server process woken by a client), client->server data delivered = {}",
         process::cross_accepts(),
         process::cross_data_ok(),
+    );
+    serial_println!(
+        "[sched] socket (24d): ring 3 close completed the FIN teardown = {}",
+        process::close_teardown_ok(),
     );
     println!("Back from running user processes; continuing boot.");
 

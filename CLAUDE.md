@@ -395,9 +395,18 @@ a *separate* server's `accept`. `accept` keeps a fast path (queued connection re
 and a lone-server inline fallback. The demo is two hand-assembled programs (a server `socket`/`listen`/
 `accept`/`write`/`exit` and a client `socket`/`connect`/`send`/`exit` on port 7901); the kernel verifies the
 client's bytes reached the server's accepted connection (`verify_cross_demo`, which pumps `poll` to complete
-any retransmit — made non-flaky over 50+ test runs). `ROADMAP.md` records the full staged history (stages
-0-22d-3 complete, Stage 23 complete (23a-23d), Stage 24 in progress (24a-24c done); Stages 24d-26 remain: 24d
-is `SYS_CLOSE` + a user netcat demo).
+any retransmit — made non-flaky over 50+ test runs). **Stage 24d-1 is also done — `SYS_CLOSE`, completing the
+ring 3 socket lifecycle.** `close(fd)` frees the descriptor slot (so `alloc_socket`'s lowest-fd rule can
+reuse it — exercised for the first time) and tears down its binding: a **connected** socket sends its FIN
+(`net::tcp_close`, the Stage 21d state machine) and pumps a few polls so a loopback peer's replies land at
+once; a **listening** socket unregisters its listener (new `tcp::remove_listener` — connections it already
+forked live on, Unix semantics). Non-blocking, like Unix `close` (the FIN handshake finishes through later
+polls / the retransmission timer). The accept demo grew the closing tail — `close`(client fd, active close),
+`close`(accepted fd, passive close), `close`(listen fd), then one more `socket()` that must come back as the
+lowest freed fd (0) — and the kernel verifies the teardown after the process phase (`verify_close_demo` →
+`net::tcp_teardown_settled`: client end TIME_WAIT/CLOSED, server end CLOSED, listener gone). `ROADMAP.md`
+records the full staged history (stages 0-22d-3 complete, Stage 23 complete (23a-23d), Stage 24 in progress
+(24a-24c and 24d-1 done); remaining: 24d-2 — a user "netcat" demo wired into the shell — then Stages 25-26).
 
 ## Language and writing conventions
 
@@ -665,8 +674,10 @@ Exit QEMU: `Ctrl-A` then `X`.
   `write`/`getpid`/`exit`/`yield`/`wait`/`spawn` (Stage 12d's `spawn` creates a child
   process from a kernel-known program and returns its pid), plus Stage 24's socket syscalls
   `socket`/`connect`/`send`/`recv` (24a/24b; `send`/`recv` are the first three-argument
-  calls, adding a `[rsp+24]` slot) and `listen`/`accept` (24c-1: `listen` binds+registers a
-  listener via the stack ABI; `accept` blocks like `connect` and returns a new fd in rax).
+  calls, adding a `[rsp+24]` slot), `listen`/`accept` (24c-1: `listen` binds+registers a
+  listener via the stack ABI; `accept` blocks like `connect` and returns a new fd in rax), and
+  `close` (24d-1: non-blocking, stack ABI — frees the fd and starts any FIN teardown /
+  listener removal via `process::on_user_close`).
   Since Stage 12c-2 the entry is a
   hand-written *naked* stub (`syscall_entry`) that
   builds a full `TrapFrame` and calls `syscall_dispatch`, mirroring the timer — so the
@@ -715,7 +726,7 @@ Exit QEMU: `Ctrl-A` then `X`.
   24a/24b `spawn_connect_demo`) enables PHY loopback (`net::tcp_loopback_reset`, no kernel-side
   listener/echo) and spawns **one** ring 3 program that plays both ends over loopback —
   `socket()`(server)/`listen()`/`socket()`(client)/`connect()`/`accept()`/`send()`(client
-  fd)/`recv()`(accepted fd)/`write()/exit()` (the fds ride in `rbx`/`r14`/`r15`, which the
+  fd)/`recv()`(accepted fd)/`write()/exit()` (the fds ride in `rbx`/`r13`/`r14`/`r15`, which the
   syscall stub preserves across calls). Stage 24c-2 makes `on_user_accept` **switch-blocking**:
   with no connection queued and other processes ready, it parks the server (tagged with
   `Process::accept_port`) and switches to another ready process, and a new `service_net_blocked`
@@ -725,7 +736,13 @@ Exit QEMU: `Ctrl-A` then `X`.
   programs on port 7901; `verify_cross_demo` confirms the client's bytes reached the server's
   accepted connection). `accept` keeps a fast path (queued connection) and a lone-server inline
   fallback; `on_user_exit` also drives the network rather than stranding a last accept-blocked
-  process.
+  process. Stage 24d-1 adds `on_user_close` (the `close` syscall): frees the fd slot (so
+  `alloc_socket`'s lowest-fd rule can reuse it) and tears down the binding — a connected socket
+  sends its FIN (`net::tcp_close`) and pumps a few polls so loopback replies land; a listening
+  socket unregisters its listener (`net::tcp_unlisten`). The accept demo grew the closing tail
+  (`close` ×3 + a `socket()` that must reuse freed fd 0), and `verify_close_demo` (via
+  `net::tcp_teardown_settled`) confirms after the process phase that the four-way FIN teardown
+  completed: client end TIME_WAIT/CLOSED, server end CLOSED, listener gone.
 - `src/ata.rs`: Stage 13a/13b block device driver — a minimal ATA (IDE) disk driver in
   PIO mode. `read_sector` reads one raw 512-byte sector from the primary master by
   the polled READ SECTORS (LBA28) protocol: write the LBA/count registers, issue the
@@ -1010,7 +1027,11 @@ Exit QEMU: `Ctrl-A` then `X`.
   `net::tcp_loopback_reset` replaces the old `tcp_listen_loopback` (the accept demo does its own ring-3
   `listen`, so no kernel-side listener/echo is set up). Stage 24c-2 adds `received_on_port(port)`
   (`net::tcp_received_on_port`), a server-side connection's received bytes, so the kernel can verify a
-  cross-process client's data reached the server's accepted connection.
+  cross-process client's data reached the server's accepted connection. Stage 24d-1 adds the TCP side of
+  `close`: `remove_listener(port)` (`net::tcp_unlisten`) deletes only the `Listen` TCB — forked
+  connections live on — plus the state queries `listener_exists`/`state_on_port`/`state_to_port` backing
+  `net::tcp_teardown_settled`, which pumps `poll` until a loopback pair's ring-3-driven FIN teardown
+  settles (client end TIME_WAIT/CLOSED, server end CLOSED, listener gone).
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

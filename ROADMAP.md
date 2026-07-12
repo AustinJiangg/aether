@@ -1012,6 +1012,23 @@ Connects the two finished lines — the network stack and ring 3 — so user pro
 > retransmits), and `on_user_exit` **drives the network** rather than stranding an accept-blocked server when
 > it is the last process to exit. Verified by 92 tests (the new `two_processes_accepted_across_the_scheduler`).
 > (Remaining: 24d `SYS_CLOSE` + a user netcat demo, then Stages 25-26.)
+>
+> **Stage 24d-1 is done — `SYS_CLOSE`, completing the ring 3 socket lifecycle.** `close(fd)` (syscall 12)
+> frees the caller's descriptor slot — so [`alloc_socket`]'s lowest-fd rule can hand it out again, exercised
+> for the first time, since nothing ever freed a slot before — and tears down what the fd was bound to: a
+> **connected** socket sends its FIN (`net::tcp_close`, the Stage 21d state machine — FIN_WAIT_1 for an
+> active close, LAST_ACK if the peer closed first), pumping a few polls so a loopback peer's replies are
+> processed at once; a **listening** socket unregisters its listener (new `tcp::remove_listener` — only the
+> `Listen` TCB is removed; connections it already forked live on, Unix semantics); an unbound socket just
+> frees the slot. Non-blocking, like Unix `close`: the caller never waits — the FIN handshake finishes
+> through later polls and the retransmission timer. The 24c-1 accept demo grows the closing tail —
+> `close`(client fd) (the active close), `close`(accepted fd) (the passive close), `close`(listen fd), then
+> one more `socket()` that must come back as the lowest freed fd (0) — so one ring 3 program now drives the
+> **entire** lifecycle, four-way FIN teardown included. The kernel verifies it after the process phase
+> (`verify_close_demo` → `net::tcp_teardown_settled`, while loopback is still on): client end TIME_WAIT (or
+> already expired to CLOSED by the 2*MSL timer), server end CLOSED, listener gone. Verified by 93 tests (the
+> new `ring3_process_closed_its_sockets`: ≥3 ring 3 closes, ≥1 freed-fd reuse, teardown settled). (Remaining:
+> 24d-2 — a user "netcat" demo wired into the shell; then Stages 25-26.)
 
 | Sub-step | What to build | OS concepts | Smallest verifiable step |
 |----------|---------------|-------------|--------------------------|

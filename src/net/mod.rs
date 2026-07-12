@@ -858,6 +858,46 @@ pub fn tcp_received_on_port(local_port: u16) -> Option<Vec<u8>> {
     tcp::received_on_port(local_port)
 }
 
+/// Stage 24d: unregister the passive TCP listener on `local_port` — the backend of a ring 3 `close` on a
+/// *listening* socket fd ([`crate::process::on_user_close`]). Connections the listener already forked are
+/// untouched (Unix semantics: closing the listening fd only stops new connections). Returns whether a
+/// listener was registered.
+pub fn tcp_unlisten(local_port: u16) -> bool {
+    tcp::remove_listener(local_port)
+}
+
+/// Stage 24d: pump [`poll`] until the loopback connection pair on `port` finishes the FIN teardown a
+/// ring 3 process's `close` syscalls drove — the client end (which closed first, the active closer) in
+/// TIME_WAIT, or already expired to CLOSED by the 2*MSL timer; the server end (which closed second, the
+/// passive closer) in CLOSED; and the listener unregistered — or a bound elapses. The pumping matters: a
+/// final segment (or a retransmission, if an ACK was lost) may still be in flight when the process phase
+/// ends. Logs and returns the outcome; backs `process::verify_close_demo`.
+pub fn tcp_teardown_settled(port: u16) -> bool {
+    let mut done = false;
+    for _ in 0..400 {
+        let client_done = matches!(
+            tcp::state_to_port(port),
+            Some(tcp::State::TimeWait) | Some(tcp::State::Closed)
+        );
+        let server_done = matches!(tcp::state_on_port(port), Some(tcp::State::Closed));
+        done = client_done && server_done && !tcp::listener_exists(port);
+        if done {
+            break;
+        }
+        poll();
+        crate::apic::pit_sleep_us(500);
+    }
+    serial_println!(
+        "[net] TCP teardown on port {}: client {:?}, server {:?}, listener gone = {}, settled = {}",
+        port,
+        tcp::state_to_port(port),
+        tcp::state_on_port(port),
+        !tcp::listener_exists(port),
+        done,
+    );
+    done
+}
+
 /// Stage 24b: stop echoing on the loopback listener (clears [`TCP_ECHO_PORT`]). Called after the process
 /// phase so the shell's later network use does not accidentally bounce traffic.
 pub fn tcp_echo_disable() {

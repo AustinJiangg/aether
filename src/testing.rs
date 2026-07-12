@@ -350,6 +350,20 @@ fn two_processes_accepted_across_the_scheduler() {
     assert!(crate::process::cross_data_ok());
 }
 
+/// Stage 24d: a ring 3 process completed the socket lifecycle with `close`. The accept demo now closes all
+/// three of its fds — the client socket (an active close: our FIN, ESTABLISHED -> FIN_WAIT_1 ->
+/// FIN_WAIT_2), the accepted socket (the passive close: CLOSE_WAIT -> LAST_ACK -> CLOSED, whose final ACK
+/// moves the client end to TIME_WAIT), and the listener (unregistered) — then opens one more socket, which
+/// must reuse the lowest freed descriptor slot. The kernel verified after the process phase that the
+/// four-way FIN teardown really completed over loopback (client end TIME_WAIT/CLOSED, server end CLOSED,
+/// listener gone).
+#[test_case]
+fn ring3_process_closed_its_sockets() {
+    assert!(crate::process::processes_closed() >= 3); // client + accepted + listener
+    assert!(crate::process::fd_slots_reused() >= 1); // the post-close socket() filled a freed slot
+    assert!(crate::process::close_teardown_ok()); // the FIN handshake ran to completion
+}
+
 /// Stage 13a: the ATA PIO driver reads a raw sector from disk. The bootimage QEMU attaches
 /// the kernel image as the primary IDE master, so sector 0 is the boot sector, whose final
 /// two bytes are the MBR boot signature 0x55 0xAA — a stable value to assert without
