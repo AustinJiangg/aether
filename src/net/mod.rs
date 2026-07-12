@@ -821,22 +821,34 @@ pub fn tcp_connect(remote_ip: [u8; 4], remote_port: u16) -> Option<u16> {
     None
 }
 
-/// Stage 24a: set up a kernel-side passive TCP listener on `local_port` with the NIC's PHY
-/// loopback enabled, so a locally-originated SYN to our own address reaches this listener and
-/// its SYN-ACK returns to us — the same loopback arrangement the TCP self-tests use. The
-/// Stage 24a connect-demo ring 3 program (`process::spawn_connect_demo`) then `connect`s to
-/// it. The listener is left in place; the caller disables loopback again (`e1000::set_loopback(false)`)
-/// once the demo has run. Clears the connection table first so the handshake starts clean.
-pub fn tcp_listen_loopback(local_port: u16) {
+/// Stage 24c: prepare the NIC for a loopback socket exchange driven entirely from ring 3 — clear the
+/// connection table, enable the card's PHY loopback (so a locally-originated frame returns to us, the same
+/// arrangement the TCP self-tests use), and drain any stale frames so the handshake sees a clean ring.
+/// Unlike the old Stage 24a `tcp_listen_loopback`, it registers **no** kernel-side listener and no echo
+/// server: the ring 3 accept demo (`process::spawn_accept_demo`) does its own `listen`/`accept`, and its
+/// `recv` reads the accepted (server-side) socket directly — nothing needs echoing. The caller disables
+/// loopback again (`e1000::set_loopback(false)`) once the demo has run.
+pub fn tcp_loopback_reset() {
     tcp::reset_connections();
-    tcp::open_passive(local_port);
-    // Stage 24b: also make this listener an echo server, so a ring 3 `send` on the connection is bounced
-    // back for the following `recv` to read (driven by `poll`; see `TCP_ECHO_PORT`).
-    TCP_ECHO_PORT.store(local_port as u32, Ordering::Relaxed);
     e1000::set_loopback(true);
     // Drain any stale frames so the handshake sees a clean ring.
     let mut sink = [0u8; 2048];
     while e1000::poll_frame(&mut sink).is_some() {}
+}
+
+/// Stage 24c: register a passive TCP **listener** on `local_port` — the backend of a ring 3 `listen`
+/// syscall ([`crate::process::on_user_listen`]). The listener stays open and forks a fresh TCB per incoming
+/// connection ([`tcp::open_passive`]); [`tcp_accept`] then claims each established one.
+pub fn tcp_listen(local_port: u16) {
+    tcp::open_passive(local_port);
+}
+
+/// Stage 24c: claim the next established connection waiting in the listener's accept queue on `local_port`,
+/// returning its `(local_port, remote_port)` port pair, or `None` if none is ready yet. Backs the blocking
+/// `accept` syscall ([`crate::process::on_user_accept`]), which retries this while pumping [`poll`] until a
+/// connection appears.
+pub fn tcp_accept(local_port: u16) -> Option<(u16, u16)> {
+    tcp::accept_one(local_port)
 }
 
 /// Stage 24b: stop echoing on the loopback listener (clears [`TCP_ECHO_PORT`]). Called after the process

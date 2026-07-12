@@ -372,9 +372,22 @@ reads). `send` is non-blocking (`on_user_send` → `net::tcp_send`); `recv` **bl
 24a's park-and-inline-poll, copies into the caller's buffer — safe since a blocked syscall never switches
 CR3 — and wakes with the count in `rax`). The loopback listener became a **TCP echo server**
 (`tcp::echo_service`, driven by `net::poll`) so a loopback `recv` has something to receive; the demo program
-grew to `socket/connect/send/recv/write/exit`, the fd riding in `rbx` across syscalls. `ROADMAP.md` records
-the full staged history (stages 0-22d-3 complete, Stage 23 complete (23a-23d), Stage 24 in progress (24a-24b
-done); Stages 24c-26 remain).
+grew to `socket/connect/send/recv/write/exit`, the fd riding in `rbx` across syscalls. **Stage 24c-1 is also
+done**: `listen`/`accept` (server sockets + the accept queue). The core change is in `net/tcp.rs`'s passive
+open — a listener now **stays** in `Listen` and **forks a fresh `SynReceived` TCB** per incoming SYN (via a
+shared `new_tcb` constructor), leaving the connection in an implicit accept queue (a `Tcb::accepted` flag),
+instead of the old "the listener becomes the connection" shortcut; `accept_one(port)` claims the oldest
+established, unaccepted connection. `SYS_LISTEN` (`on_user_listen`, non-blocking) binds a socket to a port and
+registers the listener; `SYS_ACCEPT` (`on_user_accept`) **blocks** and drives `net::poll` inline (like
+`connect`/`recv`) until a connection is ready, then returns a **new fd** bound to it (a shared `alloc_socket`
+helper; `UserSocket` gains a `listening` flag). Because the process phase has no concurrent net thread and
+syscalls run with interrupts off, two *distinct* ring-3 processes cannot both progress inside a blocking
+inline pump, so 24c-1 proves it with a **single** ring-3 program playing *both* ends over PHY loopback
+(`socket`/`listen`/`socket`/`connect`/`accept`/`send`/`recv`/`write`/`exit`) — which subsumes and so
+**replaces** the 24a/24b connect demo (the kernel-side listener/echo scaffolding, `tcp_listen_loopback`,
+becomes a plain `tcp_loopback_reset`). `ROADMAP.md` records the full staged history (stages 0-22d-3 complete,
+Stage 23 complete (23a-23d), Stage 24 in progress (24a-24b done, 24c-1 done); Stages 24c-2/24d-26 remain: a
+two-process client+server needs a "connection-established -> wake the accept-blocked server" mechanism).
 
 ## Language and writing conventions
 
@@ -640,9 +653,11 @@ Exit QEMU: `Ctrl-A` then `X`.
 - `src/syscall.rs`: Stage 10 system calls over `int 0x80` (its IDT gate's DPL is 3 so
   ring 3 may invoke it) with a stack-based argument ABI:
   `write`/`getpid`/`exit`/`yield`/`wait`/`spawn` (Stage 12d's `spawn` creates a child
-  process from a kernel-known program and returns its pid), plus Stage 24a/24b's
-  `socket`/`connect`/`send`/`recv` (the socket syscalls; `send`/`recv` are the first
-  three-argument calls, adding a `[rsp+24]` slot). Since Stage 12c-2 the entry is a
+  process from a kernel-known program and returns its pid), plus Stage 24's socket syscalls
+  `socket`/`connect`/`send`/`recv` (24a/24b; `send`/`recv` are the first three-argument
+  calls, adding a `[rsp+24]` slot) and `listen`/`accept` (24c-1: `listen` binds+registers a
+  listener via the stack ABI; `accept` blocks like `connect` and returns a new fd in rax).
+  Since Stage 12c-2 the entry is a
   hand-written *naked* stub (`syscall_entry`) that
   builds a full `TrapFrame` and calls `syscall_dispatch`, mirroring the timer — so the
   general-purpose registers survive a context switch. Ring 3 `yield`/`exit` call
@@ -682,11 +697,18 @@ Exit QEMU: `Ctrl-A` then `X`.
   no background net thread runs during the process phase), then wakes it with the result in
   rax (like `wait`). Stage 24b adds `on_user_send` (non-blocking → `net::tcp_send`) and
   `on_user_recv` (blocks like `connect`, then copies the received bytes into the caller's
-  buffer — safe because a blocked syscall never switches CR3). `spawn_connect_demo` stands up
-  a kernel-side loopback listener that also **echoes** (`net::tcp_listen_loopback` + PHY
-  loopback + `tcp::echo_service`) and spawns a ring 3 program running the full socket
-  lifecycle `socket()/connect()/send()/recv()/write()/exit()` (the fd rides in `rbx`, which
-  the syscall stub preserves across calls).
+  buffer — safe because a blocked syscall never switches CR3). Stage 24c-1 adds `on_user_listen`
+  (binds an unbound socket to a port, marks it `listening`, and registers the listener via
+  `net::tcp_listen`) and `on_user_accept` (blocks and drives `net::poll` inline until a
+  connection is ready, then binds a **new fd** — via a shared `alloc_socket` helper — to it and
+  returns it in rax); `UserSocket` gained a `listening` flag. `spawn_accept_demo` (replacing the
+  24a/24b `spawn_connect_demo`) enables PHY loopback (`net::tcp_loopback_reset`, no kernel-side
+  listener/echo) and spawns **one** ring 3 program that plays both ends over loopback —
+  `socket()`(server)/`listen()`/`socket()`(client)/`connect()`/`accept()`/`send()`(client
+  fd)/`recv()`(accepted fd)/`write()/exit()` (the fds ride in `rbx`/`r14`/`r15`, which the
+  syscall stub preserves across calls). Two distinct ring-3 processes cannot both progress
+  inside a blocking inline pump during the process phase, so the single-process demo is 24c-1's
+  proof; the true two-process client+server is 24c-2.
 - `src/ata.rs`: Stage 13a/13b block device driver — a minimal ATA (IDE) disk driver in
   PIO mode. `read_sector` reads one raw 512-byte sector from the primary master by
   the polled READ SECTORS (LBA28) protocol: write the LBA/count registers, issue the
@@ -961,7 +983,15 @@ Exit QEMU: `Ctrl-A` then `X`.
   `sack_holes` fast-retransmits only the gaps below the highest SACKed sequence (extra holes via
   `Tcb::sack_resend`, drained by `take_sack_resends`), so multiple losses recover in one round trip.
   `net::tcp_sack_recovery_loopback_selftest` drops two non-adjacent segments (the `DROP_TCP_TX_MASK` bitmask
-  hook) and confirms one fast retransmit recovered both holes with no RTO.
+  hook) and confirms one fast retransmit recovered both holes with no RTO. **Stage 24c-1** upgraded the
+  **passive-open model for server sockets**: `on_segment` no longer transforms the `Listen` TCB into the
+  connection — the listener **stays** `Listen` and **forks a fresh `SynReceived` TCB** per incoming SYN (a
+  shared `new_tcb` constructor now backs `open_passive`/`open_active`/the fork), leaving each completed
+  connection in an implicit **accept queue** (a `Tcb::accepted` flag; a retransmitted SYN is caught by the
+  existing-connection lookup, so only the first forks). `accept_one(port)` claims the oldest established,
+  unaccepted connection; `net::tcp_listen`/`tcp_accept` wrap it for the `listen`/`accept` syscalls, and
+  `net::tcp_loopback_reset` replaces the old `tcp_listen_loopback` (the accept demo does its own ring-3
+  `listen`, so no kernel-side listener/echo is set up).
 - `src/testing.rs`: the in-QEMU unit-test harness. Built on the
   `custom_test_frameworks` feature, it provides a custom `test_runner`,
   `exit_qemu` (which ends the VM through the `isa-debug-exit` device so the run

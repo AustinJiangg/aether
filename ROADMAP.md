@@ -797,7 +797,7 @@ unify later.
 
 ## Post-roadmap tracks (Stage 23+)
 
-> **Status: in progress — Stage 23 complete (23a-23d); Stage 24 in progress (24a-24b done); Stages 24c-26 remain.** With the original roadmap complete (stages 0-22d-3), four independent
+> **Status: in progress — Stage 23 complete (23a-23d); Stage 24 in progress (24a-24b done, 24c-1 done); Stages 24c-2/24d-26 remain.** With the original roadmap complete (stages 0-22d-3), four independent
 > follow-on tracks extend it. They are **not** strictly ordered by dependency, but the recommended sequence
 > is **23 → 24 → 25 → 26**, chosen by risk and blast radius: do the isolated TCP polish first (it rides the
 > momentum of the just-finished TCP work), then the socket capstone that makes the stack usable, then the
@@ -965,6 +965,31 @@ Connects the two finished lines — the network stack and ring 3 — so user pro
 > notably the socket state survives timer preemption between the `send` and `recv` (the other demos run in
 > between). Verified by 90 tests (the new `ring3_process_sent_and_received`). (Remaining: 24c `listen`/
 > `accept`, 24d `close` + a user netcat demo.)
+>
+> **Stage 24c-1 is done — `listen`/`accept` (server sockets + the accept queue).** The substantive change is
+> in the TCP layer: `net/tcp.rs`'s passive open no longer uses the "the listener *becomes* the connection"
+> shortcut — a listener now **stays** in `Listen` and, on each incoming SYN, **forks a fresh `SynReceived`
+> TCB** (a shared `new_tcb` constructor now backs `open_passive`/`open_active`/the fork, so a new `Tcb` field
+> is initialized in one place), leaving the connection in the listener's implicit **accept queue** (an
+> `accepted: bool` flag; a retransmitted SYN is caught by the existing-connection lookup, so only the first
+> SYN forks). `accept_one(port)` claims the oldest established, not-yet-accepted connection on the listen
+> port. `SYS_LISTEN` (10) binds a socket to a port and registers the listener (`on_user_listen`,
+> non-blocking, stack ABI); `SYS_ACCEPT` (11) **blocks** and — like `connect`/`recv` — drives `net::poll`
+> inline until a connection is ready, then allocates a **new fd** bound to it (a shared `alloc_socket` helper)
+> and returns it in `rax`. The `UserSocket` handle gains a `listening` flag (so `send`/`recv` refuse a
+> listener fd). **Scheduling note:** the process phase has no concurrent net thread and syscalls run with
+> interrupts off, so two *distinct* ring-3 processes cannot both make progress inside a blocking inline pump
+> (whichever pumps starves the other). So 24c-1 proves the mechanism with a **single** ring-3 program playing
+> *both* ends over PHY loopback — `socket`(server)/`listen`/`socket`(client)/`connect`/`accept`/`send`(client
+> fd)/`recv`(accepted fd)/`write`/`exit` — exactly as every `net/tcp.rs` loopback self-test drives both ends
+> in one thread. This demo subsumes the 24a/24b client path, so it **replaces** the old connect demo (the
+> kernel-side listener/echo-server scaffolding, `tcp_listen_loopback`, gives way to a plain
+> `tcp_loopback_reset`; the ring-3 program does its own `listen`/`accept`, and `recv` reads the accepted
+> server socket directly — no echo needed). Boot logs the client connecting (`fd 1 -> 49168:7900`), `accept`
+> returning a distinct `fd 2 -> 7900:49168`, and 27 bytes received on that accepted fd. Verified by 91 tests
+> (the new `ring3_process_listened_and_accepted`; the 24a/24b tests still pass unchanged). (Remaining: 24c-2,
+> a *two-process* client + server — needs a "connection-established -> wake the accept-blocked server"
+> mechanism, or the net thread running during the process phase; then 24d `close` + a user netcat demo.)
 
 | Sub-step | What to build | OS concepts | Smallest verifiable step |
 |----------|---------------|-------------|--------------------------|

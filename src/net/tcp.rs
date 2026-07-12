@@ -590,6 +590,12 @@ struct Tcb {
     sack_resend: Vec<Vec<u8>>,
     /// Stage 21e: the tick at which a TIME_WAIT connection may finally close (set on entering TIME_WAIT).
     time_wait_deadline: u64,
+    /// Stage 24c: whether this connection has been handed to the application via `accept`. A listener
+    /// (Stage 24c) forks a fresh TCB per incoming connection and leaves it `false` — the connection then
+    /// waits in the listener's implicit **accept queue** (established TCBs on the listen port with this flag
+    /// clear) until [`accept_one`] claims it and sets it `true`. Meaningless for active opens and listeners
+    /// themselves (set `true` at creation so they are never mistaken for a queued connection).
+    accepted: bool,
 }
 
 /// The connection table. Small and linear — one entry per connection (and one per listener). A real
@@ -605,20 +611,16 @@ fn next_isn() -> u32 {
     ISN_GEN.fetch_add(0x0001_0000, Ordering::Relaxed)
 }
 
-/// Register a passive open (a **listener**) on `local_port`: a TCB in [`State::Listen`] that will accept
-/// an incoming SYN. Idempotent — a second listen on the same port is ignored. (Minimal model: the
-/// listener itself becomes the connection on the first SYN, rather than forking a fresh TCB and staying
-/// open for more, which is all the loopback handshake test needs.)
-pub fn open_passive(local_port: u16) {
-    let mut table = CONNECTIONS.lock();
-    if table.iter().any(|c| c.state == State::Listen && c.local_port == local_port) {
-        return;
-    }
-    table.push(Tcb {
-        state: State::Listen,
+/// Construct a TCB with every per-connection field at its default for the given `state` and identifying
+/// tuple. Shared by [`open_passive`], [`open_active`], and (Stage 24c) the listener's per-connection fork,
+/// so a new `Tcb` field is initialized in exactly one place. The handshake bookkeeping (`iss`/`snd_una`/
+/// `snd_nxt`/`irs`/`rcv_nxt`) and any non-default flags are filled in by the caller after construction.
+fn new_tcb(state: State, local_port: u16, remote_port: u16, remote_ip: [u8; 4]) -> Tcb {
+    Tcb {
+        state,
         local_port,
-        remote_port: 0,
-        remote_ip: [0; 4],
+        remote_port,
+        remote_ip,
         snd_una: 0,
         snd_nxt: 0,
         iss: 0,
@@ -643,7 +645,21 @@ pub fn open_passive(local_port: u16) {
         retransmit: Vec::new(),
         sack_resend: Vec::new(),
         time_wait_deadline: 0,
-    });
+        accepted: false,
+    }
+}
+
+/// Register a passive open (a **listener**) on `local_port`: a TCB in [`State::Listen`] that accepts
+/// incoming SYNs. Idempotent — a second listen on the same port is ignored. Since Stage 24c the listener
+/// **stays** in Listen and forks a fresh TCB per incoming connection (see [`on_segment`]), so it can back
+/// many connections; [`accept_one`] then claims each established one. (Before 24c the listener itself
+/// became the connection on the first SYN, which sufficed for the loopback handshake tests.)
+pub fn open_passive(local_port: u16) {
+    let mut table = CONNECTIONS.lock();
+    if table.iter().any(|c| c.state == State::Listen && c.local_port == local_port) {
+        return;
+    }
+    table.push(new_tcb(State::Listen, local_port, 0, [0; 4]));
 }
 
 /// Start an active open: create a TCB in [`State::SynSent`] for the `local_port -> remote_ip:remote_port`
@@ -657,36 +673,12 @@ pub fn open_active(
 ) -> Vec<u8> {
     let iss = next_isn();
     let mut table = CONNECTIONS.lock();
-    table.push(Tcb {
-        state: State::SynSent,
-        local_port,
-        remote_port,
-        remote_ip,
-        snd_una: iss,
-        snd_nxt: iss.wrapping_add(1), // SYN consumes one sequence number
-        iss,
-        snd_wnd: 0, // unknown until the SYN-ACK advertises the peer's window
-        snd_buf: Vec::new(),
-        cwnd: INIT_CWND,
-        ssthresh: INIT_SSTHRESH,
-        dup_acks: 0,
-        in_fast_recovery: false,
-        srtt: 0,
-        rttvar: 0,
-        rto: RTO_INITIAL_TICKS,
-        rtt_valid: false,
-        unacked_segs: 0,
-        delayed_ack_deadline: 0,
-        nodelay: false,
-        sack_permitted: false, // set once the SYN-ACK confirms the peer also permits SACK (Stage 23d-1)
-        rcv_nxt: 0, // unknown until the SYN-ACK tells us the peer's ISN
-        irs: 0,
-        rx: Vec::new(),
-        ooo: Vec::new(),
-        retransmit: Vec::new(),
-        sack_resend: Vec::new(),
-        time_wait_deadline: 0,
-    });
+    let mut tcb = new_tcb(State::SynSent, local_port, remote_port, remote_ip);
+    tcb.iss = iss;
+    tcb.snd_una = iss;
+    tcb.snd_nxt = iss.wrapping_add(1); // SYN consumes one sequence number
+    tcb.accepted = true; // an active open is not a listener's queued connection (Stage 24c)
+    table.push(tcb);
     // Offer SACK on the SYN (Stage 23d-1); the peer enables it only by echoing the option in its SYN-ACK.
     build_with_options(
         local_ip,
@@ -720,40 +712,42 @@ pub fn on_segment(local_ip: [u8; 4], remote_ip: [u8; 4], seg: &Segment) -> Optio
         return step(&mut table[idx], local_ip, remote_ip, seg);
     }
 
-    // 2. Otherwise, a listener on the destination port accepting a fresh SYN (passive open).
-    if let Some(idx) = table
+    // 2. Otherwise, a listener on the destination port accepting a fresh SYN (passive open). Stage 24c:
+    //    fork a *new* SynReceived TCB for this connection and leave the listener in Listen, so it can back
+    //    more connections; the forked TCB waits in the accept queue (`accepted == false`) for [`accept_one`].
+    //    A retransmitted SYN is caught by step 1 (the forked TCB already exists), so we fork only the first.
+    if table
         .iter()
-        .position(|c| c.state == State::Listen && c.local_port == seg.dst_port)
+        .any(|c| c.state == State::Listen && c.local_port == seg.dst_port)
     {
         // Only a bare SYN (not SYN-ACK) opens a connection; anything else to a listener is ignored.
         if seg.flags & SYN != 0 && seg.flags & ACK == 0 {
             let iss = next_isn();
-            let tcb = &mut table[idx];
-            tcb.remote_ip = remote_ip;
-            tcb.remote_port = seg.src_port;
-            tcb.irs = seg.seq;
-            tcb.rcv_nxt = seg.seq.wrapping_add(1); // the peer's SYN consumes one seq
-            tcb.iss = iss;
-            tcb.snd_una = iss;
-            tcb.snd_nxt = iss.wrapping_add(1); // our SYN consumes one seq
-            tcb.snd_wnd = seg.window as u32; // learn the peer's receive window from its SYN (Stage 22c)
+            let mut conn = new_tcb(State::SynReceived, seg.dst_port, seg.src_port, remote_ip);
+            conn.irs = seg.seq;
+            conn.rcv_nxt = seg.seq.wrapping_add(1); // the peer's SYN consumes one seq
+            conn.iss = iss;
+            conn.snd_una = iss;
+            conn.snd_nxt = iss.wrapping_add(1); // our SYN consumes one seq
+            conn.snd_wnd = seg.window as u32; // learn the peer's receive window from its SYN (Stage 22c)
             // Stage 23d-1: enable SACK only if the peer offered it, and echo the option back only then, so
             // both ends agree (RFC 2018). A SYN without it leaves the connection non-SACK.
-            tcb.sack_permitted = seg.sack_permitted();
-            tcb.state = State::SynReceived;
-            let options: &[u8] = if tcb.sack_permitted { &SACK_PERMITTED_OPTION } else { &[] };
-            return Some(build_with_options(
+            conn.sack_permitted = seg.sack_permitted();
+            let options: &[u8] = if conn.sack_permitted { &SACK_PERMITTED_OPTION } else { &[] };
+            let resp = build_with_options(
                 local_ip,
                 remote_ip,
-                tcb.local_port,
-                tcb.remote_port,
+                conn.local_port,
+                conn.remote_port,
                 iss,
-                tcb.rcv_nxt,
+                conn.rcv_nxt,
                 SYN | ACK,
-                recv_window(tcb),
+                recv_window(&conn),
                 options,
                 &[],
-            ));
+            );
+            table.push(conn);
+            return Some(resp);
         }
     }
 
@@ -1696,6 +1690,20 @@ pub fn established_count() -> usize {
         .iter()
         .filter(|c| c.state == State::Established)
         .count()
+}
+
+/// Stage 24c: claim the next connection waiting in the listener's **accept queue** on `local_port` — the
+/// oldest established connection this listener forked (see [`on_segment`]) that has not yet been handed to
+/// the application. Marks it `accepted` and returns its `(local_port, remote_port)` so the caller can bind a
+/// socket to it. `None` if no such connection is ready yet (the caller then blocks and retries). The `Vec`'s
+/// arrival order is the FIFO accept order.
+pub fn accept_one(local_port: u16) -> Option<(u16, u16)> {
+    let mut table = CONNECTIONS.lock();
+    let tcb = table
+        .iter_mut()
+        .find(|c| c.local_port == local_port && c.state == State::Established && !c.accepted)?;
+    tcb.accepted = true;
+    Some((tcb.local_port, tcb.remote_port))
 }
 
 /// Stage 21e: service the connection timers — call once per [`super::poll`]. For every connection whose

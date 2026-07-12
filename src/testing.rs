@@ -312,16 +312,30 @@ fn ring3_process_connected_a_socket() {
     assert!(crate::process::processes_connected() >= 1);
 }
 
-/// Stage 24b: a ring 3 process did full stream I/O through the `send`/`recv` syscalls. The boot demo
-/// program `send`s a 27-byte message to the kernel-side loopback echo server and blocks in `recv`
-/// until the echo returns; the blocking recv drives the network inline and wakes the process with the
-/// bytes. So by the time this harness runs at least one send and one recv must have completed, and the
-/// last recv must have delivered exactly the echoed message ("hello from a ring 3 socket\n" = 27 B).
+/// Stage 24b: a ring 3 process did full stream I/O through the `send`/`recv` syscalls. The Stage 24c
+/// accept demo (which subsumes the 24b client path) `send`s a 27-byte message on its client socket and
+/// `recv`s it on the accepted server socket over loopback; the blocking recv drives the network inline
+/// and wakes the process with the bytes. So by the time this harness runs at least one send and one recv
+/// must have completed, and the last recv must have delivered exactly the message
+/// ("hello from a ring 3 socket\n" = 27 B).
 #[test_case]
 fn ring3_process_sent_and_received() {
     assert!(crate::process::processes_sent() >= 1);
     assert!(crate::process::processes_received() >= 1);
     assert_eq!(crate::process::last_recv_len(), 27);
+}
+
+/// Stage 24c: a ring 3 process used the server-socket syscalls `listen`/`accept`. The boot demo runs one
+/// program that plays both ends over loopback: it `listen`s a server socket, `connect`s a client socket to
+/// it (which forks a server-side TCB into the listener's accept queue), then `accept`s — the blocking accept
+/// drives the network inline until the connection is ESTABLISHED and claims it, returning a fresh fd. So by
+/// the time this harness runs at least one listen and one accept must have completed, and the accepted fd
+/// must be a real descriptor (not the `u64::MAX` error sentinel).
+#[test_case]
+fn ring3_process_listened_and_accepted() {
+    assert!(crate::process::processes_listened() >= 1);
+    assert!(crate::process::processes_accepted() >= 1);
+    assert_ne!(crate::process::last_accepted_fd(), u64::MAX);
 }
 
 /// Stage 13a: the ATA PIO driver reads a raw sector from disk. The bootimage QEMU attaches

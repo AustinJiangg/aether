@@ -77,6 +77,15 @@ pub const SYS_SEND: u64 = 8;
 /// (Stage 24b), returning the number of bytes read (0 on end-of-stream). Meaningful only from
 /// ring 3. Like `connect` it **blocks** — until data arrives — so it returns its count in `rax`.
 pub const SYS_RECV: u64 = 9;
+/// `listen(fd, port)` — turn socket `fd` into a passive **listener** bound to `port`, ready to accept
+/// incoming connections (Stage 24c). Meaningful only from ring 3; non-blocking (it just registers the
+/// listener), so it returns via the stack ABI like `write` (0 on success, `u64::MAX` on error).
+pub const SYS_LISTEN: u64 = 10;
+/// `accept(fd)` — take the next established connection from listening socket `fd`'s accept queue,
+/// returning a **new** file descriptor bound to it (Stage 24c). Meaningful only from ring 3. Like
+/// `connect`/`recv` it **blocks** — until a connection is ready — so it returns the new fd in `rax`
+/// (`u64::MAX` on error/timeout). The listening `fd` stays open to accept more.
+pub const SYS_ACCEPT: u64 = 11;
 
 /// Count of syscalls that arrived from ring 3 — proof (for the Stage 10b test)
 /// that the user program really crossed into the kernel through `int 0x80`.
@@ -250,6 +259,25 @@ extern "C" fn syscall_dispatch(tf_ptr: *mut TrapFrame) {
         let ptr = unsafe { args.add(2).read() };
         let len = unsafe { args.add(3).read() };
         crate::process::on_user_recv(tf, fd, ptr, len);
+        return;
+    }
+    if number == SYS_LISTEN && from_ring3 {
+        // `listen` binds the socket to a port and registers a passive listener. Non-blocking, returns via
+        // the stack ABI (like `send`), and does not switch processes.
+        // SAFETY: `listen` pushed both arguments (fd, port) at [rsp+8], [rsp+16].
+        let fd = unsafe { args.add(1).read() };
+        let port = unsafe { args.add(2).read() };
+        let result = crate::process::on_user_listen(fd, port);
+        // SAFETY: the number slot is writable, as above.
+        unsafe { args.write(result) };
+        return;
+    }
+    if number == SYS_ACCEPT && from_ring3 {
+        // `accept` *blocks* until a connection is ready, then rewrites this `TrapFrame` (rax = new fd) to
+        // resume the caller — like `connect`/`recv`. It returns in rax, not the stack.
+        // SAFETY: `accept` pushed its one argument (fd) at [rsp+8].
+        let fd = unsafe { args.add(1).read() };
+        crate::process::on_user_accept(tf, fd);
         return;
     }
 
