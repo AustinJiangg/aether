@@ -797,7 +797,7 @@ unify later.
 
 ## Post-roadmap tracks (Stage 23+)
 
-> **Status: in progress — Stage 23 complete (23a-23d); Stage 24 in progress (24a-24c done); Stages 24d-26 remain.** With the original roadmap complete (stages 0-22d-3), four independent
+> **Status: in progress — Stage 23 complete (23a-23d); Stage 24 complete (24a-24d); Stages 25-26 remain.** With the original roadmap complete (stages 0-22d-3), four independent
 > follow-on tracks extend it. They are **not** strictly ordered by dependency, but the recommended sequence
 > is **23 → 24 → 25 → 26**, chosen by risk and blast radius: do the isolated TCP polish first (it rides the
 > momentum of the just-finished TCP work), then the socket capstone that makes the stack usable, then the
@@ -1029,6 +1029,33 @@ Connects the two finished lines — the network stack and ring 3 — so user pro
 > already expired to CLOSED by the 2*MSL timer), server end CLOSED, listener gone. Verified by 93 tests (the
 > new `ring3_process_closed_its_sockets`: ≥3 ring 3 closes, ≥1 freed-fd reuse, teardown settled). (Remaining:
 > 24d-2 — a user "netcat" demo wired into the shell; then Stages 25-26.)
+>
+> **Stage 24d-2 is done — a ring 3 "netcat" wired into the shell, completing Stage 24 (user space +
+> networking).** The shell gains `nc <a.b.c.d> <port> [text]`: it loads and spawns a hand-assembled ring 3
+> program that drives the whole Stage 24 lifecycle itself — `socket`, a blocking `connect`, `send`, a
+> blocking `recv`, `write` (printing whatever the peer sent back), `close`, `exit` — and the shell simply
+> resumes when it exits. Two new mechanisms carry it. (1) **A returnable ring 3 excursion**
+> (`usermode::enter_returning` + `process::run_and_return`): the boot-phase `enter` hands the rest of boot
+> to a `fn() -> !` continuation on a reset stack, which would forget the shell's live frames (the executor,
+> the dispatch loop, the command handler) — so the new path is a setjmp/longjmp over the *same* resume
+> machinery: a naked stub saves the six callee-saved registers (exactly `context_switch`'s outgoing half)
+> and publishes its RSP + a landing label as the resume point; `resume_kernel` (unchanged) lands the last
+> `exit`'s `iretq` there, and the stub pops the registers and returns like an ordinary call. Running user
+> programs is thereby promoted from a one-shot boot phase to a **callable kernel service**. (2) **Quiescing
+> the background net thread** (`unify::pause_net_thread`): the blocking socket syscalls pump `net::poll`
+> inline with interrupts off, so if the timer had preempted the net thread mid-`poll` — holding the
+> connection-table or NIC lock — the syscall would spin on that lock forever with the holder unable to run;
+> a request/acknowledge handshake (acked only at the thread's loop top, where it holds no lock) parks it
+> for the duration. Aimed at our own IP — where no external peer can answer — the kernel stands up a
+> loopback **echo peer** (`net::tcp_echo_loopback_enable`: PHY loopback + a kernel-side listener + the
+> Stage 24b echo pump), so the text comes back verbatim and prints; aimed elsewhere it is a real client
+> over SLIRP (e.g. `nc 10.0.2.2 <port> <text>` reaches a listener on the host). The netcat is also the
+> first user program with a **branch**: `connect` can legitimately fail, so a `cmp`/`je` skips the transfer
+> tail to a "connect failed" + `exit(1)` path (verified live by aiming at a dead address). The shell
+> selftest runs a loopback `nc` at boot; verified by 94 tests (the new `ring3_netcat_echoes_over_loopback`
+> launches a netcat *after* boot from ordinary kernel context, asserts one more connect/recv/close and the
+> full echoed length, and — the new mechanism itself — that `run_netcat` *returned*). **This completes
+> Stage 24; remaining: Stages 25-26.**
 
 | Sub-step | What to build | OS concepts | Smallest verifiable step |
 |----------|---------------|-------------|--------------------------|

@@ -404,9 +404,23 @@ forked live on, Unix semantics). Non-blocking, like Unix `close` (the FIN handsh
 polls / the retransmission timer). The accept demo grew the closing tail — `close`(client fd, active close),
 `close`(accepted fd, passive close), `close`(listen fd), then one more `socket()` that must come back as the
 lowest freed fd (0) — and the kernel verifies the teardown after the process phase (`verify_close_demo` →
-`net::tcp_teardown_settled`: client end TIME_WAIT/CLOSED, server end CLOSED, listener gone). `ROADMAP.md`
-records the full staged history (stages 0-22d-3 complete, Stage 23 complete (23a-23d), Stage 24 in progress
-(24a-24c and 24d-1 done); remaining: 24d-2 — a user "netcat" demo wired into the shell — then Stages 25-26).
+`net::tcp_teardown_settled`: client end TIME_WAIT/CLOSED, server end CLOSED, listener gone). **Stage 24d-2 is
+also done — a ring 3 "netcat" wired into the shell, completing Stage 24.** The shell gains
+`nc <a.b.c.d> <port> [text]`, which loads and spawns a ring 3 program that drives the whole socket lifecycle
+itself (`socket`/blocking `connect`/`send`/blocking `recv`/`write` the reply/`close`/`exit`) — the first user
+program launched **from the running shell** rather than as a boot phase, on two new mechanisms: a
+**returnable ring 3 excursion** (`usermode::enter_returning` + `process::run_and_return` — a setjmp/longjmp
+over the existing `resume_kernel` machinery: a naked stub saves the six callee-saved registers and publishes
+its RSP + a landing label as the resume point, so the last `exit` returns to the shell command like an
+ordinary call, all its live frames intact), and **quiescing the background net thread**
+(`unify::pause_net_thread`, a request/acknowledge handshake acked only at the thread's loop top — the
+blocking syscalls pump `net::poll` with interrupts off, so a net lock held by the mid-`poll`-preempted net
+thread would deadlock them). Aimed at our own IP the kernel stands up a loopback **echo peer**
+(`net::tcp_echo_loopback_enable`: PHY loopback + a kernel-side listener + the Stage 24b echo pump) so the
+text comes back and prints; aimed elsewhere it is a real SLIRP client. The netcat is also the first user
+program with a **branch** (`cmp`/`je`): a failed `connect` skips to a "connect failed" + `exit(1)` path.
+`ROADMAP.md` records the full staged history (stages 0-22d-3 complete, Stage 23 complete (23a-23d), Stage 24
+complete (24a-24d); remaining: Stages 25-26).
 
 ## Language and writing conventions
 
@@ -643,15 +657,23 @@ Exit QEMU: `Ctrl-A` then `X`.
   is idle, forever — the shell on a 32 KiB stack, the net thread on 16 KiB, via
   `sched::spawn_with_stack` (the deep executor+shell+FAT call chain overflows the default 4 KiB; the
   guard-page refinement exposed this as a clean fault). Concurrent printing from
-  these BSP threads is safe because the VGA/serial writers lock inside `without_interrupts`.
+  these BSP threads is safe because the VGA/serial writers lock inside `without_interrupts`. Stage 24d-2
+  adds the net-thread **quiesce protocol** (`pause_net_thread`/`resume_net_thread`, a request/acknowledge
+  handshake the thread acks only at its loop top, where it holds no lock): a ring 3 excursion's blocking
+  socket syscalls pump `net::poll` with interrupts off, so the net thread must not be parked mid-`poll`
+  holding a net lock while one runs.
 - `src/shell.rs`: Stage 7-8 interactive shell — an async task that reads decoded
   keystrokes from the keyboard `ScancodeStream`, buffers a line (with Backspace)
   against a current working directory, and on Enter routes it through a `dispatch`
   table of built-in commands (including the Stage 8 file commands, which since Stage
   14b-3 also reach the FAT disk mounted at `/mnt`, and the Stage 18d network commands
-  `ifconfig`/`arp`/`ping <a.b.c.d>` over the live `net` stack). Includes a boot `selftest`
-  (now also driving the network commands) so the shell, file system, and net stack are
-  verifiable without a keyboard.
+  `ifconfig`/`arp`/`ping <a.b.c.d>` over the live `net` stack). Stage 24d-2 adds
+  `nc <a.b.c.d> <port> [text]` — a ring 3 "netcat": unlike the in-kernel network
+  commands, it spawns a **user process** (`process::run_netcat`) that drives the whole
+  Stage 24 socket lifecycle itself and prints the peer's reply; aimed at our own IP a
+  loopback echo peer answers. Includes a boot `selftest` (now also driving the network
+  commands and a loopback `nc`) so the shell, file system, net stack, and user-space
+  sockets are verifiable without a keyboard.
 - `src/fs.rs`: Stage 8 in-memory file system — a heap-backed tree of `File`/`Dir`
   nodes addressed by `/`-separated paths, exposed as a global `RamFs` behind a
   mutex with `mkdir`/`write`/`read`/`list`/`remove`/`is_dir`. No disk, no
@@ -665,7 +687,11 @@ Exit QEMU: `Ctrl-A` then `X`.
   interrupt-return frame (`initial_user_frame`: entry point + user stack; since Stage
   12c-3 IF is *set* so the process is preemptible) and `iretq`s into ring 3;
   `resume_kernel` rewrites an in-flight interrupt's frame to return to the kernel (the
-  scheduler uses it when the last process exits). The per-process context is now a full
+  scheduler uses it when the last process exits). Stage 24d-2 adds `enter_returning`,
+  the **returnable** flavor for launching user programs from the running shell: a naked
+  setjmp stub saves the callee-saved registers and publishes its RSP + a landing label
+  as the resume point, so `resume_kernel`'s longjmp unwinds back into an ordinary
+  function return (`descend` is the shared iretq tail of both flavors). The per-process context is now a full
   `TrapFrame` saved/restored by `process.rs`, so the old `save_frame`/`load_frame`
   helpers are gone. (Stage 9a added the ring 3 GDT segments and the TSS `rsp0` stack in
   `gdt.rs`.)
@@ -742,7 +768,13 @@ Exit QEMU: `Ctrl-A` then `X`.
   socket unregisters its listener (`net::tcp_unlisten`). The accept demo grew the closing tail
   (`close` ×3 + a `socket()` that must reuse freed fd 0), and `verify_close_demo` (via
   `net::tcp_teardown_settled`) confirms after the process phase that the four-way FIN teardown
-  completed: client end TIME_WAIT/CLOSED, server end CLOSED, listener gone.
+  completed: client end TIME_WAIT/CLOSED, server end CLOSED, listener gone. Stage 24d-2 adds
+  `run_and_return` — the callable counterpart of `run` (via `usermode::enter_returning`'s
+  setjmp/longjmp), so a user phase can be launched after boot and *return* — and `run_netcat(ip,
+  port, msg)`, the shell `nc` backend: it quiesces the net thread, stands up the loopback echo peer
+  when aimed at our own IP, then loads/spawns/runs a hand-assembled netcat program
+  (`socket`/`connect`/`send`/`recv`/`write`/`close`/`exit`, with a `cmp`/`je` branch to a failure
+  message when `connect` fails — the first user program with a branch).
 - `src/ata.rs`: Stage 13a/13b block device driver — a minimal ATA (IDE) disk driver in
   PIO mode. `read_sector` reads one raw 512-byte sector from the primary master by
   the polled READ SECTORS (LBA28) protocol: write the LBA/count registers, issue the

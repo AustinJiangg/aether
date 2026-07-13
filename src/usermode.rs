@@ -30,7 +30,12 @@
 //! *rewrites its own return frame* to a ring 0 context ([`resume_kernel`]). The
 //! scheduler triggers this when the *last* user process exits (Stage 12b); it then
 //! lets boot continue (into the shell or the tests) after the ring 3 excursion.
+//! Stage 24d-2 adds a second flavor of the same machinery ([`enter_returning`]): the
+//! excursion becomes an ordinary call that **returns** to its caller — a
+//! setjmp/longjmp built over the identical resume point — so the *running shell* can
+//! launch a user program (its `nc` command) and simply continue when it exits.
 
+use core::arch::naked_asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use x86_64::instructions::interrupts;
@@ -84,6 +89,94 @@ pub fn enter(user_entry: VirtAddr, user_stack_top: VirtAddr, resume: fn() -> !) 
     RESUME_RSP.store((kernel_rsp & !0xF) - 8, Ordering::SeqCst);
     RESUME_CS.store(u64::from(gdt::kernel_code_selector().0), Ordering::SeqCst);
 
+    descend(user_entry, user_stack_top)
+}
+
+/// Stage 24d-2: enter ring 3 like [`enter`], but make the excursion **callable** — when
+/// [`resume_kernel`] fires (the last process exited), control comes back to
+/// `enter_returning`'s caller as an ordinary function return, instead of jumping into a
+/// fresh `fn() -> !` continuation that owns the rest of boot.
+///
+/// This is what lets the *shell* run a user program and carry on afterwards: the boot
+/// model resets the stack and forgets every in-flight stack frame (fine at boot, where
+/// nothing above matters), but a shell command sits deep in live frames — the async
+/// executor, the dispatch loop, the command handler — that must all still be there when
+/// the program finishes. The mechanics are a setjmp/longjmp pair built from pieces the
+/// kernel already has:
+///
+/// - **setjmp** ([`setjmp_and_start`]): save the six callee-saved registers on the
+///   current stack (exactly like `thread::context_switch`'s outgoing half — everything
+///   else is caller-saved, already spilled by the compiler around this call), publish
+///   the resulting RSP and a landing label as the resume point, then start the phase.
+/// - **longjmp** ([`resume_kernel`], unchanged): the `exit` syscall's handler rewrites
+///   its own interrupt frame so the `iretq` lands at the published RIP/RSP — which is
+///   now the landing label rather than a boot continuation. The landing code pops the
+///   callee-saved registers back and returns.
+///
+/// `start` performs the actual descent (switch CR3, `iretq` — it must not return); it
+/// runs on the current stack, below the saved resume point. On return, the caller is
+/// still on whatever CR3 the last process used, with interrupts off — it must switch
+/// back to the kernel space and re-enable interrupts (see `process::run_and_return`).
+pub fn enter_returning(start: extern "C" fn() -> !) {
+    RESUME_CS.store(u64::from(gdt::kernel_code_selector().0), Ordering::SeqCst);
+    // SAFETY: `start` diverges into ring 3; the only way back is `resume_kernel`
+    // targeting the resume point the stub records, which restores this thread's
+    // callee-saved registers from its own stack and returns normally.
+    unsafe { setjmp_and_start(start) };
+}
+
+/// The naked setjmp half of [`enter_returning`]. Saves the callee-saved registers and
+/// the resume point, then jumps to `start` (in `rdi`, which never returns); the landing
+/// label `2:` below is where [`resume_kernel`]'s rewritten `iretq` re-enters this
+/// kernel context, unwinding the save.
+///
+/// Register discipline mirrors [`crate::thread::context_switch`]: a plain `call` into
+/// this function means the compiler has already spilled every caller-saved register it
+/// needs, so only `rbp`/`rbx`/`r12`-`r15` (plus RSP itself) carry state across the
+/// excursion. The general-purpose registers at the landing label hold whatever the
+/// exiting user process left in its final `TrapFrame` — garbage to us, and dead: the
+/// pops below rebuild the callee-saved set, and the caller expects nothing else.
+#[unsafe(naked)]
+unsafe extern "C" fn setjmp_and_start(start: extern "C" fn() -> !) {
+    naked_asm!(
+        // --- setjmp: save this kernel context ---
+        "push rbp",
+        "push rbx",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        // Publish the resume point: RIP = the landing label, RSP = right here (atop the
+        // six saved registers). Plain 64-bit stores are atomic on x86_64, and the reader
+        // (`resume_kernel`, in a later syscall on this same CPU) cannot run before the
+        // descent below, so no further ordering is needed.
+        "lea rax, [rip + 2f]",
+        "mov [rip + {resume_rip}], rax",
+        "mov [rip + {resume_rsp}], rsp",
+        // --- start the excursion (never returns) ---
+        // `jmp`, not `call`: `start` gets this RSP as its entry stack (rsp ≡ 8 mod 16,
+        // as after a call), and no dead return address is left behind.
+        "jmp rdi",
+        // --- longjmp target: resume_kernel's iretq lands here, RSP already restored ---
+        "2:",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rbx",
+        "pop rbp",
+        "ret",
+        resume_rip = sym RESUME_RIP,
+        resume_rsp = sym RESUME_RSP,
+    );
+}
+
+/// The descent itself: arm the return hook and `iretq` into ring 3 at `user_entry`.
+/// Shared tail of [`enter`] (boot, one-shot continuation) and the Stage 24d-2 returning
+/// path (`process::run_and_return` via [`enter_returning`]) — the caller has already
+/// published the resume point in `RESUME_RIP`/`RESUME_RSP`/`RESUME_CS`, in whichever
+/// flavor it wants, and switched CR3 to the space mapping `user_entry`.
+pub(crate) fn descend(user_entry: VirtAddr, user_stack_top: VirtAddr) -> ! {
     // Disable interrupts so none fires on the kernel stack between arming the hook and
     // the descent. The `iretq` below loads the user frame's RFLAGS, which has IF set
     // (Stage 12c-3), so interrupts turn back on *atomically* as the CPU enters ring 3

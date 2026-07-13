@@ -791,6 +791,147 @@ pub fn spawn_cross_demo(
     (server_pid, client_pid)
 }
 
+// --- Stage 24d-2: the ring 3 "netcat" the shell launches -------------------
+
+/// Bytes of the netcat success tail that the `je .fail` skips when `connect` returns
+/// `u64::MAX`: `send` (18 B) + `recv` (18 B) + dynamic `write` (16 B) + `mov rax,rbx`
+/// (3 B) + `close` (6 B) + `exit` (6 B).
+const NETCAT_SUCCESS_TAIL: usize = 18 + 18 + 16 + 3 + 6 + 6;
+/// Length of the Stage 24d-2 ring 3 "netcat" program: `socket` (5 B) + `mov rbx,rax`
+/// (3 B) + `connect` (19 B) + `cmp rax,-1` (4 B) + `je .fail` (2 B) + the success tail
+/// + the failure tail (`write` (17 B) + `exit` (6 B)).
+const NETCAT_CODE_LEN: usize = 5 + 3 + 19 + 4 + 2 + NETCAT_SUCCESS_TAIL + 17 + 6;
+
+/// Longest message [`run_netcat`] accepts: it must fit the receive buffer (so a
+/// loopback echo comes back whole) and the one-byte length immediates the emitters push.
+pub const NETCAT_MAX_MSG: usize = SOCKET_DEMO_RECV_CAP as usize;
+
+/// Hand-assemble the ring 3 netcat: `socket(); connect(dst); send(msg); recv(buf);
+/// write(buf, count); close(fd); exit(0)` — one client-side pass over the whole socket
+/// lifecycle against a *real* destination the shell chose at runtime.
+///
+/// Unlike the fixed demos, `connect` here may legitimately fail (the user can aim `nc`
+/// at a port nobody listens on), so this is the first user program with a **branch**:
+/// `connect` returns `u64::MAX` in `rax` on failure, and a `cmp`/`je` skips the
+/// data-transfer tail to a failure message + `exit(1)`. Without it, a failed connect
+/// would fall into `send`/`recv` on an unbound socket and `write` a garbage length.
+/// The fd rides in `rbx` (preserved across syscalls by the entry stub), as in the
+/// other socket demos. Produces exactly [`NETCAT_CODE_LEN`] bytes.
+fn build_netcat(
+    dst: u64,
+    send_ptr: u64,
+    send_len: u8,
+    recv_ptr: u64,
+    recv_cap: u8,
+    fail_ptr: u64,
+    fail_len: u8,
+) -> Vec<u8> {
+    let mut code = Vec::new();
+    emit_socket(&mut code); // rax = fd
+    code.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax   (stash the fd; rax still = it)
+    emit_connect(&mut code, dst); // connect(fd, dst) -> blocks; rax = fd or u64::MAX
+    code.extend_from_slice(&[0x48, 0x83, 0xF8, 0xFF]); // cmp rax, -1    (did connect fail?)
+    // A `je rel8` displacement is a *signed* byte: the tail must stay within a forward
+    // jump's reach, or the branch would silently jump backwards.
+    debug_assert!(NETCAT_SUCCESS_TAIL <= i8::MAX as usize);
+    code.extend_from_slice(&[0x74, NETCAT_SUCCESS_TAIL as u8]); // je .fail   (skip the tail below)
+    emit_send(&mut code, send_ptr, send_len); // send(fd, msg)          [reads rbx]
+    emit_recv(&mut code, recv_ptr, recv_cap); // recv(fd, buf) -> rax = count (0 if silent peer)
+    emit_write_dyn(&mut code, recv_ptr); // write(buf, count) — print what came back
+    code.extend_from_slice(&[0x48, 0x89, 0xD8]); // mov rax, rbx   (the fd, for close)
+    emit_close(&mut code); // close(fd): send our FIN, free the slot
+    emit_exit(&mut code, 0);
+    // .fail: connect timed out / was refused — say so and exit nonzero.
+    emit_write(&mut code, fail_ptr, fail_len);
+    emit_exit(&mut code, 1);
+    debug_assert_eq!(code.len(), NETCAT_CODE_LEN);
+    code
+}
+
+/// Build the netcat ELF: the code, then a data area of the message to send, the
+/// canned failure message, and a zeroed receive buffer.
+fn netcat_elf(dst: u64, msg: &[u8]) -> Vec<u8> {
+    let fail_msg = b"nc: connect failed\n";
+    let send_ptr = msg_vaddr(NETCAT_CODE_LEN);
+    let fail_ptr = send_ptr + msg.len() as u64;
+    let recv_ptr = fail_ptr + fail_msg.len() as u64;
+    let code = build_netcat(
+        dst,
+        send_ptr,
+        msg.len() as u8,
+        recv_ptr,
+        SOCKET_DEMO_RECV_CAP,
+        fail_ptr,
+        fail_msg.len() as u8,
+    );
+    let mut data = msg.to_vec();
+    data.extend_from_slice(fail_msg);
+    data.extend_from_slice(&alloc::vec![0u8; SOCKET_DEMO_RECV_CAP as usize]);
+    build_elf(&code, &data)
+}
+
+/// Stage 24d-2: run a ring 3 "netcat" against `ip:port` and return once it has exited —
+/// the backend of the shell's `nc` command, and the first user program launched **on
+/// demand from the running shell** rather than as a boot phase. Loads the program
+/// (through the global kernel frame allocator, like the `spawn` syscall), spawns it,
+/// and drives it with [`run_and_return`]; the program `connect`s, `send`s `msg`,
+/// `recv`s and prints whatever comes back, then `close`s and exits.
+///
+/// Aimed at **our own address**, no external peer can answer (a SYN to ourselves goes
+/// out the wire and never returns), so the kernel stands up its loopback echo peer for
+/// the duration (`net::tcp_echo_loopback_enable`): PHY loopback plus a kernel-side
+/// listener that bounces every byte back — the message comes back verbatim and prints.
+/// Aimed anywhere else it is a real client over SLIRP: e.g. with something listening
+/// on the host, `nc 10.0.2.2 <port> <text>` reaches it (10.0.2.2 is the host's
+/// loopback), and a silent peer just means `recv` returns 0 after its bound.
+///
+/// The background net thread is quiesced around the phase (`unify::pause_net_thread`):
+/// the blocking socket syscalls pump `net::poll` inline with interrupts off, so a net
+/// lock held by the preempted net thread would deadlock them. Returns whether the
+/// program's `connect` succeeded.
+pub fn run_netcat(ip: [u8; 4], port: u16, msg: &[u8]) -> bool {
+    if msg.is_empty() || msg.len() > NETCAT_MAX_MSG {
+        serial_println!(
+            "[sched] netcat: message must be 1..={} bytes (got {})",
+            NETCAT_MAX_MSG,
+            msg.len()
+        );
+        return false;
+    }
+
+    crate::unify::pause_net_thread();
+    let loopback = ip == crate::net::our_ip();
+    if loopback {
+        crate::net::tcp_echo_loopback_enable(port);
+    }
+
+    let elf = netcat_elf(pack_dst(ip, port), msg);
+    let offset = memory::physical_memory_offset();
+    let connected = match memory::with_kernel_frame_allocator(|fa| load(&elf, fa, offset)) {
+        Ok(image) => {
+            let connected_before = processes_connected();
+            let pid = spawn(image, None);
+            serial_println!(
+                "[sched] netcat: spawned process {} -> {}.{}.{}.{}:{} ({} byte(s){})",
+                pid, ip[0], ip[1], ip[2], ip[3], port, msg.len(),
+                if loopback { ", loopback echo" } else { "" },
+            );
+            run_and_return();
+            processes_connected() > connected_before
+        }
+        Err(_) => {
+            serial_println!("[sched] netcat: failed to load the program");
+            false
+        }
+    };
+
+    if loopback {
+        crate::net::tcp_echo_loopback_disable();
+    }
+    crate::unify::resume_net_thread();
+    connected
+}
+
 /// Stage 24c-2: after the process phase, confirm the cross-process **client**'s bytes reached the
 /// **server**'s accepted connection — the two distinct processes really exchanged application data. Sets
 /// [`CROSS_DATA_OK`]. Called from the kernel once the process scheduler has returned.
@@ -1078,46 +1219,91 @@ pub fn spawn(image: UserImage, parent: Option<u64>) -> u64 {
     id
 }
 
+/// Remember the kernel's CR3 so the eventual return from a user phase can switch back
+/// ([`return_to_kernel_space`]). Shared prologue of [`run`] and [`run_and_return`].
+fn save_kernel_cr3() {
+    let kernel = Cr3::read();
+    KERNEL_L4_ADDR.store(kernel.0.start_address().as_u64(), Ordering::SeqCst);
+    KERNEL_L4_FLAGS.store(kernel.1.bits(), Ordering::SeqCst);
+}
+
+/// Pop the first ready process, switch CR3 to its address space, make it current, and
+/// return its `(entry, user stack top)` for the descent into ring 3 — or `None` if the
+/// ready queue is empty. Shared by [`run`] (boot) and [`phase_entry`] (Stage 24d-2).
+fn start_first_process() -> Option<(VirtAddr, VirtAddr)> {
+    let mut sched = SCHEDULER.lock();
+    if sched.ready.is_empty() {
+        return None;
+    }
+    let first = sched.ready.remove(0);
+    let entry = first.image.entry;
+    let stack = first.image.user_stack_top;
+    let l4 = first.image.space.l4_frame();
+    RAN_USER_L4_ADDR.store(l4.start_address().as_u64(), Ordering::SeqCst);
+    serial_println!(
+        "[sched] starting process {} on L4 {:?} ({} more queued)",
+        first.id,
+        l4.start_address(),
+        sched.ready.len(),
+    );
+    // SAFETY: the image clones the kernel, so its space maps the running
+    // kernel; switching CR3 to it is sound.
+    unsafe { first.image.space.activate() };
+    sched.current = Some(first);
+    Some((entry, stack))
+}
+
 /// Start the cooperative scheduler: run the spawned processes in ring 3, one after
 /// another, each on its own address space. Never returns to the caller. When the
 /// last process exits, the kernel resumes at `resume` — which **must** call
 /// [`return_to_kernel_space`] first, before touching kernel-only mappings.
 pub fn run(resume: fn() -> !) -> ! {
-    // Remember the kernel's CR3 so the eventual return can switch back.
-    let kernel = Cr3::read();
-    KERNEL_L4_ADDR.store(kernel.0.start_address().as_u64(), Ordering::SeqCst);
-    KERNEL_L4_FLAGS.store(kernel.1.bits(), Ordering::SeqCst);
-
-    let started = {
-        let mut sched = SCHEDULER.lock();
-        if sched.ready.is_empty() {
-            None
-        } else {
-            let first = sched.ready.remove(0);
-            let entry = first.image.entry;
-            let stack = first.image.user_stack_top;
-            let l4 = first.image.space.l4_frame();
-            RAN_USER_L4_ADDR.store(l4.start_address().as_u64(), Ordering::SeqCst);
-            serial_println!(
-                "[sched] starting process {} on L4 {:?} ({} more queued)",
-                first.id,
-                l4.start_address(),
-                sched.ready.len(),
-            );
-            // SAFETY: the image clones the kernel, so its space maps the running
-            // kernel; switching CR3 to it is sound.
-            unsafe { first.image.space.activate() };
-            sched.current = Some(first);
-            Some((entry, stack))
-        }
-    };
-
-    match started {
+    save_kernel_cr3();
+    match start_first_process() {
         Some((entry, stack)) => usermode::enter(entry, stack, resume),
         None => {
             serial_println!("[sched] no processes to run");
             resume()
         }
+    }
+}
+
+/// Stage 24d-2: run the spawned processes in ring 3 and **return** when the last one
+/// exits — the callable counterpart of [`run`], for launching a user program *after*
+/// boot (the shell's `nc` command). Where `run` hands the rest of boot to a `fn() -> !`
+/// continuation on a reset stack, this uses [`usermode::enter_returning`]'s
+/// setjmp/longjmp: the caller's whole stack (the executor, the shell dispatch, the
+/// command handler) survives the excursion, and execution resumes here as an ordinary
+/// return. Interrupts are re-enabled on the way out (the resume frame lands with them
+/// off).
+///
+/// The caller must ensure no other kernel thread can be mid-way through the network
+/// stack while the phase runs: the blocking socket syscalls pump `net::poll` inline
+/// with interrupts off, so a net lock held by a preempted thread would deadlock them
+/// (see `unify::pause_net_thread`).
+pub fn run_and_return() {
+    if SCHEDULER.lock().ready.is_empty() {
+        return; // nothing spawned — nothing to do
+    }
+    save_kernel_cr3();
+    usermode::enter_returning(phase_entry);
+    // The longjmp back lands still on the last process's CR3 with interrupts off —
+    // the same state `run`'s boot continuation starts in. Restore the kernel space
+    // before touching anything else, then let interrupts flow again.
+    return_to_kernel_space();
+    x86_64::instructions::interrupts::enable();
+}
+
+/// The descent [`run_and_return`] hands to [`usermode::enter_returning`]: activate the
+/// first ready process and `iretq` into it. The resume point is already published, so
+/// this uses the bare [`usermode::descend`] rather than `enter`. Never returns — the
+/// way back is `resume_kernel`'s longjmp when the last process exits.
+extern "C" fn phase_entry() -> ! {
+    match start_first_process() {
+        Some((entry, stack)) => usermode::descend(entry, stack),
+        // Unreachable: `run_and_return` checked the queue, and nothing else consumes it
+        // while no process is current (the timer path requires a current process).
+        None => panic!("phase_entry: no ready process"),
     }
 }
 

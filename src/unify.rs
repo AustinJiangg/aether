@@ -21,7 +21,7 @@
 //! 2. [`run_shell_threaded`] (non-test) — the real application: the interactive shell
 //!    runs as a scheduled kernel thread, alongside a coexisting kernel thread, forever.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use x86_64::instructions::interrupts as int;
 
@@ -147,13 +147,57 @@ pub fn run_shell_threaded() -> ! {
     crate::hlt_loop(); // unreachable: shell_thread runs forever
 }
 
+/// Stage 24d-2: whether the background [`net_thread`] exists. Set once at its start; while false
+/// (boot self-test, or a `cargo test` build, where no net thread is ever spawned) the quiesce
+/// protocol below is a no-op.
+static NET_THREAD_UP: AtomicBool = AtomicBool::new(false);
+/// Stage 24d-2: asks the net thread to park at its loop top ([`pause_net_thread`] sets it,
+/// [`resume_net_thread`] clears it).
+static NET_PAUSE_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Stage 24d-2: the net thread's acknowledgement that it is parked — set only at its loop top,
+/// where it holds no lock.
+static NET_PAUSED: AtomicBool = AtomicBool::new(false);
+
+/// Stage 24d-2: quiesce the background net thread before a ring 3 excursion, and wait until it
+/// really is parked. The excursion's blocking socket syscalls pump `net::poll` **with interrupts
+/// off** (a syscall cannot be preempted), so if the timer had preempted the net thread mid-`poll`
+/// — while it holds the connection-table or NIC lock — the syscall would spin on that lock forever
+/// with the holder unable to run: a hard deadlock. Waiting for the acknowledgement (with
+/// interrupts on, so the timer keeps scheduling the net thread until it reaches its loop top)
+/// guarantees no net lock is held when the excursion starts. A no-op when no net thread exists.
+pub fn pause_net_thread() {
+    if !NET_THREAD_UP.load(Ordering::SeqCst) {
+        return;
+    }
+    NET_PAUSE_REQUESTED.store(true, Ordering::SeqCst);
+    while !NET_PAUSED.load(Ordering::SeqCst) {
+        x86_64::instructions::hlt();
+    }
+}
+
+/// Stage 24d-2: let a paused net thread poll again (the excursion is over). The thread clears its
+/// own acknowledgement when it wakes.
+pub fn resume_net_thread() {
+    NET_PAUSE_REQUESTED.store(false, Ordering::SeqCst);
+}
+
 /// The background network thread (Stage 18d): forever drain and dispatch received frames, so the
 /// stack keeps answering ARP requests and incoming pings while the shell is idle. Between polls it
 /// `hlt`s — sleeping until the next interrupt (the e1000 receive IRQ, or the timer that preempts it
 /// to the shell) — so an idle network costs nothing. Reached via the scheduler like any other thread.
 #[cfg(not(test))]
 fn net_thread() {
+    NET_THREAD_UP.store(true, Ordering::SeqCst);
     loop {
+        // Stage 24d-2: park while a ring 3 excursion (the shell's `nc`) runs. Acknowledging here —
+        // at the loop top, never mid-`poll` — is what makes the ack mean "holding no net lock".
+        if NET_PAUSE_REQUESTED.load(Ordering::SeqCst) {
+            NET_PAUSED.store(true, Ordering::SeqCst);
+            while NET_PAUSE_REQUESTED.load(Ordering::SeqCst) {
+                x86_64::instructions::hlt();
+            }
+            NET_PAUSED.store(false, Ordering::SeqCst);
+        }
         crate::net::poll();
         // Sleep until an interrupt wakes us: a received frame (so we poll it promptly) or the timer
         // (which preempts us to the shell). A bare `hlt` is safe here — interrupts are enabled.

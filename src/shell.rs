@@ -29,7 +29,7 @@ use futures_util::stream::StreamExt;
 use pc_keyboard::{layouts::Us104Key, DecodedKey, HandleControl, PS2Keyboard, ScancodeSet1};
 
 use crate::task::keyboard::ScancodeStream;
-use crate::{allocator, fs, interrupts, net, vga_buffer};
+use crate::{allocator, fs, interrupts, net, process, vga_buffer};
 
 /// Print to BOTH the screen and the serial log, with a trailing newline.
 ///
@@ -139,6 +139,9 @@ fn dispatch(cwd: &mut String, line: &str) {
         "ping" => cmd_ping(args),
         "nslookup" => cmd_nslookup(args),
 
+        // --- user-space networking (Stage 24d-2) ---
+        "nc" => cmd_nc(args),
+
         other => sh_println!("unknown command: '{}' (try 'help')", other),
     }
 }
@@ -162,6 +165,8 @@ fn help() {
     sh_println!("  arp                   show the ARP cache");
     sh_println!("  ping <a.b.c.d>        send an ICMP echo to an IPv4 address");
     sh_println!("  nslookup <hostname>   resolve a hostname to an IPv4 address via DNS");
+    sh_println!("  nc <ip> <port> [text] ring 3 netcat: connect, send, print the reply");
+    sh_println!("                        (aimed at our own IP, a loopback echo answers)");
 }
 
 /// `ls [path]` — list a directory (the cwd if no path is given).
@@ -328,6 +333,45 @@ fn cmd_nslookup(args: &str) {
     }
 }
 
+/// `nc <a.b.c.d> <port> [text]` — Stage 24d-2: a tiny ring 3 "netcat".
+///
+/// This is the stage's point: the other network commands run *in the kernel*, but `nc`
+/// spawns a **user process** that drives the whole Stage 24 socket lifecycle itself —
+/// `socket`, a blocking `connect`, `send`, a blocking `recv`, `write` (printing
+/// whatever the peer sent back), `close`, `exit` — and the shell simply resumes when it
+/// exits ([`process::run_netcat`], the first user program launched from the running
+/// shell rather than as a boot phase). Aimed at our own IP the kernel stands up a
+/// loopback echo peer, so the text comes straight back; aimed elsewhere it is a real
+/// TCP client over SLIRP (e.g. `nc 10.0.2.2 8000 hi` reaches a listener on the host).
+fn cmd_nc(args: &str) {
+    let mut parts = args.splitn(3, char::is_whitespace);
+    let ip = parts.next().and_then(net::parse_ipv4);
+    let port = parts.next().and_then(|p| p.parse::<u16>().ok());
+    let (Some(ip), Some(port)) = (ip, port) else {
+        sh_println!("usage: nc <a.b.c.d> <port> [text]");
+        return;
+    };
+    // The text to send, newline-terminated like a real netcat line (default if omitted).
+    let mut msg = String::from(parts.next().unwrap_or("hello from ring 3"));
+    msg.push('\n');
+    if msg.len() > process::NETCAT_MAX_MSG {
+        sh_println!("nc: text too long (max {} bytes)", process::NETCAT_MAX_MSG - 1);
+        return;
+    }
+
+    sh_println!(
+        "nc: connecting to {}.{}.{}.{}:{} from ring 3 ...",
+        ip[0], ip[1], ip[2], ip[3], port
+    );
+    // The reply the user program receives is printed by the program itself (its
+    // `write` syscall lands on the screen and serial); we only report the outcome.
+    if process::run_netcat(ip, port, msg.as_bytes()) {
+        sh_println!("nc: connection closed");
+    } else {
+        sh_println!("nc: could not connect to {}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], port);
+    }
+}
+
 /// Handle one decoded key against the current line buffer.
 ///
 /// Echoes printable characters, erases on Backspace, and on Enter runs the
@@ -464,6 +508,21 @@ pub fn selftest() {
         sh_println!("aether:{}> {}", cwd, command);
         dispatch(&mut cwd, command);
     }
+
+    // Stage 24d-2: the ring 3 netcat, wired into the shell. Aimed at our own (DHCP-leased)
+    // address, the kernel stands up a loopback echo peer, so this one command drives the whole
+    // user-space socket lifecycle — a freshly spawned ring 3 process socket()s, connect()s,
+    // send()s the text, recv()s the echo, write()s it (the line printed below), close()s, and
+    // exits — after which the shell simply carries on. The address is read at runtime, so the
+    // command is built dynamically rather than scripted.
+    sh_println!("[shell selftest] ring 3 netcat over the loopback echo (24d-2):");
+    let ip = net::our_ip();
+    let nc_cmd = alloc::format!(
+        "nc {}.{}.{}.{} 7 hello from ring 3 netcat",
+        ip[0], ip[1], ip[2], ip[3]
+    );
+    sh_println!("aether:{}> {}", cwd, nc_cmd);
+    dispatch(&mut cwd, &nc_cmd);
 
     // Exercise the interactive key path (echo, Backspace, Enter) by feeding
     // decoded keys through the same `handle_key` the live loop uses. We "type"

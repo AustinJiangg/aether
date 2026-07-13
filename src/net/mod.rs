@@ -904,6 +904,26 @@ pub fn tcp_echo_disable() {
     TCP_ECHO_PORT.store(0, Ordering::Relaxed);
 }
 
+/// Stage 24d-2: stand up the kernel-side **echo peer** for a loopback `nc` run — reset the connection
+/// table and enable PHY loopback ([`tcp_loopback_reset`]), register a passive listener on `port` (the
+/// server the ring 3 client's SYN reaches; it forks a connection TCB per the Stage 24c-1 model), and
+/// point the Stage 24b echo pump at that port, so every byte the client sends is bounced straight back.
+/// The shell's `nc` uses this when aimed at our own address, where no external peer can exist.
+pub fn tcp_echo_loopback_enable(port: u16) {
+    tcp_loopback_reset();
+    tcp::open_passive(port);
+    TCP_ECHO_PORT.store(u32::from(port), Ordering::Relaxed);
+}
+
+/// Stage 24d-2: tear the loopback echo peer down again — stop echoing, drop the listener and any
+/// leftover connections (the echo side never `close`s, so its TCB would linger in CLOSE_WAIT forever),
+/// and turn PHY loopback off so real traffic reaches the emulated wire again.
+pub fn tcp_echo_loopback_disable() {
+    tcp_echo_disable();
+    tcp::reset_connections();
+    e1000::set_loopback(false);
+}
+
 /// Stage 22c: transmit the segments a [`tcp::flush`] produced (queued data the window now admits, or a
 /// zero-window probe), each framed as TCP-in-IPv4-in-Ethernet to its peer. Uses the cache-only next-hop
 /// (an established connection's peer MAC is already resolved, or is our own for loopback) and goes through

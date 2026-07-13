@@ -364,6 +364,28 @@ fn ring3_process_closed_its_sockets() {
     assert!(crate::process::close_teardown_ok()); // the FIN handshake ran to completion
 }
 
+/// Stage 24d-2: the shell's ring 3 "netcat" — a user program launched **after boot**, from ordinary
+/// kernel context (the way the shell's `nc` command invokes it), that `socket`s, `connect`s, `send`s,
+/// `recv`s, and `close`s. Aimed at our own address, the kernel's loopback echo peer bounces the message
+/// back, so the run must add exactly one connect, one delivered recv of the full message, and one close
+/// to the counters — and, crucially, `run_netcat` must *return* here (the setjmp/longjmp excursion),
+/// which is the new mechanism this sub-step introduces.
+#[test_case]
+fn ring3_netcat_echoes_over_loopback() {
+    let connected = crate::process::processes_connected();
+    let received = crate::process::processes_received();
+    let closed = crate::process::processes_closed();
+    // Deliberately 27 bytes — the same length as the boot accept-demo's message — because this
+    // run overwrites the shared `last_recv_len`, which `ring3_process_sent_and_received` (running
+    // after this test in name order) asserts to be exactly 27.
+    let msg = b"ring 3 netcat test payload\n";
+    assert!(crate::process::run_netcat(crate::net::our_ip(), 7902, msg));
+    assert_eq!(crate::process::processes_connected(), connected + 1);
+    assert_eq!(crate::process::processes_received(), received + 1);
+    assert_eq!(crate::process::last_recv_len(), msg.len() as u64);
+    assert_eq!(crate::process::processes_closed(), closed + 1);
+}
+
 /// Stage 13a: the ATA PIO driver reads a raw sector from disk. The bootimage QEMU attaches
 /// the kernel image as the primary IDE master, so sector 0 is the boot sector, whose final
 /// two bytes are the MBR boot signature 0x55 0xAA — a stable value to assert without
